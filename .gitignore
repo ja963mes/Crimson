@@ -1,0 +1,49 @@
+# This repository holds the Crimson scripts only. Everything a run produces stays out.
+
+# run output and data
+results/
+logs/
+data/
+collected_results/
+server-logs/
+runs/
+runs-*/
+*.out
+*.log
+*.log.*
+*.csv
+*.html
+*.png
+*.jpg
+*.zip
+*.tgz
+*.tar.gz
+
+# crawler working files
+worker/crawler/list.txt
+worker/crawler/urls.txt
+worker/crawler/crawled_urls.txt
+worker/crawler/fed_domains.txt
+worker/crawler/mailinator_usage.json
+worker/crawler/hyip_evidence_*.json
+worker/crawler/https_*/
+worker/crawler/http_*/
+worker/crawler/.scambusters-*
+tools/llm-agent/mail_reads_*.json
+tools/llm-agent/sites/
+
+# backups and editor/python leftovers
+*.bak
+*.bak.*
+*.bak-*
+*.stale*
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# secrets
+.env
+.crimson_env*
+*.pem
+*.key

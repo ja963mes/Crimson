@@ -19,3 +19,16 @@ If you use this work, please use this citation:
   year = {2025},
 }
 ```
+
+## Repository layout (lab deployment)
+
+| Folder | Runs on | Contents |
+|---|---|---|
+| `broker/` | the RabbitMQ hub (VM4) | `listen.py` (CertStream listener), `send.py` (filters), `cron.py`, `test_pipeline.py`, `utils/keyword_utils.py`, the health-check script and `systemd/` units |
+| `worker/` | the worker VMs (VM1-3) | `recv.py` (LLM worker), `validate.py`, `utils/` and `systemd/` units |
+| `worker/crawler/` | the worker VMs (VM1-3) | the authentication crawler: `crawler_script.py`, `feeder.py`, `build_wallets.py`, `hyip_classifier.py`, `submit_scambusters.py`, `iocs_searcher.sh` |
+| `tools/` | a local PC | evaluation and test tools: regression runner, Browser Use agent, classifier checks, HYIP feature research |
+
+On the VMs the scripts live in `~/crimson/src/` (crawler in `~/crimson/src/authentication_crawling/`). Units are in `/etc/systemd/system/`.
+
+The history was rebuilt on 2026-11-22 from the backups kept before each change, so each commit carries the date that version was written. Machine addresses and secrets are replaced with placeholders such as `<BROKER_IP>`, `<VM1_IP>`, `<MAILINATOR_API_KEY>` and `<MAILINATOR_DOMAIN>`. Put the real values back, or read them from the environment, before you deploy.
