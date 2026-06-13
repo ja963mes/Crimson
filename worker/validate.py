@@ -84,7 +84,7 @@ try:
                 {"role": "user", "content": row[1]}
             ]
             input_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in input_messages])
-            command = [ollama_binary, 'run', 'llama3:70b', input_text] # update the model as required
+            command = [ollama_binary, 'run', 'llama3:8b', input_text] # update the model as required
             chat_response = run_subprocess(domain, command, input_text, done_domains, error_file)
             if chat_response:
                 clean_json = json.dumps(chat_response, indent=None)
