@@ -30,7 +30,7 @@ def start_server():
     """Starts the CertStream server."""
     global SERVER_PROCESS
     try:
-        os.chdir(CERTSTREAM_DIR)
+        os.chdir("/home/ubuntu/crimson/certstream-server")
         SERVER_PROCESS = subprocess.Popen(SERVER_COMMAND, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         logger.info("CertStream server started successfully.")
     except Exception as e:
