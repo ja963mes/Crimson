@@ -42,12 +42,23 @@ newYorkTz = pytz.timezone("America/New_York")
 # incubation queue and consume a worker dequeue. Dedupe belongs here instead.
 seen_domains = OrderedDict()
 
+def dedupe_key(url_name):
+    """
+    Normalized cache key. 'www.foo.com' and 'foo.com' are the same site, but were
+    being published (and independently crawled) as two separate domains.
+    We normalize only the CACHE KEY -- the original domain string is still what
+    gets published, because some hosts only serve on the www. name and stripping
+    it would turn them into false 'unreachable' results in recv.py.
+    """
+    return url_name[4:] if url_name.startswith('www.') else url_name
+
 def already_seen(url_name):
     """LRU membership test. Returns True if url_name was recently published."""
-    if url_name in seen_domains:
-        seen_domains.move_to_end(url_name)
+    key = dedupe_key(url_name)
+    if key in seen_domains:
+        seen_domains.move_to_end(key)
         return True
-    seen_domains[url_name] = True
+    seen_domains[key] = True
     if len(seen_domains) > CACHE_CAPACITY:
         seen_domains.popitem(last=False)
     return False
@@ -90,7 +101,7 @@ def enqueue_domains(message, context, channel):
 
 if __name__ == '__main__':
     # 1. Setup the authenticated connection
-    credentials = pika.PlainCredentials('<RABBITMQ_USER>', '<RABBITMQ_PASS>')
+    credentials = pika.PlainCredentials(os.environ['RABBITMQ_USER'], os.environ['RABBITMQ_PASS'])
     connection = pika.BlockingConnection(
         pika.ConnectionParameters(host=RABBITMQ_HOST, credentials=credentials)
     )
