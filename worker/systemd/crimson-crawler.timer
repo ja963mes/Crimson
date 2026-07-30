@@ -1,0 +1,15 @@
+[Unit]
+Description=Periodically run the Crimson authenticated crawler
+Documentation=https://github.com/ja963mes/Crimson
+
+[Timer]
+# First run 10 min after boot, then every 6h measured from the end of the
+# previous run. systemd won't start a second pass while one is still running,
+# so long crawls can never overlap.
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+Unit=crimson-crawler.service
+
+[Install]
+WantedBy=timers.target

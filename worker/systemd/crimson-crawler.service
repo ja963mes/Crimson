@@ -1,0 +1,33 @@
+[Unit]
+Description=Crimson authenticated crawler (feeder + one crawl pass)
+Documentation=https://github.com/ja963mes/Crimson
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/crimson/src/authentication_crawling
+
+# --- optional: enable Mailinator email-confirmation clicking ---
+# The crawler skips the email step entirely unless BOTH of these are set.
+#Environment=MAILINATOR_API_KEY=your_token_here
+#Environment=MAILINATOR_DOMAIN=yourname.mailinator.com
+
+# 1) Refresh urls.txt with newly-confirmed scam domains from the pipeline.
+#    Default below uses THIS worker's own detections (src/results/<SYSNO>/).
+#    systemd does NOT expand globs; the '*' is passed literally and feeder.py
+#    expands it via glob.glob(), which is exactly what we want.
+#
+#    To crawl BOTH workers' finds instead, pull the master's aggregated results
+#    first, then feed from that copy -- replace the ExecStartPre line below with:
+#      ExecStartPre=/usr/bin/rsync -az -e 'ssh -i /home/ubuntu/.ssh/id_ed25519 -o StrictHostKeyChecking=no' ubuntu@<VM1_IP>:/home/ubuntu/crimson/collected_results/results/ /home/ubuntu/crimson/collected_results/results/
+#      ExecStartPre=/usr/bin/python3 feeder.py --results /home/ubuntu/crimson/collected_results/results/*/results.log.*
+ExecStartPre=/usr/bin/python3 feeder.py --results /home/ubuntu/crimson/src/results/*/results.log.*
+
+# 2) One crawl pass over any new domains (resumes via crawled_urls.txt).
+ExecStart=/usr/bin/python3 crawler_script.py
+
+# A crawl over many sites can take hours; don't let systemd time it out.
+TimeoutStartSec=0
