@@ -38,6 +38,24 @@ email_used = None
 start_url = ''
 blacklisted_urls = ["facebook.com", "example.com","linkedin.com","paypal.com"]
 
+# --- Paths & credentials --------------------------------------------------
+# Resolve input files relative to THIS file so the crawler works no matter what
+# working directory systemd/cron launches it from, and so it always reads the
+# same urls.txt that feeder.py appends to.
+HERE = os.path.dirname(os.path.abspath(__file__))
+NAMES_FILE = os.path.join(HERE, 'other', 'names.txt')        # dictionary of common names
+URLS_FILE = os.path.join(HERE, 'urls.txt')                   # crawler input, produced by feeder.py
+CRAWLED_URLS_FILE = os.path.join(HERE, 'crawled_urls.txt')   # single-URL resume checkpoint
+# Mailinator email-confirmation is optional; set these env vars to enable it.
+EMAIL_DOMAIN = os.environ.get('MAILINATOR_DOMAIN', 'your-email-domain.com')
+MAILINATOR_API_KEY = os.environ.get('MAILINATOR_API_KEY', 'YOUR_API_KEY')
+# Chromium/chromedriver locations. Defaults match the Crimson worker nodes
+# (snap Chromium shim + system chromedriver), the same paths recv.py uses.
+# Override via env for other environments.
+CHROMEDRIVER_PATH = os.environ.get('CHROMEDRIVER_PATH', '/usr/bin/chromedriver')
+CHROME_BINARY = os.environ.get('CHROME_BIN', '/usr/bin/chromium-browser')
+# --------------------------------------------------------------------------
+
 # Configure logging
 logging.basicConfig(filename=log_file_path, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 sys.stdout = open(log_file_path, 'a', buffering=1)
@@ -57,10 +75,11 @@ def setup_chrome_options():
         "translate": {"enabled": False},
         "intl.accept_languages": "en-US,en"
     })
+    chrome_options.binary_location = CHROME_BINARY
     return chrome_options
 
 
-chrome_driver_path = "/usr/local/bin/chromedriver"
+chrome_driver_path = CHROMEDRIVER_PATH
 service = Service(executable_path=chrome_driver_path)
 chrome_options = setup_chrome_options()
 
@@ -94,7 +113,7 @@ def initialize_driver():
 driver = initialize_driver()
 
 # Generate random strings and emails for filling forms
-def generate_random_string(length=8, names_file='names.txt'): #names.txt contains a dictionary of common names
+def generate_random_string(length=8, names_file=NAMES_FILE): #names.txt contains a dictionary of common names
     with open(names_file, 'r') as file:
         names = [line.strip() for line in file.readlines()]
     random_name = random.choice(names)
@@ -104,7 +123,7 @@ def generate_random_string(length=8, names_file='names.txt'): #names.txt contain
 def generate_random_email():
     random_number = random.randint(60, 99)
     username = generate_random_string()
-    return f"{username}{random_number}@your-email-domain.com" 
+    return f"{username}{random_number}@{EMAIL_DOMAIN}"
 
 # Generate crypto addresses
 def generate_btc_address():
@@ -143,7 +162,7 @@ def predict_values(form):
     predictions = {}
     predicted_password = "Pass@1234"
     predicted_username = generate_random_string()
-    predicted_email = f"{predicted_username}{random.randint(60, 99)}@your-email-domain.com"
+    predicted_email = f"{predicted_username}{random.randint(60, 99)}@{EMAIL_DOMAIN}"
     input_tags = form.find_elements(By.TAG_NAME, 'input')
 
     for input_tag in input_tags:
@@ -314,7 +333,7 @@ def fill_sign_up_form(driver, start_url):
                             email_used = predictions.get("email")
                             form_filled = True
                             logging.info(f"Form submission successful. Signed up using {email_used}")
-                            api_key = "YOUR_API_KEY"
+                            api_key = MAILINATOR_API_KEY
                             email_checked = check_mailinator_inbox_and_click_links(api_key, driver, 10)
                             if email_checked:
                                 logging.info("Successfully interacted with new email.")
@@ -426,7 +445,7 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
             username_input = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[name="username"],input[type="email"],input[type="text"]')))
             input_type = username_input.get_attribute('type')
             if input_type == "text":
-                modified_email = re.sub(r'\d+', '', email_used).replace("@your-email-domain.com", "")
+                modified_email = re.sub(r'\d+', '', email_used).replace(f"@{EMAIL_DOMAIN}", "")
                 username_input.send_keys(modified_email)
             else:
                 username_input.send_keys(email_used)
@@ -780,6 +799,9 @@ def get_last_processed_url(file_path):
 
 # Check Mailinator inbox and click links. Mailinator is used as an email service to click on email confirmation links after signup
 def check_mailinator_inbox_and_click_links(api_key, driver, time_threshold_seconds=10):
+    if not api_key or api_key == "YOUR_API_KEY":
+        logging.info("Mailinator API key not configured; skipping email-confirmation step.")
+        return False
     endpoint = "https://api.mailinator.com/api/v2/domains/private/inboxes"
     params = {"token": api_key}
     email_interacted = False
@@ -820,8 +842,8 @@ def main():
     driver = initialize_driver()
     handle_alert(driver)  # Handle initial alerts right after the driver is initialized
     try:
-        list_of_urls_file = 'urls.txt' #List of URLs to run the crawler through
-        last_processed_file_path = 'crawled_urls.txt' #Contains the last crawled URL to keep track
+        list_of_urls_file = URLS_FILE #List of URLs (produced by feeder.py from pipeline results)
+        last_processed_file_path = CRAWLED_URLS_FILE #Contains the last crawled URL to keep track
         fill_sign_up_urls_in_list(list_of_urls_file, last_processed_file_path)
 
         login_url = find_login_url_with_single_password_field(driver, start_url)
