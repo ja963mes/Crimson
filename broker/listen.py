@@ -8,8 +8,13 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 from datetime import timezone, timedelta
 
+"""
+listen.py is a messenger. It listens to the web socket server from cron.py and sets up the 
+RabbitMQ pipeline, then forwards the raw data to the RabbitMQ message broker. 
+"""
+
 # Configuration
-SELF_IP = '<PAPER_HOST_IP>'
+SELF_IP = '<VM1_IP>'
 RABBITMQ_HOST = 'localhost'
 QUEUE_NAME = 'urls'
 LOG_DIR = "sender-logs"
@@ -72,7 +77,13 @@ class CryptoScamListener:
         self.message_count += 1
         self.hourly_message_count += 1
         try:
-            self.channel.basic_publish(exchange='', routing_key=QUEUE_NAME, body=json.dumps(message), properties=pika.BasicProperties(delivery_mode=2))
+            # FIX: Pass 'message' directly to avoid double-encoding the JSON string
+            self.channel.basic_publish(
+                exchange='', 
+                routing_key=QUEUE_NAME, 
+                body=message, 
+                properties=pika.BasicProperties(delivery_mode=2)
+            )
         except Exception as e:
             logger.error(f"Error publishing message to RabbitMQ: {e}")
 
@@ -87,7 +98,13 @@ class CryptoScamListener:
         logger.info("WebSocket connection opened")
 
     def start_websocket_listener(self):
-        self.ws = websocket.WebSocketApp(f"ws://{SELF_IP}:4000", on_open=self.on_open, on_message=self.on_message, on_error=self.on_error, on_close=self.on_close)
+        self.ws = websocket.WebSocketApp(
+            f"ws://{SELF_IP}:4000", 
+            on_open=self.on_open, 
+            on_message=self.on_message, 
+            on_error=self.on_error, 
+            on_close=self.on_close
+        )
         threading.Thread(target=self.ws.run_forever, daemon=True).start()
 
     def run(self):
