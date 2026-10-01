@@ -1,0 +1,27 @@
+[Unit]
+Description=Crimson CertStream listener (listen.py: feed -> urls)
+After=network-online.target rabbitmq-server.service
+Wants=network-online.target
+# Bound to the broker: listen.py reconnects the WebSocket on its own, but never
+# its RabbitMQ channel -- after a broker restart it would log publish errors
+# forever and drop every cert. Restarting with the broker gives it a fresh one.
+Requires=rabbitmq-server.service
+PartOf=rabbitmq-server.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/crimson/src
+EnvironmentFile=/home/ubuntu/.crimson_env.systemd
+Environment="PYTHONUNBUFFERED=1"
+Environment="CERTSTREAM_URL=ws://<CERTSTREAM_IP>:8080/"
+ExecStart=/usr/bin/python3 /home/ubuntu/crimson/src/listen.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=crimson-listener
+
+[Install]
+WantedBy=multi-user.target rabbitmq-server.service
