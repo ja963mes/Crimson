@@ -59,8 +59,19 @@ keyword_in_url = {"crypto", "fx", "earn", "deposit", "trade", "capital", "invest
 keyword_in_url |= {"trader", "traders", "trading", "trades", "traded",
                    "funds", "funded", "coins", "miners"}
 
+# ---------------------------------------------------------------------------
+# Whitelist -- registered domains whose certs are never worth crawling. An
+# entry also covers every subdomain under it, matched on a dot boundary (see
+# match_domain_name_with_keywords), so lookalikes like bitcoinaws.dev are still
+# filtered normally.
+#
+# Measured on VM1, Oct 2 2026: Amazon's internal test certs
+# (*.globaltest.prod.sadbirds.aws.dev, *.sadbirds.aws.a2z.eu) were 44% of all
+# URL-filter passes and 52% of what reached incubation_queue.
+# ---------------------------------------------------------------------------
 domain_whitelist = { # Update as needed!
-
+    "aws.dev",   # ~35% of URL-filter passes
+    "a2z.eu",    # ~10%
 }
 
 # ---------------------------------------------------------------------------
@@ -100,7 +111,7 @@ def _token_matches(token, keyword):
 
 def match_domain_name_with_keywords(domain_name):
     for domain_kw in domain_whitelist:
-        if(domain_name.endswith(domain_kw)):
+        if domain_name == domain_kw or domain_name.endswith('.' + domain_kw):
             return False
     extracted = tldextract.extract(domain_name)
     domain_without_tld = extracted.domain
