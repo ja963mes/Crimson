@@ -1,0 +1,31 @@
+[Unit]
+Description=Crimson URL filter (send.py: urls -> incubation_queue, instance %i)
+After=network-online.target rabbitmq-server.service
+Wants=network-online.target
+# Bound to the broker: send.py dies when RabbitMQ goes away, and Restart= alone
+# would just crash-loop until it returns. PartOf/Requires propagate a broker
+# stop or restart here; WantedBy=rabbitmq-server.service pulls this back in
+# when the broker starts again (e.g. after an unattended-upgrades restart).
+Requires=rabbitmq-server.service
+PartOf=rabbitmq-server.service
+
+# Templated so several filters can share the urls queue as competing consumers
+# (one send.py tops out at ~700 certs/s; the feed delivers ~975/s). %i is only a
+# label. Each instance keeps its own dedupe cache, so dedupe is per instance.
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/crimson/src
+EnvironmentFile=/home/ubuntu/.crimson_env.systemd
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/python3 /home/ubuntu/crimson/src/send.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=crimson-filter-%i
+
+[Install]
+WantedBy=multi-user.target rabbitmq-server.service
