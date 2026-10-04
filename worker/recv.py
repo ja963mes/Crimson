@@ -33,7 +33,7 @@ OPENAI_MAX_RETRIES = 2
 _openai_client = None
 
 
-QUEUE_IP = '<VM1_IP>'
+QUEUE_IP = '<BROKER_IP>'
 searcher = Searcher()
 os.environ['OMP_THREAD_LIMIT'] = '1'
 SYSNO = sys.argv[1]
@@ -60,10 +60,10 @@ def ensure_directory_exists(directory_path):
             log(f"Error creating directory {directory_path}: {e}", str(datetime.now(newYorkTz)).split(' ')[0].replace('-', '')[2:], 'errors.txt', 'a')
 
 def sync(url_name, curr_date, local_file_path, remote_file_path):
-    # Absolute path on the worker node (VM2/VM3)
+    # Absolute path on the worker node (VM1/VM2/VM3)
     abs_local_path = f"/home/ubuntu/crimson/src/{local_file_path}"
 
-    # Absolute path on the master node (VM1)
+    # Absolute path on the central node (the broker host, QUEUE_IP)
     abs_remote_path = f"/home/ubuntu/crimson/collected_results/{local_file_path}"
 
     # Absolute path to the SSH key
