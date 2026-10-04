@@ -134,7 +134,14 @@ class CryptoScamListener:
                     on_error=self.on_error,
                     on_close=self.on_close
                 )
-                self.ws.run_forever(ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT)
+                # skip_utf8_validation: websocket-client otherwise validates every text
+                # frame in pure Python (no wsaccel), ~3 ms per 4 KB message. On the 2-core
+                # broker VM that alone needed more than one core for the full feed, so the
+                # socket backed up and ~40% of certs were lost. send.py's json.loads still
+                # rejects malformed frames. on_message now receives bytes, which pika
+                # publishes unchanged.
+                self.ws.run_forever(ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT,
+                                    skip_utf8_validation=True)
                 logger.warning(f"Feed disconnected. Reconnecting in {self.backoff}s...")
                 time.sleep(self.backoff)
                 self.backoff = min(self.backoff * 2, MAX_BACKOFF)
