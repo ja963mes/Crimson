@@ -15,7 +15,7 @@ RabbitMQ pipeline, then forwards the raw data to the RabbitMQ message broker.
 The feed is now an EXTERNAL CertStream server rather than the self-hosted one that
 cron.py used to supervise. Override with the CERTSTREAM_URL env var; cron.py and
 certstream-server/ are left in place so reverting to the local feed only means
-setting CERTSTREAM_URL=ws://<VM1_IP>:4000 and starting cron.py again.
+setting CERTSTREAM_URL=ws://<BROKER_IP>:4000 and starting cron.py again.
 """
 
 # Configuration
