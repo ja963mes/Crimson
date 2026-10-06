@@ -714,6 +714,7 @@ def check(url_name, curr_date):
     start_eval = time.time()
     raw_dom_text = extract_dom_text(html_content)
     clean_text = sanitize_text(raw_dom_text)
+    dom_text = clean_text  # kept for the content filter if OCR replaces clean_text below
     used_ocr = False
 
     # Evasion Detection Check: Fall back to visual processing if DOM text is suspiciously thin
@@ -745,10 +746,19 @@ def check(url_name, curr_date):
             return f"OCR failure."
 
         clean_text = sanitize_text(raw_ocr_text)
-   # Pass 2: Classification Engine Call with Content Filter
-    # content_filter still runs first: it is free, and at ~98.7% rejection it keeps
-    # the Ollama call (the expensive step on CPU-only hardware) off most pages.
-    if used_ocr or content_filter(clean_text):
+    # Pass 2: Classification Engine Call with Content Filter
+    # content_filter runs first on every page: it is free, and at ~98.7% rejection
+    # it keeps the Ollama call (the expensive step on CPU-only hardware) off most pages.
+    #
+    # OCR'd pages used to skip it (`if used_ocr or content_filter(...)`). The paper
+    # and the published artifact filter every page, and the artifact's OCR() ran
+    # the filter on OCR text and HTML text combined; that is restored here. Once
+    # screenshots started working (Oct 6) the bypass sent every thin-DOM page to the
+    # LLM: 92% of that day's OpenAI calls came from OCR pages, Ollama called half of
+    # them "garbled", and all 4 OCR-path "scams" were non-crypto pages that fail
+    # this filter. The LLM still gets the OCR text only, as in the artifact.
+    filter_text = f"{clean_text} {dom_text}" if used_ocr else clean_text
+    if content_filter(filter_text):
         evaluation = evaluate_hybrid(clean_text, url_name, curr_date)
     else:
         evaluation = {"is_scam": False, "confidence": 0, "reason": "Cleared_By_Content_Filter"}
