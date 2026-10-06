@@ -41,7 +41,10 @@ class SeleniumScreenshot:
         service = Service(executable_path=r'/usr/bin/chromedriver')
         browser = None
         try:
-            service.start()
+            # No service.start() here: webdriver.Chrome() starts the service itself.
+            # Starting it first launched a second chromedriver on the same port,
+            # leaking one per attempt and making startup race; on VM2 and VM3
+            # every screenshot failed.
             browser = webdriver.Chrome(options=self.options, service=service)
             browser.set_page_load_timeout(20)
             browser.get(scheme + url)
