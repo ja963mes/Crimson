@@ -223,6 +223,17 @@ OLLAMA_MODEL = "llama3.2:3b"
 OLLAMA_MAX_ATTEMPTS = 1
 OLLAMA_TIMEOUT = 90  # seconds, generous for CPU-only inference on longer prompts
 
+# Ollama runs llama3.2:3b with a 4,096-token context. A longer prompt is cut to
+# its tail, which drops the system prompt, so the model answers without its
+# instructions and returns no JSON. Measured Oct 1-5: each of the 102 "JSON
+# decode error" failures on VM2/VM3 matched a prompt over 4,096 tokens (median
+# ~7k, max 140k), and those pages went to OpenAI. sanitize_text() output is
+# ASCII at roughly 3-4 chars per token, so 8,000 chars (~2,000-2,700 tokens)
+# plus the ~400-token system prompt fits with room for the reply.
+# Only Ollama's copy is capped: content_filter() and the OpenAI fallback still
+# see the full page (see the note in sanitize_text()).
+OLLAMA_MAX_TEXT_CHARS = 8000
+
 # Below this, a yes/no from Ollama is not trusted on its own and goes to OpenAI.
 #
 # check() files a confirmed scam only when confidence > SCAM_CONFIDENCE_BAR, so a
@@ -296,7 +307,7 @@ def evaluate_ocr_with_ollama(clean_text, domain_name, curr_date):
     """
     messages = [
         {"role": "system", "content": OLLAMA_SYSTEM_PROMPT},
-        {"role": "user", "content": f"Domain: {domain_name}\nText Content: {clean_text}"}
+        {"role": "user", "content": f"Domain: {domain_name}\nText Content: {clean_text[:OLLAMA_MAX_TEXT_CHARS]}"}
     ]
 
     attempt = 0
