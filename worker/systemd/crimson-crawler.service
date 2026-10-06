@@ -9,25 +9,14 @@ Type=oneshot
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/crimson/src/authentication_crawling
-
-# --- optional: enable Mailinator email-confirmation clicking ---
-# The crawler skips the email step entirely unless BOTH of these are set.
-#Environment=MAILINATOR_API_KEY=your_token_here
-#Environment=MAILINATOR_DOMAIN=yourname.mailinator.com
-
-# 1) Refresh urls.txt with newly-confirmed scam domains from the pipeline.
-#    Default below uses THIS worker's own detections (src/results/<SYSNO>/).
-#    systemd does NOT expand globs; the '*' is passed literally and feeder.py
-#    expands it via glob.glob(), which is exactly what we want.
-#
-#    To crawl BOTH workers' finds instead, pull the master's aggregated results
-#    first, then feed from that copy -- replace the ExecStartPre line below with:
-#      ExecStartPre=/usr/bin/rsync -az -e 'ssh -i /home/ubuntu/.ssh/id_ed25519 -o StrictHostKeyChecking=no' ubuntu@<VM1_IP>:/home/ubuntu/crimson/collected_results/results/ /home/ubuntu/crimson/collected_results/results/
-#      ExecStartPre=/usr/bin/python3 feeder.py --results /home/ubuntu/crimson/collected_results/results/*/results.log.*
+# MAILINATOR_DOMAIN and MAILINATOR_API_KEY for sign-up emails and confirmation
+# links (crawler_script.py skips the email step when they are missing).
+EnvironmentFile=/home/ubuntu/.crimson_env.systemd
+Environment="PYTHONUNBUFFERED=1"
+# Each VM crawls the scams its own worker confirmed. feeder.py expands the glob
+# itself and only appends new domains to urls.txt, so the crawler's resume
+# checkpoint (crawled_urls.txt) stays valid between runs.
 ExecStartPre=/usr/bin/python3 feeder.py --results /home/ubuntu/crimson/src/results/*/results.log.*
-
-# 2) One crawl pass over any new domains (resumes via crawled_urls.txt).
+# One pass over urls.txt; the crawler logs to logs/logfile.log next to itself.
 ExecStart=/usr/bin/python3 crawler_script.py
-
-# A crawl over many sites can take hours; don't let systemd time it out.
 TimeoutStartSec=0
