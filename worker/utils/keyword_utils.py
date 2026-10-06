@@ -68,10 +68,20 @@ keyword_in_url |= {"trader", "traders", "trading", "trades", "traded",
 # Measured on VM1, Oct 2 2026: Amazon's internal test certs
 # (*.globaltest.prod.sadbirds.aws.dev, *.sadbirds.aws.a2z.eu) were 44% of all
 # URL-filter passes and 52% of what reached incubation_queue.
+#
+# Measured on the broker VM, Oct 4-5 2026: cloud managed-service endpoints
+# (S3 access points, ElastiCache, VPC endpoints, Cosmos DB) were ~13% of what
+# was sent to incubation_queue. Entries can be subdomains: azure.com itself is
+# NOT whitelisted, because cloudapp.azure.com names are customer-controlled VMs
+# that can host a site. amazonaws.com is safe whole: S3 buckets share Amazon's
+# wildcard cert, so individual buckets never reach CT anyway.
 # ---------------------------------------------------------------------------
 domain_whitelist = { # Update as needed!
-    "aws.dev",   # ~35% of URL-filter passes
-    "a2z.eu",    # ~10%
+    "aws.dev",            # ~35% of URL-filter passes (Oct 2)
+    "a2z.eu",             # ~10%
+    "amazonaws.com",      # ~5.6% of sends (Oct 4-5)
+    "windows-int.net",    # ~4.3%, Azure internal test environments
+    "cosmos.azure.com",   # ~2.9%, Cosmos DB endpoints
 }
 
 # ---------------------------------------------------------------------------
