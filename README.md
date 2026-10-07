@@ -6,16 +6,16 @@
 Supervises the certstream-server process. Polls its status every 15 seconds and restarts it if it has died, logging to `../server-logs/server.log`.
 
 ### `listen.py`
-Connects to the certstream WebSocket at `ws://<SELF_IP>:4000` and publishes each raw certificate-update message to the `urls` RabbitMQ queue.
+Connects to the external CertStream WebSocket (`CERTSTREAM_URL`, `ws://130.245.32.192:8080/` by default) and publishes each raw certificate-update message to the `urls` RabbitMQ queue. Runs on the broker host (130.245.32.119) alongside `send.py`.
 
 ### `send.py`
 The URL filter. Consumes `urls`, pulls every domain out of each certificate, and keeps only those whose name matches the crypto keyword list via `keyword_utils`. Survivors are de-duplicated through a 50,000-entry LRU cache and published to `incubation_queue`, which holds each domain for 12 hours before dead-lettering it into `cryptoscams`. Logs which domains passed, were deduped, and were sent.
 
 ### `recv.py`
-The worker. Consumes `cryptoscams` and, for each domain: fetches the site (HTTPS first, browser User-Agent, certificate errors ignored), extracts and sanitizes the page text, then applies the content filter, which requires investment words, coin words, and context words to all be present. Pages with under 150 characters of DOM text fall back to a Selenium screenshot plus Tesseract OCR. Survivors go to `evaluate_hybrid()`, which asks the local Ollama model first and escalates to OpenAI only when the local verdict is `unsure` or below the confidence bar. Domains confirmed above the bar are enriched with WHOIS, IP and IOC data, then rsynced back to the master. Takes `SYSNO` and `SCREENNO` as command-line arguments.
+The worker. Consumes `cryptoscams` and, for each domain: fetches the site (HTTPS first, browser User-Agent, certificate errors ignored), extracts and sanitizes the page text, then applies the content filter, which requires investment words, coin words, and context words to all be present. An HYIP phrase (such as "investment plans" or "2% daily") can stand in for the investment word. Pages with exclusion words that mark another kind of site (token presales and airdrops, parked domains, QFS pages, or two different gambling words) are dropped unless they also contain an HYIP phrase, and each is logged to `content_excluded.txt`. Pages with under 150 characters of DOM text fall back to a Selenium screenshot plus Tesseract OCR, and the content filter then runs on the OCR text and DOM text combined, as in the published artifact. Survivors go to `evaluate_hybrid()`, which asks the local Ollama model first and escalates to OpenAI only when the local verdict is `unsure` or below the confidence bar. Both prompts target HYIP (high-yield investment program) sites only; other crypto scams such as drainers, airdrops and meme coins count as "no". Domains confirmed above the bar are enriched with WHOIS, IP and IOC data, then rsynced to `collected_results/` on the broker host (`QUEUE_IP`, 130.245.32.119). Takes `SYSNO` and `SCREENNO` as command-line arguments.
 
 ### `validate.py`
-Classifies OCR-extracted text by piping it to a local LLM through a subprocess. Validates that the model's JSON reply contains `answer` and `reason` keys, and retries up to five times with a correction prompt appended when the format is wrong.
+Classifies OCR-extracted text as HYIP or not by piping it to a local LLM through a subprocess, using the same HYIP-only prompt as `recv.py`. Validates that the model's JSON reply contains `answer` and `reason` keys, and retries up to five times with a correction prompt appended when the format is wrong.
 
 ### `test_pipeline.py`
 Pulls three domains out of `incubation_queue` and republishes them directly into `cryptoscams`, bypassing the 12-hour incubation wait so the workers can be exercised immediately.

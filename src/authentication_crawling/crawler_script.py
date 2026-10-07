@@ -1,5 +1,6 @@
 
 import base64
+import html
 import itertools
 import logging
 import os
@@ -47,8 +48,16 @@ NAMES_FILE = os.path.join(HERE, 'other', 'names.txt')        # dictionary of com
 URLS_FILE = os.path.join(HERE, 'urls.txt')                   # crawler input, produced by feeder.py
 CRAWLED_URLS_FILE = os.path.join(HERE, 'crawled_urls.txt')   # single-URL resume checkpoint
 # Mailinator email-confirmation is optional; set these env vars to enable it.
+# On the Crimson VMs they come from ~/.crimson_env.systemd via the unit's
+# EnvironmentFile, so the API token never lives in this file or the repo.
 EMAIL_DOMAIN = os.environ.get('MAILINATOR_DOMAIN', 'your-email-domain.com')
 MAILINATOR_API_KEY = os.environ.get('MAILINATOR_API_KEY', 'YOUR_API_KEY')
+# "private" addresses the account's private domain (EMAIL_DOMAIN) in the v2 API.
+MAILINATOR_API = 'https://api.mailinator.com/api/v2/domains/private'
+MAILINATOR_WAIT_SECONDS = 60   # how long to poll the sign-up inbox for a confirmation email
+# The password every sign-up form gets, and therefore the one login must use.
+# Login used to send the literal string "PASSWORD", so no login could succeed.
+ACCOUNT_PASSWORD = 'Pass@1234'
 # Chromium/chromedriver locations. Defaults match the Crimson worker nodes
 # (snap Chromium shim + system chromedriver), the same paths recv.py uses.
 # Override via env for other environments.
@@ -79,8 +88,6 @@ def setup_chrome_options():
     return chrome_options
 
 
-chrome_driver_path = CHROMEDRIVER_PATH
-service = Service(executable_path=chrome_driver_path)
 chrome_options = setup_chrome_options()
 
 # Handle pop ups and alerts
@@ -105,12 +112,18 @@ def handle_alert(driver):
         logging.error(f"Failed to override alert functions: {e}")
 
 # Initialize driver function
+#
+# Each browser gets its own chromedriver Service. A single module-level Service
+# used to be shared by every webdriver.Chrome() call, and a browser was also
+# opened at import time and never quit: every run leaked a chromedriver plus
+# Chrome, and later starts reused a Service that was already running.
 def initialize_driver():
+    service = Service(executable_path=CHROMEDRIVER_PATH)
     driver = webdriver.Chrome(service=service, options=chrome_options)
     handle_alert(driver)  # Handle alerts immediately after driver initialization
     return driver
 
-driver = initialize_driver()
+driver = None  # created in main(); fill_form() and the URL loop use this global
 
 # Generate random strings and emails for filling forms
 def generate_random_string(length=8, names_file=NAMES_FILE): #names.txt contains a dictionary of common names
@@ -160,7 +173,7 @@ def has_captcha(html_content, driver):
 # Predict form values
 def predict_values(form):
     predictions = {}
-    predicted_password = "Pass@1234"
+    predicted_password = ACCOUNT_PASSWORD
     predicted_username = generate_random_string()
     predicted_email = f"{predicted_username}{random.randint(60, 99)}@{EMAIL_DOMAIN}"
     input_tags = form.find_elements(By.TAG_NAME, 'input')
@@ -213,19 +226,23 @@ def handle_checkbox(driver):
     except Exception as e:
         logging.error(f"An error occurred while handling checkboxes: {e}")
 
-# Ensure driver function with enhanced error handling
-def ensure_driver(driver):
+# Ensure driver function with enhanced error handling. A replacement is also
+# stored in the module-level `driver`, which fill_form() and the URL loop use;
+# otherwise they kept working with the dead browser.
+def ensure_driver(drv):
+    global driver
     try:
-        current_url = driver.current_url
+        drv.current_url
+        return drv
     except (WebDriverException, Exception) as e:
         logging.info(f"WebDriver not responding, reinitializing due to error: {e}")
         try:
             logging.info("Quitting driver now")
-            driver.quit()
+            drv.quit()
         except Exception as inner_e:
             logging.error(f"Failed to quit the driver: {inner_e}")
         driver = initialize_driver()
-    return driver
+        return driver
 
 # Handle dropdowns
 def handle_dropdowns(form, driver):
@@ -330,19 +347,23 @@ def fill_sign_up_form(driver, start_url):
                         ]
 
                         if submit_form(driver, selectors):
-                            email_used = predictions.get("email")
+                            # predictions is keyed by input name, so .get("email") only
+                            # worked when the field was literally named "email". Take the
+                            # generated address from whichever field received it.
+                            email_used = next((v for v in predictions.values()
+                                               if isinstance(v, str) and v.endswith(f"@{EMAIL_DOMAIN}")), None)
                             form_filled = True
                             logging.info(f"Form submission successful. Signed up using {email_used}")
-                            api_key = MAILINATOR_API_KEY
-                            email_checked = check_mailinator_inbox_and_click_links(api_key, driver, 10)
+                            email_checked = check_mailinator_inbox_and_click_links(
+                                MAILINATOR_API_KEY, driver, email_used, signup_time=time.time())
                             if email_checked:
                                 logging.info("Successfully interacted with new email.")
                             else:
-                                logging.info("No new email to interact with within 10 seconds.")
+                                logging.info(f"No confirmation email clicked within {MAILINATOR_WAIT_SECONDS} seconds.")
 
                             login_url = find_login_url_with_single_password_field(driver, current_url)
                             if login_url:
-                                login_and_take_screenshot(driver, login_url, "PASSWORD", email_used)
+                                login_and_take_screenshot(driver, login_url, ACCOUNT_PASSWORD, email_used)
                             else:
                                 logging.info("Could not find a login URL to proceed with login.")
                                 return False
@@ -385,6 +406,9 @@ def has_two_or_more_password_fields(driver, url):
 
 # Process URLs from a list
 def fill_sign_up_urls_in_list(urls_file_path, last_processed_file_path):
+    if not os.path.exists(urls_file_path):
+        logging.info(f"No {urls_file_path} yet (feeder.py has not added any domains); nothing to crawl.")
+        return
     last_processed_url = get_last_processed_url(last_processed_file_path)
     start_processing = last_processed_url is None
 
@@ -427,14 +451,18 @@ def has_single_password_field(driver, url):
         logging.error(f"An error occurred while fetching {url}: {str(e)}")
     return None
 
-# Get base domain from URL
+# Get base domain from URL. A leading "www." is dropped so that a site which
+# redirects example.com -> www.example.com still counts as one site; otherwise
+# every link on the redirected page looked off-site and the crawl stopped on
+# the first page (seen on crystaltradeinvestment.net).
 def get_base_domain(url):
-    parsed_url = urlparse(url)
-    return parsed_url.netloc
+    netloc = urlparse(url).netloc.lower()
+    return netloc[4:] if netloc.startswith('www.') else netloc
 
 # Login and take screenshot
 def login_and_take_screenshot(driver, login_url, predicted_password, email_used):
     base_domain = get_base_domain(login_url)
+    original_window = None  # the finally block below reads it even if driver.get() fails
     try:
         driver.get(login_url)
         logging.info(f"Navigating to URL: {login_url}")
@@ -478,7 +506,7 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
     except Exception as e:
         logging.error(f"Unexpected error during login and page capturing: {e}")
     finally:
-        if original_window in driver.window_handles:
+        if original_window and original_window in driver.window_handles:
             driver.switch_to.window(original_window)
 
 #Validate links to avoid clicking on logout/signout buttons
@@ -798,43 +826,66 @@ def get_last_processed_url(file_path):
         return None
 
 # Check Mailinator inbox and click links. Mailinator is used as an email service to click on email confirmation links after signup
-def check_mailinator_inbox_and_click_links(api_key, driver, time_threshold_seconds=10):
+#
+# Polls the one inbox the sign-up used (the local part of email_address) for up
+# to MAILINATOR_WAIT_SECONDS and opens the links in any message that arrived
+# after signup_time. Shapes verified against the v2 API on Oct 6 2026:
+#   GET {MAILINATOR_API}/inboxes/{inbox}                      -> {"msgs": [{"id", "time" (epoch ms), "subject", ...}]}
+#   GET {MAILINATOR_API}/inboxes/{inbox}/messages/{id}/links  -> {"links": [...]}
+#   GET {MAILINATOR_API}/inboxes/{inbox}/messages/{id}        -> {"parts": [{"body": ...}], ...}
+# The old version listed "inboxes" (the API returns "msgs"), read "time" as
+# seconds and "data.parts" for the body, so it could never click anything.
+MAILINATOR_CONFIRM_HINTS = ('verif', 'confirm', 'activat', 'token', 'valid', 'register', 'signup', 'sign-up')
+MAILINATOR_MAX_CLICKS = 3
+
+def _mailinator_links(inbox, msg_id, params):
+    base = f"{MAILINATOR_API}/inboxes/{inbox}/messages/{msg_id}"
+    resp = requests.get(f"{base}/links", params=params, timeout=15)
+    resp.raise_for_status()
+    links = resp.json().get('links', [])
+    if not links:  # fall back to the hrefs in the message body
+        resp = requests.get(base, params=params, timeout=15)
+        resp.raise_for_status()
+        for part in resp.json().get('parts', []):
+            links += [html.unescape(l) for l in re.findall(r'https?://[^\s"\'<>]+', part.get('body', ''))]
+    # Confirmation-looking links first, unsubscribe links never, each link once.
+    links = [l for l in dict.fromkeys(links) if 'unsubscribe' not in l.lower()]
+    return sorted(links, key=lambda l: not any(h in l.lower() for h in MAILINATOR_CONFIRM_HINTS))
+
+def check_mailinator_inbox_and_click_links(api_key, driver, email_address, signup_time,
+                                           wait_seconds=MAILINATOR_WAIT_SECONDS):
     if not api_key or api_key == "YOUR_API_KEY":
         logging.info("Mailinator API key not configured; skipping email-confirmation step.")
         return False
-    endpoint = "https://api.mailinator.com/api/v2/domains/private/inboxes"
-    params = {"token": api_key}
-    email_interacted = False
-
-    try:
-        response = requests.get(endpoint, params=params)
-        response.raise_for_status()
-        inboxes = response.json().get('inboxes', [])
-
-        for inbox in inboxes:
-            inbox_endpoint = f"{endpoint}/{inbox}/messages"
-            inbox_response = requests.get(inbox_endpoint, params=params)
-            inbox_response.raise_for_status()
-            emails = inbox_response.json().get('msgs', [])
-
-            for email in emails:
-                email_time = datetime.fromtimestamp(email['time'])
-                if datetime.now() - email_time < timedelta(seconds=time_threshold_seconds):
-                    email_id = email['id']
-                    email_content_endpoint = f"{inbox_endpoint}/{email_id}"
-                    email_content_response = requests.get(email_content_endpoint, params=params)
-                    email_content = email_content_response.json().get('data', {}).get('parts', [])[0].get('body', '')
-
-                    links = re.findall('http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', email_content)
-                    for link in links:
-                        driver.get(link)
-                        logging.info(f"Clicked link in email: {link}")
-                        email_interacted = True
-
-        return email_interacted
-    except requests.RequestException as e:
-        logging.error(f"Error checking Mailinator inbox: {e}")
+    if not email_address or not email_address.endswith(f"@{EMAIL_DOMAIN}"):
+        logging.info(f"Sign-up email {email_address!r} is not on {EMAIL_DOMAIN}; skipping email-confirmation step.")
         return False
+    inbox = email_address.split('@')[0]
+    params = {"token": api_key}
+    since_ms = (signup_time - 30) * 1000  # small allowance for clock skew
+    seen, clicked = set(), 0
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline and should_continue and not clicked:
+        try:
+            resp = requests.get(f"{MAILINATOR_API}/inboxes/{inbox}",
+                                params={**params, "limit": 10, "sort": "descending"}, timeout=15)
+            resp.raise_for_status()
+            for msg in resp.json().get('msgs', []):
+                if msg['id'] in seen or msg.get('time', 0) < since_ms:
+                    continue
+                seen.add(msg['id'])
+                logging.info(f"Mailinator: '{msg.get('subject', '')}' arrived for {email_address}")
+                for link in _mailinator_links(inbox, msg['id'], params)[:MAILINATOR_MAX_CLICKS]:
+                    driver.get(link)
+                    clicked += 1
+                    logging.info(f"Clicked link in email: {link}")
+        except (requests.RequestException, ValueError, KeyError) as e:
+            logging.error(f"Error checking Mailinator inbox {inbox}: {e}")
+        except WebDriverException as e:
+            logging.error(f"Error opening a link from the Mailinator inbox {inbox}: {e}")
+        if not clicked:
+            time.sleep(5)
+    return clicked > 0
 
 # Main function
 def main():
@@ -844,19 +895,10 @@ def main():
     try:
         list_of_urls_file = URLS_FILE #List of URLs (produced by feeder.py from pipeline results)
         last_processed_file_path = CRAWLED_URLS_FILE #Contains the last crawled URL to keep track
+        # Login happens per site inside fill_sign_up_form(). A second login search
+        # used to run here from start_url, which is always '', so it only logged
+        # an "invalid argument" error.
         fill_sign_up_urls_in_list(list_of_urls_file, last_processed_file_path)
-
-        login_url = find_login_url_with_single_password_field(driver, start_url)
-        if login_url:
-            driver.get(login_url)
-            handle_alert(driver)  # Handle any alerts that may appear when navigating to the login page
-            predicted_password = 'PASSWORD' #Password for logging in the the account created
-            if login_and_take_screenshot(driver, login_url, predicted_password, email_used):
-                logging.info("Login and screenshot successful.")
-            else:
-                logging.error("Login failed or screenshot not taken.")
-        else:
-            logging.info("No page with a single password field found.")
     except Exception as e:
         logging.error(f"An error occurred in the main loop: {e}")
         driver = ensure_driver(driver)  # Ensures the driver is responsive and handles re-initialization if needed

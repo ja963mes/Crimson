@@ -64,7 +64,21 @@ def append_correction_prompt(original_text, correction_prompt, last_response):
 try:
     done_domains = load_processed_domains('done.txt')
     system_prompt = 'You are a financial advisor programmed to provide responses strictly in JSON format. Each response must contain keys "answer" and "reason". The answer key can have a value of either "yes" or "no", and the reason key should have a one word reason. Example: Input: "Invest now for a guaranteed return of 10 percent in one month." Output: {"answer": "yes", "reason": "promises"}. Please adhere strictly to this output format.'
-    user_prompt = '' # Update as needed!
+    # The paper's Appendix B prompt, narrowed to HYIPs only. Same target as
+    # OLLAMA_SYSTEM_PROMPT in recv.py; keep the two in step.
+    user_prompt = (
+        'Be sure of your answer. Determine if the provided text likely originates from an HYIP '
+        '(high-yield investment program) scam website, characterized by promises of high returns '
+        'on money deposited with the site. An HYIP is a Ponzi-style scheme: visitors open an '
+        'account, deposit money (usually cryptocurrency) into the site\'s investment plans, and '
+        'are promised high or guaranteed returns over short periods, such as 2% daily or 50% per '
+        'week. If the text suggests a low probability of being an HYIP, seems like a news site, '
+        'blog, review or guide, or does not invite visitors to sign up, log in, deposit or contact '
+        'the site to invest, respond "no". Also respond "no" for every other kind of site, '
+        'including other cryptocurrency scams: wallet drainers and seed-phrase phishing, fake '
+        'airdrops and giveaways, meme coins and token presales, fund-recovery services, casinos '
+        'and betting, and domains for sale.'
+    )
     assistant_prompt = "Sure. I will now assess the text you provide in the required format."
     ollama_binary = '' # update binary path
     scam_file = f'results/scams_{month}.txt'

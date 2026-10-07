@@ -33,7 +33,7 @@ OPENAI_MAX_RETRIES = 2
 _openai_client = None
 
 
-QUEUE_IP = '130.245.32.96'
+QUEUE_IP = '130.245.32.119'
 searcher = Searcher()
 os.environ['OMP_THREAD_LIMIT'] = '1'
 SYSNO = sys.argv[1]
@@ -60,10 +60,10 @@ def ensure_directory_exists(directory_path):
             log(f"Error creating directory {directory_path}: {e}", str(datetime.now(newYorkTz)).split(' ')[0].replace('-', '')[2:], 'errors.txt', 'a')
 
 def sync(url_name, curr_date, local_file_path, remote_file_path):
-    # Absolute path on the worker node (VM2/VM3)
+    # Absolute path on the worker node (VM1/VM2/VM3)
     abs_local_path = f"/home/ubuntu/crimson/src/{local_file_path}"
 
-    # Absolute path on the master node (VM1)
+    # Absolute path on the central node (the broker host, QUEUE_IP)
     abs_remote_path = f"/home/ubuntu/crimson/collected_results/{local_file_path}"
 
     # Absolute path to the SSH key
@@ -192,8 +192,67 @@ context_words = ["deposit", "withdraw", "reward", "growth", "gain", "capital",
 "solution", "funding"]
 
 
-def content_filter(clean_text):
+# --- HYIP phrases and exclusion words (added Oct 6, 2026) ---
+#
+# The three lists above pass HYIPs (62 of the 63 in the Oct 1-6 hand-labelled
+# sample) but also 79 of the 86 confirmed domains labelled as not HYIPs. Both
+# lists below were measured on that sample, matched against sanitize_text()
+# output (lowercase, hyphens turned into spaces, '%' kept).
+#
+# HYIP phrases: share of HYIPs vs non-HYIPs containing each. "investment
+# plan(s)" 43% vs 0%; daily/weekly/hourly profit, return, roi, interest or
+# earning 28% vs 0%; "N% daily/weekly/..." 20% vs 2%; "principal" 10% vs 1%;
+# "total deposits/withdrawn" 5% vs 0%. A page with one passes without an invest
+# word, and no exclusion word drops it.
+hyip_phrases = [re.compile(p) for p in (
+    r'\binvestment plans?\b',
+    r'\b(daily|weekly|hourly) (profit|return|roi|interest|earning)',
+    r'\d+(\.\d+)? ?% ?(daily|weekly|monthly|hourly|per day|per week|per month|a day|every day|each day|after)',
+    r'\bprincipal\b',
+    r'\btotal (deposits?|withdrawn|withdrawals)\b',
+)]
+
+# Exclusion words mark meme coins and presales, parked domains, QFS pages and
+# casinos. None appears on any of the 63 HYIPs; together they drop 44 of the 79
+# non-HYIPs above. Gambling words count only when two different ones appear:
+# one HYIP describes a resort "casino" project, another says trading is not
+# "blind gambling", and HYIPs advertise "limited slots".
+exclusion_phrases = {name: re.compile(p) for name, p in (
+    ('tokenomics', r'\btokenomics\b'),
+    ('presale', r'\bpre ?sale\b'),
+    ('airdrop', r'\bairdrops?\b'),
+    ('token sale', r'\btoken (sale|launch)\b'),
+    ('circulating supply', r'\bcirculating supply\b'),
+    ('contract address', r'\bcontract address\b'),
+    ('domain for sale', r'\bdomain\b.{0,40}\bfor sale\b|\bfor sale\b.{0,40}\bdomain\b'),
+    ('buy this domain', r'\b(buy this domain|make an offer)\b'),
+    ('qfs', r'\b(qfs|quantum financial system)\b'),
+)}
+gambling_words = {name: re.compile(p) for name, p in (
+    ('casino', r'\bcasinos?\b'),
+    ('gambling', r'\bgambling\b'),
+    ('betting', r'\b(bets?|betting|sportsbook)\b'),
+    ('slots', r'\bslots?\b'),
+    ('poker', r'\b(poker|jackpot|roulette|blackjack)\b'),
+    ('togel', r'\btogel\b'),
+    ('odds', r'\bodds\b'),
+)}
+
+
+def has_hyip_phrase(clean_text):
+    return any(rx.search(clean_text) for rx in hyip_phrases)
+
+
+def content_exclusions(clean_text):
+    """Names of the exclusion words found in clean_text ([] if none)."""
+    found = [name for name, rx in exclusion_phrases.items() if rx.search(clean_text)]
+    gambling = [name for name, rx in gambling_words.items() if rx.search(clean_text)]
+    return found + gambling if len(gambling) >= 2 else found
+
+
+def table11_filter(clean_text):
     """Table 11 content filter: invest AND coin AND context, as in the artifact.
+    An HYIP phrase may stand in for the invest word.
 
     The original tokenised with:
         clean_strings(s) = [re.sub(r'[^A-Za-z0-9]', '', x) for x in s.split()]
@@ -213,7 +272,15 @@ def content_filter(clean_text):
     matches = [find_intersection(text_splits, invest_words),
                find_intersection(text_splits, coin_words),
                find_intersection(text_splits, context_words)]
-    return bool(len(matches[0]) and len(matches[2]) and len(matches[1]))
+    return bool((len(matches[0]) or has_hyip_phrase(clean_text))
+                and len(matches[2]) and len(matches[1]))
+
+
+def content_filter(clean_text):
+    """True if the page should go to the LLM: it passes table11_filter() and
+    either has an HYIP phrase or has no exclusion words."""
+    return table11_filter(clean_text) and (
+        has_hyip_phrase(clean_text) or not content_exclusions(clean_text))
 
 # --- OLLAMA LOCAL EVALUATOR (primary verdict; escalates the unsure cases to OpenAI) ---
 
@@ -222,6 +289,17 @@ OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "llama3.2:3b"
 OLLAMA_MAX_ATTEMPTS = 1
 OLLAMA_TIMEOUT = 90  # seconds, generous for CPU-only inference on longer prompts
+
+# Ollama runs llama3.2:3b with a 4,096-token context. A longer prompt is cut to
+# its tail, which drops the system prompt, so the model answers without its
+# instructions and returns no JSON. Measured Oct 1-5: each of the 102 "JSON
+# decode error" failures on VM2/VM3 matched a prompt over 4,096 tokens (median
+# ~7k, max 140k), and those pages went to OpenAI. sanitize_text() output is
+# ASCII at roughly 3-4 chars per token, so 8,000 chars (~2,000-2,700 tokens)
+# plus the ~650-token system prompt fits with room for the reply.
+# Only Ollama's copy is capped: content_filter() and the OpenAI fallback still
+# see the full page (see the note in sanitize_text()).
+OLLAMA_MAX_TEXT_CHARS = 8000
 
 # Below this, a yes/no from Ollama is not trusted on its own and goes to OpenAI.
 #
@@ -234,22 +312,65 @@ OLLAMA_TIMEOUT = 90  # seconds, generous for CPU-only inference on longer prompt
 SCAM_CONFIDENCE_BAR = 80  # must match the threshold check() compares against
 OLLAMA_MIN_CONFIDENCE = SCAM_CONFIDENCE_BAR + 1
 
+# Both prompts target HYIPs only: sites that take deposits into their own
+# investment plans and promise high returns on them. Other crypto scams (drainers,
+# fake airdrops and giveaways, meme coins and presales, recovery scams) are "no",
+# like every other kind of site. "yes" / is_scam therefore means "is an HYIP".
+#
+# They merge the paper's classification prompt (Appendix B of "The Poorest Man in
+# Babylon", WWW '25) with this pipeline's needs. From the paper: "Be sure of your
+# answer", "characterized by promises of high returns", its four "respond no"
+# conditions, and the HYIP traits it describes in sections 2.3 and 3.2 (plans
+# with minimum/maximum deposits, implausible short-term returns, fake
+# certificates and reviews). Its sign-up and contact conditions are merged into
+# one, because 13 of the 63 HYIPs in the Oct 1-6 hand-labelled sample have no
+# English sign-up or login wording.
+#
+# The previous prompts asked for crypto scams of any kind. Of the 173 domains
+# confirmed Oct 1-6, 86 were hand-labelled as not HYIPs: casinos, meme coins and
+# presales, parked domains, recovery services, agencies, courses, real exchanges.
+#
+# The examples are input -> output pairs. The old prompt gave bare outputs, and
+# llama3.2:3b copied them: 525 of its 1,091 "no" verdicts were exactly
+# {"no", 90, "news"}, and 9 of its 36 "yes" verdicts were {"yes", 95, "airdrop"}.
 OLLAMA_SYSTEM_PROMPT = (
-    "You are a cryptocurrency fraud detector. You will be given text scraped from a website. "
-    "Decide whether the website is a cryptocurrency scam (for example: fake investment platforms, "
-    "wallet drainers, fake airdrops, guaranteed-return schemes, seed-phrase phishing). "
-    "Respond ONLY with a JSON object with exactly three keys: "
-    '"answer", "confidence" and "reason". '
-    'Set "answer" to "yes" if the text IS a cryptocurrency scam. '
-    'Set "answer" to "no" if the text is NOT a scam (legitimate site, news, blog, or unrelated content). '
-    'Set "answer" to "unsure" if you genuinely cannot tell -- for example the text is too short, '
-    "garbled, truncated, in a language you cannot read, or does not give you enough to judge. "
-    '"unsure" is a valid and useful answer; prefer it over guessing. '
-    'Set "confidence" to an integer 0-100 for how certain you are of "answer". '
-    'Set "reason" to a single word summarizing why. '
-    'Example scam -> {"answer": "yes", "confidence": 95, "reason": "airdrop"}. '
-    'Example legitimate -> {"answer": "no", "confidence": 90, "reason": "news"}. '
-    'Example unclear -> {"answer": "unsure", "confidence": 20, "reason": "garbled"}.'
+    "You are a financial advisor who screens websites for HYIP scams. An HYIP "
+    "(high-yield investment program) is a Ponzi-style scheme: visitors open an account, "
+    "deposit money (usually cryptocurrency) into the site's investment plans, and are "
+    "promised high or guaranteed returns over short periods, such as 2% daily or 50% per "
+    "week. HYIP sites typically list plans with minimum and maximum deposits, pay referral "
+    "commissions, and show account balances, earnings and withdrawals. They often claim the "
+    "profits come from trading, mining or an AI bot. "
+    "You will be given text scraped from a website. Be sure of your answer. Determine if the "
+    "text likely originates from an HYIP scam website, characterized by promises of high "
+    "returns on money deposited with the site. "
+    'Answer "no" if the text suggests a low probability of being an HYIP, seems like a news '
+    "site, blog, review or guide, or does not invite visitors to sign up, log in, deposit or "
+    'contact the site to invest. Answer "no" for every other kind of site, including other '
+    "cryptocurrency scams: wallet drainers and seed-phrase phishing, fake airdrops and "
+    "giveaways, meme coins and token presales, fund-recovery services, casinos and betting, "
+    "domains for sale, marketing agencies, trading courses, real exchanges and banks, and "
+    "startup fundraising. "
+    'Answer "unsure" only if the text is too short, garbled or unreadable to judge. '
+    'Respond ONLY with a JSON object with exactly three keys: "answer" ("yes", "no" or '
+    '"unsure"), "confidence" (an integer 0-100 for how certain you are of the answer) and '
+    '"reason" (one word).\n'
+    "Examples:\n"
+    'Text: "Invest now for a guaranteed return of 10 percent in one month." -> '
+    '{"answer": "yes", "confidence": 95, "reason": "promises"}\n'
+    'Text: "Silver plan: 3% daily for 30 days. Minimum deposit $100, maximum $5,000. 10% '
+    'referral commission. Register to start earning." -> '
+    '{"answer": "yes", "confidence": 100, "reason": "plans"}\n'
+    'Text: "Our AI bot trades for you. Deposit from $250 and earn up to 40% per week." -> '
+    '{"answer": "yes", "confidence": 90, "reason": "returns"}\n'
+    'Text: "Connect your wallet to claim 5,000 free tokens in our airdrop." -> '
+    '{"answer": "no", "confidence": 95, "reason": "airdrop"}\n'
+    'Text: "Play slots and poker with Bitcoin. 100 free spins on your first deposit." -> '
+    '{"answer": "no", "confidence": 95, "reason": "casino"}\n'
+    'Text: "Bitcoin slips 3% as investors await the Federal Reserve decision." -> '
+    '{"answer": "no", "confidence": 85, "reason": "news"}\n'
+    'Text: "lgn ae7 ; wlc0me btc dpst ##" -> '
+    '{"answer": "unsure", "confidence": 10, "reason": "garbled"}'
 )
 
 OLLAMA_ANSWERS = {"yes", "no", "unsure"}
@@ -296,7 +417,7 @@ def evaluate_ocr_with_ollama(clean_text, domain_name, curr_date):
     """
     messages = [
         {"role": "system", "content": OLLAMA_SYSTEM_PROMPT},
-        {"role": "user", "content": f"Domain: {domain_name}\nText Content: {clean_text}"}
+        {"role": "user", "content": f"Domain: {domain_name}\nText Content: {clean_text[:OLLAMA_MAX_TEXT_CHARS]}"}
     ]
 
     attempt = 0
@@ -367,20 +488,41 @@ def _get_openai_client():
             max_retries=OPENAI_MAX_RETRIES,
         )
     return _openai_client
+# HYIPs only, as in OLLAMA_SYSTEM_PROMPT above; see the note there. The old prompt
+# also counted wallet drainers and seed-phrase phishing, which are now "false".
 OPENAI_SYSTEM_PROMPT = (
-    "You are a Cyber Threat Intelligence Analyst. Your sole objective is to classify "
-    "whether text scraped from a newly registered domain belongs to a cryptocurrency "
-    "investment scam or wallet-drainer.\n\n"
-    "### SCAM INDICATORS (is_scam = true):\n"
-    "- Unrealistic promises of high returns, guaranteed profits, or risk-free crypto investments.\n"
-    "- High-pressure tactics urging immediate account creation, deposits, or wallet connections.\n"
-    "- Unverifiable claims of proprietary AI trading bots or exclusive mining pools.\n"
-    "- Seed-phrase / recovery-phrase solicitation.\n\n"
-    "### SAFE INDICATORS (is_scam = false):\n"
-    "- Legitimate crypto news site, blog, or educational resource.\n"
-    "- Standard portfolio tracker, block explorer, or validator/node infrastructure.\n"
+    "You are a financial advisor and threat-intelligence analyst. Be sure of your answer. "
+    "Determine if text scraped from a newly registered domain likely originates from an "
+    "HYIP scam website, characterized by promises of high returns on money deposited with "
+    "the site. An HYIP (high-yield investment program) is a Ponzi-style scheme: visitors "
+    "open an account, deposit money (usually cryptocurrency) into the site's investment "
+    "plans, and are promised high or guaranteed returns over short periods. The site often "
+    "claims the profits come from trading (crypto, forex, or CFD), mining, staking, or an "
+    "AI bot. Only HYIPs count; other cryptocurrency scams do not.\n\n"
+    "### HYIP INDICATORS (is_scam = true):\n"
+    "- Investment plans or packages with minimum and maximum deposit amounts.\n"
+    "- Unrealistically high, fixed, or guaranteed returns over short time frames "
+    "(e.g. 2% daily, 50% profit per week, 10% after 24 hours).\n"
+    "- Requests to sign up, log in, deposit, or contact an account manager to start "
+    "investing; referral commissions.\n"
+    "- Account dashboards with balances, earnings, deposits, and withdrawals.\n"
+    "- Props for fake legitimacy: certificates of incorporation, fake reviews or testimonials, "
+    "payout statistics (total deposits, total withdrawals, days online), unverifiable phone "
+    "numbers or addresses.\n\n"
+    "### NOT AN HYIP (is_scam = false):\n"
+    "- The text suggests a low probability of being an HYIP.\n"
+    "- The site does not invite visitors to sign up, log in, deposit, or contact it to invest.\n"
+    "- News site, blog, review, guide, or educational resource.\n"
+    "- Other cryptocurrency scams that do not promise returns on deposited money: wallet "
+    "drainers and seed-phrase phishing; fake airdrops and giveaways, including 'send crypto, "
+    "get double back'; meme coins, token presales, and rug pulls; NFT mints; fake wallets; "
+    "fund-recovery services.\n"
+    "- Other kinds of sites: casinos and betting; domains for sale; marketing agencies, "
+    "trading courses, coaching, or newsletters; legitimate exchanges, brokers, banks, "
+    "portfolio trackers, block explorers, or node infrastructure; startup or venture "
+    "fundraising.\n"
     "- Standard login portals with no solicitation for investing.\n"
-    "- Text is garbage, broken, or has no actionable crypto-investment context.\n\n"
+    "- Text is garbage, broken, or has no actionable investment context.\n\n"
     "### TEXT QUALITY:\n"
     "The text may be OCR output, and may be garbled or transliterated from a non-Latin "
     "script. If you cannot read it well enough to identify concrete scam content, set "
@@ -397,7 +539,7 @@ OPENAI_SCAM_SCHEMA = {
         "properties": {
             "is_scam": {
                 "type": "boolean",
-                "description": "True if this matches a crypto investment scam/drainer.",
+                "description": "True only if this is an HYIP (high-yield investment program) scam.",
             },
             "confidence": {
                 "type": "integer",
@@ -663,7 +805,7 @@ def handlePositives(url_name, text, js_libraries, html_content, path, curr_date,
         "text": text
     }
 
-    # CRITICAL FIX: Merge the Gemini evaluation into the final log dictionary
+    # Merge the LLM verdict (is_scam = is an HYIP) into the final log dictionary
     log_data.update(evaluation)
 
     log_result(json.dumps(log_data), curr_date, 'results.log', 'a')
@@ -703,6 +845,7 @@ def check(url_name, curr_date):
     start_eval = time.time()
     raw_dom_text = extract_dom_text(html_content)
     clean_text = sanitize_text(raw_dom_text)
+    dom_text = clean_text  # kept for the content filter if OCR replaces clean_text below
     used_ocr = False
 
     # Evasion Detection Check: Fall back to visual processing if DOM text is suspiciously thin
@@ -734,12 +877,26 @@ def check(url_name, curr_date):
             return f"OCR failure."
 
         clean_text = sanitize_text(raw_ocr_text)
-   # Pass 2: Classification Engine Call with Content Filter
-    # content_filter still runs first: it is free, and at ~98.7% rejection it keeps
-    # the Ollama call (the expensive step on CPU-only hardware) off most pages.
-    if used_ocr or content_filter(clean_text):
+    # Pass 2: Classification Engine Call with Content Filter
+    # content_filter runs first on every page: it is free, and at ~98.7% rejection
+    # it keeps the Ollama call (the expensive step on CPU-only hardware) off most pages.
+    #
+    # OCR'd pages used to skip it (`if used_ocr or content_filter(...)`). The paper
+    # and the published artifact filter every page, and the artifact's OCR() ran
+    # the filter on OCR text and HTML text combined; that is restored here. Once
+    # screenshots started working (Oct 6) the bypass sent every thin-DOM page to the
+    # LLM: 92% of that day's OpenAI calls came from OCR pages, Ollama called half of
+    # them "garbled", and all 4 OCR-path "scams" were non-crypto pages that fail
+    # this filter. The LLM still gets the OCR text only, as in the artifact.
+    filter_text = f"{clean_text} {dom_text}" if used_ocr else clean_text
+    if content_filter(filter_text):
         evaluation = evaluate_hybrid(clean_text, url_name, curr_date)
     else:
+        # Pages dropped only by an exclusion word are logged with the words that
+        # matched, so an HYIP lost to one of them can be found and the word removed.
+        if table11_filter(filter_text):
+            log(f"{url_name},{'+'.join(content_exclusions(filter_text))}",
+                curr_date, 'content_excluded.txt', 'a')
         evaluation = {"is_scam": False, "confidence": 0, "reason": "Cleared_By_Content_Filter"}
 
     if evaluation.get("error"):

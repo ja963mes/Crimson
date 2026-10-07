@@ -15,7 +15,7 @@ RabbitMQ pipeline, then forwards the raw data to the RabbitMQ message broker.
 The feed is now an EXTERNAL CertStream server rather than the self-hosted one that
 cron.py used to supervise. Override with the CERTSTREAM_URL env var; cron.py and
 certstream-server/ are left in place so reverting to the local feed only means
-setting CERTSTREAM_URL=ws://130.245.32.96:4000 and starting cron.py again.
+setting CERTSTREAM_URL=ws://130.245.32.119:4000 and starting cron.py again.
 """
 
 # Configuration
@@ -134,7 +134,14 @@ class CryptoScamListener:
                     on_error=self.on_error,
                     on_close=self.on_close
                 )
-                self.ws.run_forever(ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT)
+                # skip_utf8_validation: websocket-client otherwise validates every text
+                # frame in pure Python (no wsaccel), ~3 ms per 4 KB message. On the 2-core
+                # broker VM that alone needed more than one core for the full feed, so the
+                # socket backed up and ~40% of certs were lost. send.py's json.loads still
+                # rejects malformed frames. on_message now receives bytes, which pika
+                # publishes unchanged.
+                self.ws.run_forever(ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT,
+                                    skip_utf8_validation=True)
                 logger.warning(f"Feed disconnected. Reconnecting in {self.backoff}s...")
                 time.sleep(self.backoff)
                 self.backoff = min(self.backoff * 2, MAX_BACKOFF)
