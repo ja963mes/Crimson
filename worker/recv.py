@@ -805,7 +805,7 @@ def handlePositives(url_name, text, js_libraries, html_content, path, curr_date,
         "text": text
     }
 
-    # Merge the LLM verdict (is_scam = is an HYIP) into the final log dictionary
+    # CRITICAL FIX: Merge the Gemini evaluation into the final log dictionary
     log_data.update(evaluation)
 
     log_result(json.dumps(log_data), curr_date, 'results.log', 'a')
