@@ -860,41 +860,54 @@ def check(url_name, curr_date):
     sspath = f"data/{SYSNO}/screenshots/{curr_date}/{url_name}/"
     ensure_directory_exists(sspath)
 
-    # Every reachable page is screenshotted and OCR'd, as in the paper's artifact.
-    # The LLM judges the OCR text, i.e. what a visitor sees: content drawn by
-    # JavaScript or baked into images counts, and HTML text a visitor never sees
-    # does not. The HTML text is still read, but only for the content filter.
-    #
-    # Until Oct 9 OCR ran only when the HTML text was under 150 characters, and the
-    # LLM judged the HTML text everywhere else. That was far faster (median 0.03s
-    # against 3.2s per page on VM2, Oct 9) but blind to pitches held in images.
-    # As in the artifact, a page whose screenshot or OCR fails is dropped.
-    dom_text = sanitize_text(extract_dom_text(html_content))
+    # Pass 1: Extraction via Lightweight HTML DOM
+    start_eval = time.time()
+    raw_dom_text = extract_dom_text(html_content)
+    clean_text = sanitize_text(raw_dom_text)
+    dom_text = clean_text  # kept for the content filter if OCR replaces clean_text below
+    used_ocr = False
 
-    start = time.time()
-    try:
-        ss = selenium_obj.take_screenshot(url_name, curr_date, sspath, SYSNO)
-    except Exception as e:
-        log(f"{url_name},selenium_obj.take_screenshot (),{e}", curr_date, 'errors.txt', 'a')
-        ss = False
-    log(f"{url_name},{time.time()-start}", curr_date, 'time_screenshot.txt', 'a')
-    if not ss:
-        if os.path.exists(sspath): os.system(f'rm -rf {sspath}')
-        return "screenshot failure."
+    # Evasion Detection Check: Fall back to visual processing if DOM text is suspiciously thin
+    if len(clean_text) < 150:
+        log(f"{url_name} - DOM text too short ({len(clean_text)} chars). Running OCR Fallback.", curr_date, 'hybrid_fallback.txt', 'a')
+        used_ocr = True
 
-    start = time.time()
-    raw_ocr_text = OCR(url_name, curr_date, html_content)
-    if not raw_ocr_text:
-        if os.path.exists(sspath): os.system(f'rm -rf {sspath}')
-        log(f"{url_name},{time.time()-start}", curr_date, 'time_OCR.txt', 'a')
-        return "OCR failure."
-    clean_text = sanitize_text(raw_ocr_text)
+        # Trigger heavy Selenium process
+        try:
+            ss = selenium_obj.take_screenshot(url_name, curr_date, sspath, SYSNO)
+            if not ss:
+                if os.path.exists(sspath): os.system(f'rm -rf {sspath}')
+                end_eval = time.time()
+                log(f"{url_name},{end_eval-start_eval}", curr_date, 'time_screenshot.txt', 'a')
+                return f"screenshot failure."
+        except Exception as e:
+            log(f"{url_name},selenium_obj.take_screenshot (),{e}", curr_date, 'errors.txt', 'a')
+            if os.path.exists(sspath): os.system(f'rm -rf {sspath}')
+            end_eval = time.time()
+            log(f"{url_name},{end_eval-start_eval}", curr_date, 'time_screenshot.txt', 'a')
+            return "screenshot failure"
 
+        # Trigger heavy Tesseract extraction
+        raw_ocr_text = OCR(url_name, curr_date, html_content)
+        if not raw_ocr_text:
+            if os.path.exists(sspath): os.system(f'rm -rf {sspath}')
+            end_eval = time.time()
+            log(f"{url_name},{end_eval-start_eval}", curr_date, 'time_OCR.txt', 'a')
+            return f"OCR failure."
+
+        clean_text = sanitize_text(raw_ocr_text)
+    # Pass 2: Classification Engine Call with Content Filter
     # content_filter runs first on every page: it is free, and at ~98.7% rejection
-    # it keeps the Ollama call (the expensive step on CPU-only hardware) off most
-    # pages. As in the artifact's OCR(), it reads the OCR text and the HTML text
-    # combined; the LLM gets the OCR text only.
-    filter_text = f"{clean_text} {dom_text}"
+    # it keeps the Ollama call (the expensive step on CPU-only hardware) off most pages.
+    #
+    # OCR'd pages used to skip it (`if used_ocr or content_filter(...)`). The paper
+    # and the published artifact filter every page, and the artifact's OCR() ran
+    # the filter on OCR text and HTML text combined; that is restored here. Once
+    # screenshots started working (Oct 6) the bypass sent every thin-DOM page to the
+    # LLM: 92% of that day's OpenAI calls came from OCR pages, Ollama called half of
+    # them "garbled", and all 4 OCR-path "scams" were non-crypto pages that fail
+    # this filter. The LLM still gets the OCR text only, as in the artifact.
+    filter_text = f"{clean_text} {dom_text}" if used_ocr else clean_text
     if content_filter(filter_text):
         evaluation = evaluate_hybrid(clean_text, url_name, curr_date)
     else:
@@ -908,7 +921,7 @@ def check(url_name, curr_date):
 
     if evaluation.get("error"):
         # FAIL CLOSED. Not classified either way. Screenshots kept for the retry pass.
-        log(f"{url_name}\t{evaluation.get('reason')}",
+        log(f"{url_name}\t{evaluation.get('reason')}\t(OCR Fallback: {used_ocr})",
             curr_date, 'needs_retry.txt', 'a')
         result_msg = "Needs retry (API error)."
     elif (evaluation.get("is_scam")
@@ -917,21 +930,23 @@ def check(url_name, curr_date):
             curr_date, 'needs_retry.txt', 'a')
         result_msg = "Flagged on unreadable text - needs retry."
     elif evaluation.get("is_scam") and evaluation.get("confidence", 0) > SCAM_CONFIDENCE_BAR:
-        log(f"Confirmed Scam [{evaluation.get('model', '?')}]: "
+        log(f"Confirmed Scam [{evaluation.get('model', '?')}] (OCR Fallback: {used_ocr}): "
             f"{url_name} - Reason: {evaluation.get('reason')}",
             curr_date, 'llm_scams.txt', 'a')
         handlePositives(url_name, clean_text, js_libraries, html_content, sspath, curr_date, evaluation)
         result_msg = "Scam Found & Confirmed!"
 
     else:
-        log(f"Rejected [{evaluation.get('model', 'local')}]: "
+        log(f"Rejected [{evaluation.get('model', 'local')}] (OCR Fallback: {used_ocr}): "
             f"{url_name} - Reason: {evaluation.get('reason')}",
             curr_date, 'llm_rejected.txt', 'a')
         if os.path.exists(sspath):
             os.system(f'rm -rf {sspath}')
         result_msg = "Safe / Rejected."
-    # OCR, filter and classification time; the screenshot is in time_screenshot.txt
-    log(f"{url_name},{time.time()-start}", curr_date, 'time_OCR.txt', 'a')
+    end_eval = time.time()
+    # Log execution times back to standard diagnostic endpoints
+    metric_file = 'time_OCR.txt' if used_ocr else 'time_screenshot.txt'
+    log(f"{url_name},{end_eval-start_eval}", curr_date, metric_file, 'a')
     time.sleep(1.0)
     return result_msg
 def log(url_name, curr_date, filename, mode='a'):
@@ -965,14 +980,12 @@ def main():
             visited_cache[url_name] = True
             signal.signal(signal.SIGALRM, timeout_handler)
             # Budget for the worst-case path, which is now BOTH engines in series:
-            #   fetch 2x10s + Selenium 2x20s + OCR of a tall page ~30s
-            #   + Ollama 90s (OLLAMA_TIMEOUT)
-            #   + OpenAI 30s x3 (OPENAI_TIMEOUT x 1+OPENAI_MAX_RETRIES)  ~= 270s
+            #   fetch 10s + Selenium 2x20s + Ollama 90s (OLLAMA_TIMEOUT)
+            #   + OpenAI 30s x3 (OPENAI_TIMEOUT x 1+OPENAI_MAX_RETRIES)  ~= 230s
             # At the old 120s an escalated page on the OCR path tripped this and was
             # filed as Worker_Timeout even though both engines answered correctly.
-            # Raised from 240 when every page started going through OCR (Oct 9).
             # Lower this once the workers have AVX2 and Ollama returns in <10s.
-            signal.alarm(300)
+            signal.alarm(240)
             try:
                 result = check(url_name, curr_date)
                 sys.stdout.flush()
