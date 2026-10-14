@@ -20,3 +20,13 @@ ExecStartPre=/usr/bin/python3 feeder.py --results /home/ubuntu/crimson/src/resul
 # One pass over urls.txt; the crawler logs to logs/logfile.log next to itself.
 ExecStart=/usr/bin/python3 crawler_script.py
 TimeoutStartSec=0
+# Then pull wallet addresses (and the other IOCs) out of the pages the crawl saved,
+# the step the original ran by hand with iocs_searcher.sh. Results accumulate in
+# iocs_results next to the crawler; iocs_results.log lists pages already searched,
+# so each run only reads new pages. ExecStopPost runs even when the crawl fails, so
+# pages saved before a crash are still searched. iocsearcher is a pip --user
+# install, hence the PATH; the first run reads every page saved so far, hence the
+# longer stop timeout.
+Environment="PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStopPost=/bin/bash iocs_searcher.sh /home/ubuntu/crimson/src/authentication_crawling
+TimeoutStopSec=1h

@@ -15,14 +15,19 @@ search_dir=$1  # Directory to search in, provided as an argument
 results_file="$search_dir/iocs_results"
 processed_files_log="$search_dir/iocs_results.log"
 
-# Clear the results file or create it if it doesn't exist
-: > "$results_file"
+# Create the results file if it doesn't exist. It is appended to, not cleared:
+# files already in the processed log are skipped below, so clearing it on every
+# run (as this used to) lost the IOCs found by earlier runs. crimson-crawler.service
+# runs this after every crawl pass.
+touch "$results_file"
 
 # Ensure processed files log exists
 touch "$processed_files_log"
 
-# Specify the IOC types to search for
-ioc_types=(bitcoin bitcoincash cardano dashcoin dogecoin ethereum litecoin monero ripple tezos tronix zcash webmoney onionAddress email phoneNumber facebookHandle githubHandle instagramHandle linkedinHandle pinterestHandle telegramHandle twitterHandle whatsappHandle youtubeHandle youtubeChannel)
+# Specify the IOC types to search for. Current iocsearcher calls Tron addresses
+# (TRX and USDT-TRC20) "tron"; with "tronix" it printed "No regexp for target"
+# and skipped them.
+ioc_types=(bitcoin bitcoincash cardano dashcoin dogecoin ethereum litecoin monero ripple tezos tron zcash webmoney onionAddress email phoneNumber facebookHandle githubHandle instagramHandle linkedinHandle pinterestHandle telegramHandle twitterHandle whatsappHandle youtubeHandle youtubeChannel)
 
  target_options=""
 for ioc_type in "${ioc_types[@]}"; do
