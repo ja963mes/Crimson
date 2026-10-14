@@ -6,7 +6,7 @@ import logging
 import os
 import random
 import re
-import requests
+from curl_cffi import requests as curl_requests
 import string
 import sys
 import threading
@@ -840,11 +840,11 @@ MAILINATOR_MAX_CLICKS = 3
 
 def _mailinator_links(inbox, msg_id, params):
     base = f"{MAILINATOR_API}/inboxes/{inbox}/messages/{msg_id}"
-    resp = requests.get(f"{base}/links", params=params, timeout=15)
+    resp = curl_requests.get(f"{base}/links", params=params, timeout=15)
     resp.raise_for_status()
     links = resp.json().get('links', [])
     if not links:  # fall back to the hrefs in the message body
-        resp = requests.get(base, params=params, timeout=15)
+        resp = curl_requests.get(base, params=params, timeout=15)
         resp.raise_for_status()
         for part in resp.json().get('parts', []):
             links += [html.unescape(l) for l in re.findall(r'https?://[^\s"\'<>]+', part.get('body', ''))]
@@ -867,7 +867,7 @@ def check_mailinator_inbox_and_click_links(api_key, driver, email_address, signu
     deadline = time.time() + wait_seconds
     while time.time() < deadline and should_continue and not clicked:
         try:
-            resp = requests.get(f"{MAILINATOR_API}/inboxes/{inbox}",
+            resp = curl_requests.get(f"{MAILINATOR_API}/inboxes/{inbox}",
                                 params={**params, "limit": 10, "sort": "descending"}, timeout=15)
             resp.raise_for_status()
             for msg in resp.json().get('msgs', []):
@@ -879,7 +879,7 @@ def check_mailinator_inbox_and_click_links(api_key, driver, email_address, signu
                     driver.get(link)
                     clicked += 1
                     logging.info(f"Clicked link in email: {link}")
-        except (requests.RequestException, ValueError, KeyError) as e:
+        except (curl_requests.exceptions.RequestException, ValueError, KeyError) as e:
             logging.error(f"Error checking Mailinator inbox {inbox}: {e}")
         except WebDriverException as e:
             logging.error(f"Error opening a link from the Mailinator inbox {inbox}: {e}")
