@@ -36,9 +36,6 @@ os.environ['OMP_THREAD_LIMIT'] = '1'
 SYSNO = sys.argv[1]
 SCREENNO = sys.argv[2]
 newYorkTz = pytz.timezone("America/New_York")
-text_converter = html2text.HTML2Text()
-text_converter.ignore_links = True
-text_converter.ignore_images = True
 unavailable_domains = 0
 domains_checked = 0
 less_words_domains = 0
@@ -776,7 +773,15 @@ def is_domain_available(url_name, curr_date):
     try:
         if str(response.status_code)[0] not in ['4', '5']:
             html_content = response.text
-            plain_text = str(text_converter.handle(response.text)).split()
+            # A fresh converter per page. One module-level HTML2Text used to serve
+            # every page, and html2text keeps state between handle() calls: after a
+            # page with an unclosed <abbr>, every later page's text was appended to
+            # abbr_data. On VM3 (Oct 15) that string reached ~195 MB, each page
+            # spent the full 300s alarm copying it, and was filed 'unreachable.'
+            text_converter = html2text.HTML2Text()
+            text_converter.ignore_links = True
+            text_converter.ignore_images = True
+            plain_text = str(text_converter.handle(html_content)).split()
             if len(plain_text) < 20:
                 less_words_domains += 1
                 log(less_words_domains, curr_date, 'less_words_domains.txt', 'w')

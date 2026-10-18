@@ -1,0 +1,21 @@
+[Unit]
+Description=Crimson worker (SYSNO %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/crimson/src
+EnvironmentFile=/home/ubuntu/.crimson_env.systemd
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/python3 /home/ubuntu/crimson/src/recv.py %i 1
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=crimson-worker-%i
+
+[Install]
+WantedBy=multi-user.target
