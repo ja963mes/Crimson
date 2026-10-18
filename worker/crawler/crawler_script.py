@@ -124,6 +124,11 @@ def initialize_driver():
     return driver
 
 driver = None  # created in main(); fill_form() and the URL loop use this global
+# The urls.txt line being crawled. login_and_take_screenshot() writes it to
+# source_url.txt in the site's folder, because the folder is named after the login
+# URL, which can be on another host than the site feeder.py gave the crawler.
+# build_wallets.py reads it to tie each wallet to its domain.
+current_site_url = None
 
 # Generate random strings and emails for filling forms
 def generate_random_string(length=8, names_file=NAMES_FILE): #names.txt contains a dictionary of common names
@@ -406,6 +411,7 @@ def has_two_or_more_password_fields(driver, url):
 
 # Process URLs from a list
 def fill_sign_up_urls_in_list(urls_file_path, last_processed_file_path):
+    global current_site_url
     if not os.path.exists(urls_file_path):
         logging.info(f"No {urls_file_path} yet (feeder.py has not added any domains); nothing to crawl.")
         return
@@ -417,6 +423,7 @@ def fill_sign_up_urls_in_list(urls_file_path, last_processed_file_path):
             url = line.strip()
             if start_processing:
                 try:
+                    current_site_url = url
                     email_used = fill_sign_up_form_with_timeout(driver, url)
                     if email_used:
                         logging.info(f"Success: {url} ")
@@ -495,6 +502,9 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
 
         directory_name = login_url.replace('://', '_').replace('/', '_')
         os.makedirs(directory_name, exist_ok=True)
+        if current_site_url:
+            with open(os.path.join(directory_name, 'source_url.txt'), 'w') as f:
+                f.write(current_site_url + '\n')
         processed_links = set()
 
         links = driver.find_elements(By.TAG_NAME, 'a')
@@ -700,7 +710,10 @@ def process_deposit_page(driver, href, directory_name, original_window):
 
         result = driver.execute_cdp_cmd("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True})
         screenshot_data = base64.b64decode(result['data'])
-        screenshot_path = os.path.join(directory_name, f"deposit_screenshot_{counter}.png")
+        # Named after the deposit page like the HTML above. "deposit_screenshot_{counter}"
+        # restarted at 1 for every deposit page of a site, so each deposit page's
+        # screenshots overwrote the previous page's.
+        screenshot_path = os.path.join(directory_name, f"deposit_screenshot_{href.replace('://', '_').replace('/', '_').replace('?', '_')}_{counter}.png")
         with open(screenshot_path, 'wb') as file:
             file.write(screenshot_data)
 
