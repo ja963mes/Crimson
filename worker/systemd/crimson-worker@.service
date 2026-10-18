@@ -13,6 +13,11 @@ Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/python3 /home/ubuntu/crimson/src/recv.py %i 1
 Restart=always
 RestartSec=10
+# Several instances share a VM with Ollama (~11 GB) and no swap. Chromium started
+# by recv.py stays in this unit's cgroup, even when orphaned, so a leaking or
+# runaway instance is OOM-killed and restarted clean here instead of the kernel
+# picking Ollama. recv.py plus a live Chromium peaked around 1.75 GB.
+MemoryMax=3G
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=crimson-worker-%i

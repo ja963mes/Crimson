@@ -64,9 +64,12 @@ def sync(url_name, curr_date, local_file_path, remote_file_path):
     abs_key_path = "/home/ubuntu/.ssh/id_ed25519"
 
     try:
+        # --mkpath: a new instance's collected_results/data/<SYSNO>/check/ is two
+        # levels deep, and rsync otherwise creates only the last one. The timeouts
+        # stop an unreachable broker from blocking the worker (no alarm covers sync).
         subprocess.run([
-            'rsync', '-avz',
-            '-e', f'ssh -i {abs_key_path} -o StrictHostKeyChecking=no',
+            'rsync', '-avz', '--mkpath', '--timeout=60',
+            '-e', f'ssh -i {abs_key_path} -o StrictHostKeyChecking=no -o ConnectTimeout=20',
             abs_local_path,
             f'{REMOTE_USER}@{REMOTE_IP}:{abs_remote_path}'
         ], check=True, stdout=subprocess.DEVNULL)
@@ -988,8 +991,12 @@ def main():
                 result = "Timeout"
             signal.alarm(0)
             log(f"[x] Done {url_name} {result}", curr_date, 'worker.txt', 'a')
-            sync(url_name, curr_date, f"results/{SYSNO}/", "/home/ubuntu/crimson/collected_results/")
-            sync(url_name, curr_date, f"data/{SYSNO}/check/", "/home/ubuntu/crimson/collected_results/")
+            # results/ and data/check/ only change in handlePositives(), so syncing
+            # after every domain sent ~2 ssh logins/s to the 2-core broker for nothing.
+            # rsync copies the whole folder, so a failed sync is caught up by the next one.
+            if result == "Scam Found & Confirmed!":
+                sync(url_name, curr_date, f"results/{SYSNO}/", "/home/ubuntu/crimson/collected_results/")
+                sync(url_name, curr_date, f"data/{SYSNO}/check/", "/home/ubuntu/crimson/collected_results/")
             ch.basic_ack(delivery_tag=method.delivery_tag)
 
     while True:
