@@ -36,7 +36,6 @@ logs_directory = 'logs'
 os.makedirs(logs_directory, exist_ok=True)
 log_file_path = os.path.join(logs_directory, 'logfile.log')
 email_used = None
-start_url = ''
 blacklisted_urls = ["facebook.com", "example.com","linkedin.com","paypal.com"]
 
 # --- Paths & credentials --------------------------------------------------
@@ -267,15 +266,111 @@ def handle_dropdowns(form, driver):
             except WebDriverException as e:
                 logging.error(f"Failed to select dropdown option using JavaScript: {e}")
 
+# --- Sign-up and login outcome checks --------------------------------------------------
+# Until Oct 20 a sign-up counted as successful whenever a button was clicked (the URL was
+# compared with a module-level start_url that was always ''), and a login whenever the URL
+# changed. Over Oct 6-20, 149 of 288 "successful" sign-ups never left the sign-up page (140 of
+# them then failed to log in), and 9 of 53 "logged-in" sites were not logged in; 3 of those
+# had been redirected to the site's own ?a=login&say=invalid_login page. The outcome is now
+# read from the page. Only messages that appear after the submit count, so a notice that was
+# already on the form ("Please enter your details") is not mistaken for an error.
+
+PAGE_STATE_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+const errSel = '[class*="error" i],[class*="alert" i],[class*="invalid" i],[class*="warning" i],[class*="danger" i],' +
+               '[role="alert"],.help-block,font[color="red" i],font[color="#ff0000" i],[style*="color:red" i],[style*="color: red" i]';
+const errors = Array.from(document.querySelectorAll(errSel))
+    .filter(e => vis(e) && !/success|info/i.test(String(e.className || '')))
+    .map(e => (e.innerText || '').trim().replace(/\s+/g, ' ')).filter(t => t && t.length < 300);
+const invalid = Array.from(document.querySelectorAll('input,select,textarea'))
+    .filter(e => vis(e) && e.willValidate && !e.checkValidity())
+    .map(e => (e.name || e.id || e.type) + ': ' + e.validationMessage);
+const logout = Array.from(document.querySelectorAll('a,button')).filter(vis).some(e =>
+    /log-?out|sign-?out|logoff|a=logout/i.test(e.getAttribute('href') || '') ||
+    /^\s*(log ?out|sign ?out|log off)\s*$/i.test(e.innerText || ''));
+return {url: location.href, errors: [...new Set(errors)].slice(0, 8), invalid: invalid.slice(0, 5), logout: logout,
+        passwords: Array.from(document.querySelectorAll('input[type=password]')).filter(vis).length,
+        text: (document.body ? document.body.innerText : '').slice(0, 20000)};
+"""
+SIGNUP_OK_RE = re.compile(r"registration (was |is )?(complete|completed|successful)|successfully (registered|signed up|created)|registered successfully|"
+                          r"account (has been |was )?(created|registered)|thank you for (registering|signing up|joining|your registration)|"
+                          r"check your (e-?mail|inbox)|(confirmation|verification|activation) (link|e-?mail|code) (has been |was )?sent|verify your e-?mail", re.I)
+FORM_ERROR_RE = re.compile(r"already (exists|registered|in use|taken)|required|invalid|incorrect|do(es)? not match|must (be|contain|have)|"
+                           r"please (enter|fill|provide|select|check|agree|type|correct|choose)|captcha|not valid|too (short|long)|wrong|error|failed", re.I)
+LOGIN_FAILED_URL_RE = re.compile(r"say=invalid|invalid_login|login_?error|[?&]error=", re.I)
+
+def page_state(driver):
+    """Logout link, visible password fields, visible error messages, invalid form fields and body text of the current page."""
+    try:
+        return driver.execute_script(PAGE_STATE_JS)
+    except Exception as e:
+        logging.info(f"Could not read the page state: {e}")
+        return {"url": "", "errors": [], "invalid": [], "logout": False, "passwords": 0, "text": ""}
+
+def new_errors(before, after):
+    """Error-like messages on the page after a submit that were not on it before."""
+    return [t for t in after["errors"] if t not in before["errors"] and FORM_ERROR_RE.search(t)]
+
+def wait_for_outcome(driver, before, seconds=10):
+    """After a submit, poll until the page shows something decisive (a new URL, a Logout link, a
+    new message, invalid fields, the password fields gone) or `seconds` pass, and return the page
+    state. A read that fails mid-navigation (empty url) is never taken as the outcome."""
+    state = page_state(driver)
+    for _ in range(seconds):
+        new_ok = SIGNUP_OK_RE.search(state["text"]) and not SIGNUP_OK_RE.search(before["text"])
+        if state["url"] and (state["url"] != before["url"] or state["logout"] or new_errors(before, state)
+                             or state["invalid"] or not state["passwords"] or new_ok):
+            time.sleep(1)  # let a redirect or an AJAX update finish
+            settled = page_state(driver)
+            return settled if settled["url"] else state
+        time.sleep(1)
+        state = page_state(driver)
+    return state
+
+def assess_signup(before, after, form_url):
+    """('success' | 'rejected' | 'unclear', evidence) for the page shown after a sign-up submit.
+    Only 'rejected' changes what the crawler does next (no e-mail wait, no login attempt), so it
+    needs explicit evidence: a new error message or a field the browser refused, on a page that
+    still shows the form. 'unclear' carries on as before: 9 of the 149 sign-ups that never left
+    the sign-up page did end in a login."""
+    errors = new_errors(before, after)
+    ok = SIGNUP_OK_RE.search(after["text"])
+    if after["logout"]:
+        return "success", "a Logout link is on the page"
+    if ok and not SIGNUP_OK_RE.search(before["text"]):
+        return "success", f"success message {ok.group(0)!r}"
+    if after["passwords"] and (errors or after["invalid"]):
+        return "rejected", "; ".join(errors + after["invalid"])[:300]
+    if after["url"] != form_url and not after["passwords"]:
+        return "success", f"moved to {after['url']} and the form is gone"
+    where = "URL unchanged" if after["url"] == form_url else f"now at {after['url']}"
+    return "unclear", f"{where}, {after['passwords']} password field(s) on the page, no message found"
+
+def assess_login(before, after):
+    """('success' | 'failed' | 'unclear', evidence) for the page shown after a login submit.
+    'unclear' (no Logout link, no password field) carries on as logged in, which also covers a
+    login done by JavaScript without a URL change; the old URL-change test missed those."""
+    errors = new_errors(before, after)
+    if LOGIN_FAILED_URL_RE.search(after["url"]):
+        return "failed", f"redirected to {after['url']}"
+    if after["logout"]:
+        return "success", "a Logout link is on the page"
+    if after["passwords"]:
+        return "failed", "; ".join(errors)[:300] or f"still on a page with {after['passwords']} password field(s) and no Logout link"
+    return "unclear", f"no Logout link and no password field at {after['url']}"
+
 # Submit form
 def click_and_submit(driver, button, button_type):
+    # True once the button has been clicked. Whether that worked is decided afterwards from the
+    # page (assess_signup); the URL comparison that used to be here compared with '' and so
+    # reported every click as a successful sign-up.
     try:
+        before = driver.current_url
         driver.execute_script("arguments[0].click();", button)
         time.sleep(3)
-        current_url = driver.current_url
-        if current_url != start_url:
-            logging.info(f"Form submitted - Redirected to: {current_url}")
-            return True
+        after = driver.current_url
+        logging.info(f"Form submitted - URL {'changed to ' + after if after != before else 'unchanged: ' + after}")
+        return True
     except (ElementNotInteractableException, TimeoutException):
         button.send_keys(Keys.RETURN)
     return False
@@ -351,7 +446,15 @@ def fill_sign_up_form(driver, start_url):
                             ('input[name="submit"]', By.NAME)
                         ]
 
+                        form_url = driver.current_url
+                        before_submit = page_state(driver)
                         if submit_form(driver, selectors):
+                            outcome, evidence = assess_signup(before_submit, wait_for_outcome(driver, before_submit), form_url)
+                            logging.info(f"Sign-up result: {outcome} - {evidence}")
+                            if outcome == "rejected":
+                                # The site refused the form, so there is no account to confirm
+                                # or log in to; skip the 60 s inbox wait and the login search.
+                                return False
                             # predictions is keyed by input name, so .get("email") only
                             # worked when the field was literally named "email". Take the
                             # generated address from whichever field received it.
@@ -471,10 +574,14 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
     base_domain = get_base_domain(login_url)
     original_window = None  # the finally block below reads it even if driver.get() fails
     try:
+        if not email_used:
+            # The username below is derived from the e-mail, and re.sub() on None used to crash
+            # here ("Unexpected error during login") after every such sign-up.
+            logging.info("Login result: skipped - the sign-up form had no e-mail field, so there is no account e-mail to log in with")
+            return
         driver.get(login_url)
         logging.info(f"Navigating to URL: {login_url}")
         original_window = driver.current_window_handle
-        initial_url = driver.current_url
 
         try:
             username_input = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[name="username"],input[type="email"],input[type="text"]')))
@@ -490,6 +597,7 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
         password_input = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[type="password"]')))
         password_input.send_keys(predicted_password)
 
+        before_submit = page_state(driver)
         try:
             submit_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit'],input[type='submit']")))
             submit_button.click()
@@ -497,8 +605,12 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
             submit_button = driver.find_element(By.CSS_SELECTOR, "form button, form input[type='button']")
             driver.execute_script("arguments[0].click();", submit_button)
 
-        WebDriverWait(driver, 10).until(EC.url_changes(initial_url))
-        logging.info("URL changed, indicating a potential successful login.")
+        # Judged from the page, not from a URL change: a failed login that redirects to
+        # ?a=login&say=invalid_login changes the URL too.
+        outcome, evidence = assess_login(before_submit, wait_for_outcome(driver, before_submit))
+        logging.info(f"Login result: {outcome} - {evidence}")
+        if outcome == "failed":
+            return
 
         directory_name = login_url.replace('://', '_').replace('/', '_')
         os.makedirs(directory_name, exist_ok=True)
