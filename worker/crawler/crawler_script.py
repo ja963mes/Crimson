@@ -744,6 +744,14 @@ def process_deposit_page(driver, href, directory_name, original_window):
 
         # Iterate over each combination
         for radio_option, dropdown_values, text_field_value in all_combinations:
+            # Find the fields again on the page that is loaded now.the ones found
+            # above belong to the first load, and driver.get(href) at the end of each
+            # pass replaces it, so from pass 2 on they were stale and nothing was set
+
+            select_elements = safe_find_elements(By.TAG_NAME, 'select')
+            input_elements = safe_find_elements(By.CSS_SELECTOR, 'input[type="checkbox"], input[type="radio"]')
+            text_fields = safe_find_elements(By.CSS_SELECTOR, 'input[type="text"], input[type="number"]')
+
             # Clear existing values
             clear_input_fields(input_elements, select_elements, text_fields)
 
