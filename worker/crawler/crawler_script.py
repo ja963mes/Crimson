@@ -161,18 +161,100 @@ def generate_xmr_address():
 def generate_ada_address():
     return 'addr1' + ''.join(random.choices(string.digits + string.ascii_letters, k=58))
 
-# Captcha detection, log error if detected and move to next URL
-def has_captcha(html_content, driver):
-    if "captcha" in html_content.lower():
-        logging.info(f"Captcha detected on {driver.current_url}.")
-        recaptcha_elements = driver.find_elements(By.XPATH, "//iframe[contains(@src, 'recaptcha')]") + \
-                             driver.find_elements(By.CLASS_NAME, "g-recaptcha")
-        if recaptcha_elements:
-            logging.info(f"Google reCAPTCHA detected on {driver.current_url}.")
-        else:
-            logging.info(f"Non-Google captcha detected on {driver.current_url}.")
-        return True
-    return False
+# --- Captcha check -----------------------------------------------------------------------
+# has_captcha() used to give up on a site whenever the word "captcha" appeared anywhere in the
+# HTML. Re-checking the 93 sites it stopped between Oct 17 and Oct 20 (87 loaded): 28 showed no
+# captcha at all (the word sat in comments, CSS, config strings or class names), 14 had a
+# site-built text or math captcha whose answer is on the page ("8 × 8 = ?", "Enter Captcha:
+# B730FF"), 30 had a math captcha in a hidden later step of a multi-step form, 6 had an image
+# captcha and 9 a third-party widget. Every real one sat inside the sign-up form. So now only
+# what the sign-up form shows counts, and text and math captchas are answered. Image captchas
+# (OCR) and multi-step forms are left for later; both are logged when seen.
+CAPTCHA_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+const forms = Array.from(document.forms);
+const scope = forms.find(f => f.querySelectorAll('input[type=password]').length >= 2)
+           || forms.find(f => f.querySelector('input[type=password]')) || document;
+const q = s => Array.from(scope.querySelectorAll(s));
+const widgets = [];
+if (q('iframe[src*="recaptcha/api2/anchor"],iframe[src*="recaptcha/enterprise/anchor"]').some(e => vis(e) && !/size=invisible/.test(e.src))
+    || q('.g-recaptcha[data-sitekey]').some(e => vis(e) && e.getAttribute('data-size') !== 'invisible')) widgets.push('reCAPTCHA v2');
+if (q('.h-captcha,iframe[src*="hcaptcha.com"]').some(vis)) widgets.push('hCaptcha');
+if (q('.cf-turnstile,iframe[src*="challenges.cloudflare.com"]').some(vis)) widgets.push('Cloudflare Turnstile');
+if (q('altcha-widget').some(vis)) widgets.push('ALTCHA');
+const invisible = !!document.querySelector('.grecaptcha-badge,iframe[src*="size=invisible"]')
+               || /recaptcha\/(api|enterprise)\.js\?[^"']*render=(?!explicit)/i.test(document.documentElement.innerHTML);
+const images = q('img').filter(e => vis(e) && /captcha|turing|validation_image|securimage|antibot/i.test(
+    (e.getAttribute('src') || '') + ' ' + e.id + ' ' + String(e.className) + ' ' + (e.alt || '')));
+const texts = e => {
+    const out = [e.placeholder || ''];
+    if (e.id) { const l = document.querySelector('label[for="' + CSS.escape(e.id) + '"]'); if (l) out.push(l.innerText || l.textContent); }
+    for (let p = e.parentElement, i = 0; p && i < 4; p = p.parentElement, i++) out.push(p.innerText || p.textContent || '');
+    return out.map(t => t.replace(/\s+/g, ' ').trim().slice(0, 300)).filter(Boolean);
+};
+const inputs = q('input').filter(e => e.type !== 'hidden'
+    && /captcha|validation_number|turing|security.?code|verif\w*.?code|antibot|math/i.test((e.name || '') + ' ' + e.id + ' ' + (e.placeholder || '')));
+return {widgets: widgets, invisible: invisible, images: images.length,
+        inputs: inputs.map(e => ({name: e.name, id: e.id, visible: vis(e), texts: texts(e)}))};
+"""
+CAPTCHA_MATH_RE = re.compile(r"(\d{1,3})\s*(\+|-|−|x|×|\*|÷|/|plus|minus|times)\s*(\d{1,3})\s*(?:=|\?)", re.I)
+CAPTCHA_SPACED_RE = re.compile(r"(?<!\w)\d(?: \d){3,7}(?!\w)")                    # "8 9 5 7 1 3"
+CAPTCHA_CODE_RE = re.compile(r"\b(?=[A-Z0-9]*\d)[A-Z0-9]{4,8}\b")                 # "B730FF", "0EAAB3"
+CAPTCHA_OPS = {"+": lambda a, b: a + b, "plus": lambda a, b: a + b, "-": lambda a, b: a - b, "−": lambda a, b: a - b,
+               "minus": lambda a, b: a - b, "x": lambda a, b: a * b, "×": lambda a, b: a * b, "*": lambda a, b: a * b,
+               "times": lambda a, b: a * b, "÷": lambda a, b: a // b, "/": lambda a, b: a // b}
+
+def solve_text_captcha(texts):
+    """(answer, challenge) for a text or math captcha, read from the texts around its input
+    (placeholder, label, then up to four parent elements, nearest first), or (None, None)."""
+    for t in texts:
+        m = CAPTCHA_MATH_RE.search(t)
+        if m and not (m.group(2) in ("÷", "/") and int(m.group(3)) == 0):
+            return str(CAPTCHA_OPS[m.group(2).lower()](int(m.group(1)), int(m.group(3)))), m.group(0)
+        m = CAPTCHA_SPACED_RE.search(t)
+        if m:
+            return m.group(0).replace(" ", ""), m.group(0)
+        m = CAPTCHA_CODE_RE.search(t)
+        if m:
+            return m.group(0), m.group(0)
+    return None, None
+
+def check_captcha(driver):
+    """What captcha the sign-up form shows. Returns (blocking, summary, answer, target): blocking
+    means the site is skipped; answer and target ((By, value) of the input) are set when a text or
+    math captcha was read, and the answer is typed in just before the form is submitted."""
+    time.sleep(2)  # third-party widgets render after load
+    try:
+        c = driver.execute_script(CAPTCHA_JS)
+    except Exception as e:
+        return False, f"could not inspect the page ({e}), trying anyway", None, None
+    if c["widgets"]:
+        return True, f"{' and '.join(c['widgets'])} on the sign-up form, skipping the site", None, None
+    visible = [i for i in c["inputs"] if i["visible"]]
+    if visible:
+        i = visible[0]
+        answer, challenge = solve_text_captcha(i["texts"])
+        if answer is not None:
+            target = (By.ID, i["id"]) if i["id"] else (By.NAME, i["name"])
+            return False, f"text captcha {challenge!r}, answering {answer!r}", answer, target
+        if c["images"]:
+            return True, "image captcha on the sign-up form (OCR not implemented), skipping the site", None, None
+        return True, f"captcha input {i['name'] or i['id']!r} whose challenge could not be read {i['texts'][:2]}, skipping the site", None, None
+    if c["images"]:
+        return True, "image captcha on the sign-up form (OCR not implemented), skipping the site", None, None
+    notes = (["a captcha input in a hidden part of the form (multi-step form?)"] if c["inputs"] else []) + \
+            (["an invisible reCAPTCHA"] if c["invisible"] else [])
+    return False, (f"none visible ({' and '.join(notes)}), trying anyway" if notes else "none"), None, None
+
+def answer_captcha(driver, answer, target):
+    """Type the captcha answer, replacing whatever predict_values() put in the field."""
+    try:
+        field = driver.find_element(*target)
+        field.clear()
+        field.send_keys(answer)
+        logging.info(f"Captcha answer {answer!r} entered")
+    except Exception as e:
+        logging.info(f"Could not enter the captcha answer: {e}")
 
 # Predict form values
 def predict_values(form):
@@ -416,8 +498,9 @@ def fill_sign_up_form(driver, start_url):
             if has_two_or_more_password_fields(driver, current_url) and not form_filled and should_continue:
                 driver = ensure_driver(driver)
                 driver.get(current_url)
-                html_content = driver.page_source
-                if has_captcha(html_content, driver):
+                captcha_blocks, captcha_summary, captcha_answer, captcha_target = check_captcha(driver)
+                logging.info(f"Captcha check on {driver.current_url}: {captcha_summary}")
+                if captcha_blocks:
                     return False
 
                 wait = WebDriverWait(driver, 5)
@@ -438,6 +521,10 @@ def fill_sign_up_form(driver, start_url):
                             return False
 
                         handle_checkbox(driver)
+
+                        # After the fields are filled, so predict_values() cannot overwrite it.
+                        if captcha_answer is not None:
+                            answer_captcha(driver, captcha_answer, captcha_target)
 
                         selectors = [
                             ('input[type="submit"]', By.CSS_SELECTOR),
