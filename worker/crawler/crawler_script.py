@@ -544,6 +544,15 @@ def process_link(driver, href, directory_name, original_window):
     driver.close()
     driver.switch_to.window(original_window)
 
+# Wallet-looking strings on a page, for the deposit-stage log lines only. A hint for reading
+# the log: iocs_searcher.sh still does the real extraction. Script and style blocks are
+# dropped first so tokens inside them are not reported.
+WALLET_LIKE_RE = re.compile(r"\b(bc1[02-9ac-hj-np-z]{25,60}|[13][1-9A-HJ-NP-Za-km-z]{25,34}|0x[0-9a-fA-F]{40}|T[1-9A-HJ-NP-Za-km-z]{33})\b")
+
+def wallet_like(html_content):
+    visible = re.sub(r"<(script|style)\b.*?</\1>", " ", html_content, flags=re.S | re.I)
+    return sorted(set(WALLET_LIKE_RE.findall(visible)))
+
 def process_links(driver, links, processed_links, base_domain, directory_name, original_window, max_links=25):
     if len(processed_links) >= max_links:
         logging.info(f"Reached maximum link processing threshold of {max_links}. Stopping further processing.")
@@ -551,14 +560,26 @@ def process_links(driver, links, processed_links, base_domain, directory_name, o
 
     deposit_page_counter = 0
 
+    # Logged so a site whose deposit page was never opened can be told apart from one whose
+    # deposit page was opened but produced nothing (process_deposit_page logs that case).
+    try:
+        deposit_hrefs = sorted({h for h in (l.get_attribute('href') for l in links) if h and re.search(r'\bdeposits?\b', h.lower())})
+        logging.info(f"Post-login page has {len(links)} links; deposit links: {deposit_hrefs or 'none'}")
+    except Exception as e:
+        logging.info(f"Could not list the deposit links on the post-login page: {e}")
+
     for link in links:
         href = link.get_attribute('href')
         if validate_link(href, processed_links, base_domain):
             try:
-                if re.search(r'\bdeposits?\b', href.lower()) and deposit_page_counter < 5: # condition true if either deposit or deposits in url and within limit
+                is_deposit = re.search(r'\bdeposits?\b', href.lower()) # condition true if either deposit or deposits in url
+                if is_deposit and deposit_page_counter < 5: # and within limit
+                    logging.info(f"Opening deposit page {href} (deposit link {deposit_page_counter + 1} of at most 5)")
                     process_deposit_page(driver, href, directory_name, original_window)
                     deposit_page_counter += 1
                 else:
+                    if is_deposit:
+                        logging.info(f"Deposit link {href} handled as an ordinary page: the limit of 5 deposit pages was reached")
                     process_link(driver, href, directory_name, original_window)
                 processed_links.add(href)
 
@@ -566,10 +587,14 @@ def process_links(driver, links, processed_links, base_domain, directory_name, o
                 for second_link in second_layer_links:
                     second_href = second_link.get_attribute('href')
                     if validate_link(second_href, processed_links, base_domain) and len(processed_links) < max_links:
-                        if re.search(r'\bdeposits?\b', second_href.lower()) and deposit_page_counter < 5:
+                        is_deposit = re.search(r'\bdeposits?\b', second_href.lower())
+                        if is_deposit and deposit_page_counter < 5:
+                            logging.info(f"Opening deposit page {second_href} (deposit link {deposit_page_counter + 1} of at most 5)")
                             process_deposit_page(driver, second_href, directory_name, original_window)
                             deposit_page_counter += 1
                         else:
+                            if is_deposit:
+                                logging.info(f"Deposit link {second_href} handled as an ordinary page: the limit of 5 deposit pages was reached")
                             process_link(driver, second_href, directory_name, original_window)
                         processed_links.add(second_href)
                     if len(processed_links) >= max_links:
@@ -739,18 +764,36 @@ def process_deposit_page(driver, href, directory_name, original_window):
         text_fields_values = ['1000']  # or any other desired values
         counter = 1
 
+        # Diagnostics only, no behaviour change: what the deposit form offers and how many
+        # passes the loop below will run. A form with no radio button or no <select> gives
+        # zero passes, which used to leave no trace in the log at all.
+        try:
+            radio_groups = {}
+            for element in input_elements:
+                if element.get_attribute('type') == 'radio':
+                    radio_groups.setdefault(element.get_attribute('name'), []).append(element.get_attribute('value'))
+            planned = len(radio_options) * len(dropdown_options) * len(text_fields_values)
+            missing = [what for what, have in (("no radio buttons", radio_options), ("no <select> dropdown", dropdown_options)) if not have]
+            logging.info(f"Deposit page {href}: radio groups {radio_groups or 'none'}; "
+                         f"dropdowns {[(name, len(values)) for name, values in dropdown_options.items()] or 'none'}; "
+                         f"{len(text_fields)} text/number fields; {planned} passes planned"
+                         + (f" ({' and '.join(missing)})" if missing else ""))
+        except Exception as e:
+            logging.info(f"Could not describe deposit page {href}: {e}")
+
         # Generate all possible combinations of input options
         all_combinations = itertools.product(radio_options, dropdown_options.values(), text_fields_values)
 
         # Iterate over each combination
         for radio_option, dropdown_values, text_field_value in all_combinations:
-            # Find the fields again on the page that is loaded now.the ones found
+            # Find the fields again on the page that is loaded now. The ones found
             # above belong to the first load, and driver.get(href) at the end of each
             # pass replaces it, so from pass 2 on they were stale and nothing was set
 
             select_elements = safe_find_elements(By.TAG_NAME, 'select')
             input_elements = safe_find_elements(By.CSS_SELECTOR, 'input[type="checkbox"], input[type="radio"]')
             text_fields = safe_find_elements(By.CSS_SELECTOR, 'input[type="text"], input[type="number"]')
+            logging.info(f"Deposit pass {counter} on {href}: radio {radio_option!r}, dropdown values {list(dropdown_values)[:8]}, amount {text_field_value!r}")
 
             # Clear existing values
             clear_input_fields(input_elements, select_elements, text_fields)
@@ -762,6 +805,15 @@ def process_deposit_page(driver, href, directory_name, original_window):
 
             # Find and click the submit button
             submit_button = find_submit_button(driver)
+
+            # Diagnostics only: what the form actually holds when it is submitted, which can
+            # differ from the values above when setting a field fails.
+            try:
+                form_state = {"checked": [(e.get_attribute('name'), e.get_attribute('value')) for e in input_elements if e.is_selected()],
+                              "selects": [(s.get_attribute('name'), Select(s).first_selected_option.get_attribute('value')) for s in select_elements]}
+            except Exception as e:
+                form_state = f"unreadable ({type(e).__name__})"
+
             if submit_button:
                 safe_click_element(submit_button)
 
@@ -771,10 +823,17 @@ def process_deposit_page(driver, href, directory_name, original_window):
 
             # Capture HTML and screenshot
             capture_html_and_screenshot(driver, directory_name, href, counter)
+            try:
+                logging.info(f"Deposit pass {counter} on {href}: submitted with {form_state}; submit button {'found' if submit_button else 'NOT FOUND'}; "
+                             f"result title {driver.title[:60]!r}, url {driver.current_url}, wallet-like strings {wallet_like(driver.page_source) or 'none'}")
+            except Exception as e:
+                logging.info(f"Deposit pass {counter} on {href}: could not log the result: {e}")
             counter += 1
 
             # Navigate back to the original deposit page
             driver.get(href)
+
+        logging.info(f"Deposit page {href}: {counter - 1} passes run")
 
     except UnexpectedAlertPresentException as e:
         alert = driver.switch_to.alert
