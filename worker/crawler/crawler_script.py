@@ -1,7 +1,6 @@
 
 import base64
 import html
-import itertools
 import logging
 import os
 import random
@@ -812,233 +811,256 @@ def process_links(driver, links, processed_links, base_domain, directory_name, o
                 else:
                     driver.switch_to.window(original_window)
 
+# --- Deposit step ----------------------------------------------------------------------------
+# One pass per payment option that the site's own deposit form lists (dropdown or radios),
+# never a built-in coin list. Each pass picks the option, submits, and saves the page that
+# comes back (on HYIP Manager sites, "Please confirm your deposit" with the wallet address).
+#
+# Until Oct 20 the loop ran over itertools.product(every radio value on the page, each
+# <select>'s option list, ['1000']). On the HYIP Manager form (plan <select name="h_id">,
+# payment radios name="type", amount) that failed three ways, seen in the 186 deposit pages
+# saved on VM1-3 by Oct 20:
+#   - set_dropdown_options() selected one option value character by character, so the plan
+#     stayed on its blank first option. On 6 of the 19 sites every pass came back as the form,
+#     with no wallet (fundamentaltradegroup, metrospacefinance, lotech-global, ...).
+#   - clear_input_fields() clicked every radio, so passes that changed the plan submitted the
+#     last payment radio: bitvestwise spent 4 of its 8 passes on USDT TRC20.
+#   - A form without a radio or without a <select> got zero passes and left no trace.
+# Now the deposit form is the one holding the amount field. The plan control is the choice
+# control whose name or options read like plans (h_id, "plan", %, days, min/max); the payment
+# control is the other one. Each pass reloads the page and sets the controls by name in
+# JavaScript, which also reaches hidden radios and select2-wrapped selects, so nothing goes stale.
+MAX_DEPOSIT_PASSES = 12
+
+DEPOSIT_FORM_JS = r"""
+const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+const PLACEHOLDER = /^(select|choose|please|--|-)/i;
+const PLANLIKE = /%|\bdaily\b|\bhours?\b|\bdays?\b|\bweeks?\b|\bprofit|\bmin(imum)?\b|\bmax(imum)?\b|\bplan\b|\bpackage\b|\blevel\b/i;
+const PLANNAME = /h_id|plan|package|scheme|tariff|level/i;
+const PAYNAME = /type|pay|method|gateway|currency|coin|wallet|processor|system|ps$|ec$/i;
+const AMOUNTNAME = /amount|sum/i;
+function range(s) {
+  const m = (s || '').match(/\$?\s?([\d,]+(?:\.\d+)?)\s*(?:-|–|to)\s*\$?\s?([\d,]+(?:\.\d+)?)/i);
+  if (m) return [parseFloat(m[1].replace(/,/g, '')), parseFloat(m[2].replace(/,/g, ''))];
+  const n = (s || '').match(/min(?:imum)?[^0-9$]{0,15}\$?\s?([\d,]+(?:\.\d+)?)/i);
+  return n ? [parseFloat(n[1].replace(/,/g, '')), null] : null;
+}
+function radioText(r) {
+  // The radio's own row or label, else the text right after it; then the enclosing table
+  // or card, where plan tables put the "$50.00 - $549.00" range.
+  // A row holding several radios belongs to none of them; then the text up to the next
+  // input or <br> is the label.
+  let row = r.closest('tr, li, label');
+  if (row && row.querySelectorAll('input[type=radio]').length > 1) row = null;
+  let label = clean(row ? row.innerText || row.textContent : '');
+  if (label.length < 2) {
+    let n = r.nextSibling, s = '';
+    while (n && s.length < 120 && !(n.nodeType === 1 && (['BR', 'INPUT'].includes(n.tagName) || n.querySelector('input')))) {
+      s += ' ' + (n.textContent || ''); n = n.nextSibling;
+    }
+    label = clean(s);
+  }
+  const box = r.closest('table, .card, .plan, .package, div');
+  return [label.slice(0, 160), clean(box ? box.innerText || box.textContent : '').slice(0, 400)];
+}
+const described = Array.from(document.forms).map((f, index) => {
+  const els = Array.from(f.elements);
+  const amount = els.find(e => e.tagName === 'INPUT'
+      && ['text', 'number', 'tel', ''].includes((e.getAttribute('type') || '').toLowerCase())
+      && AMOUNTNAME.test([e.name, e.id, e.placeholder].join(' ')));
+  const controls = [];
+  els.filter(e => e.tagName === 'SELECT' && !e.disabled && e.name).forEach(s => {
+    const options = Array.from(s.options)
+      .filter(o => !o.disabled && o.value !== '' && !PLACEHOLDER.test(clean(o.text)))
+      .map(o => ({value: o.value, label: clean(o.text).slice(0, 80), range: range(o.text)}));
+    controls.push({kind: 'select', name: s.name, options});
+  });
+  const groups = {};
+  els.filter(e => e.type === 'radio' && !e.disabled && e.name && e.value !== '').forEach(r => {
+    const [label, box] = radioText(r);
+    (groups[r.name] = groups[r.name] || []).push({value: r.value, label: label.slice(0, 80), range: range(label) || range(box)});
+  });
+  Object.entries(groups).forEach(([name, options]) => controls.push({kind: 'radio', name, options}));
+  controls.forEach(c => {
+    c.plan = PLANNAME.test(c.name)
+      || (c.options.length > 0 && 2 * c.options.filter(o => PLANLIKE.test(o.label)).length >= c.options.length);
+  });
+  const submit = els.some(e => (e.tagName === 'BUTTON' && (e.getAttribute('type') || 'submit').toLowerCase() === 'submit')
+      || (e.tagName === 'INPUT' && ['submit', 'image'].includes(e.type)));
+  return {index, name: f.getAttribute('name') || f.id || '', amount: amount ? amount.name : null,
+          controls: controls.filter(c => c.options.length), submit};
+});
+const byControls = (a, b) => b.controls.length - a.controls.length;
+const form = described.filter(d => d.amount).sort(byControls)[0]
+          || described.filter(d => d.controls.length && d.submit).sort(byControls)[0];
+if (!form) return {forms: described.length};
+const plan = form.controls.find(c => c.plan) || null;
+const rest = form.controls.filter(c => c !== plan);
+const payment = rest.find(c => PAYNAME.test(c.name)) || rest.sort((a, b) => b.options.length - a.options.length)[0] || null;
+return {forms: described.length, form, plan, payment};
+"""
+
+# Sets the plan, the amount and one payment option on the reloaded page, and returns what the
+# form holds afterwards. The plan goes first because some sites refill the amount when the plan
+# changes; that amount is kept when it lies inside the plan's range.
+DEPOSIT_FILL_JS = r"""
+const [index, plan, payment, amountName, range] = arguments;
+const f = document.forms[index];
+if (!f) return {error: 'the deposit form is not on the reloaded page'};
+// The crawler's alert/confirm override (handle_alert) only covered the first page; a
+// "Are you sure?" confirm() on submit would otherwise block the pass.
+window.alert = () => {}; window.confirm = () => true;
+const els = Array.from(f.elements);
+function set(c) {
+  if (!c) return null;
+  if (c.kind === 'select') {
+    const s = els.find(e => e.tagName === 'SELECT' && e.name === c.name);
+    if (!s) return 'missing';
+    s.value = c.value;
+    Array.from(s.options).forEach(o => { o.selected = o.value === c.value; });
+    ['input', 'change'].forEach(t => s.dispatchEvent(new Event(t, {bubbles: true})));
+    if (window.jQuery) { try { window.jQuery(s).trigger('change'); } catch (e) {} }
+    return s.value;
+  }
+  const r = els.find(e => e.type === 'radio' && e.name === c.name && e.value === c.value);
+  if (!r) return 'missing';
+  r.click();
+  if (!r.checked) { r.checked = true; r.dispatchEvent(new Event('change', {bubbles: true})); }
+  const now = els.find(e => e.type === 'radio' && e.name === c.name && e.checked);
+  return now ? now.value : '';
+}
+const state = {plan: set(plan)};
+const a = amountName ? els.find(e => e.name === amountName) : null;
+if (a) {
+  const [min, max] = range || [null, null];
+  let v = parseFloat((a.value || '').replace(/[^\d.]/g, ''));
+  if (!(v > 0) || (min && v < min) || (max && v > max)) v = min || 100;
+  a.value = String(v);
+  ['input', 'change', 'keyup', 'blur'].forEach(t => a.dispatchEvent(new Event(t, {bubbles: true})));
+  state.amount = a.value;
+}
+state.payment = set(payment);
+return state;
+"""
+
+# Clicks the form's own submit button (or submits the form) once this script has returned, so
+# the navigation does not cut the WebDriver call short.
+DEPOSIT_SUBMIT_JS = r"""
+const f = document.forms[arguments[0]];
+const b = Array.from(f.elements).find(e => (e.tagName === 'BUTTON' && (e.getAttribute('type') || 'submit').toLowerCase() === 'submit')
+    || (e.tagName === 'INPUT' && ['submit', 'image'].includes(e.type)));
+setTimeout(() => { if (b) b.click(); else if (f.requestSubmit) f.requestSubmit(); else f.submit(); }, 0);
+return b ? 'button ' + JSON.stringify((b.innerText || b.value || '').trim().slice(0, 30)) : 'form.submit()';
+"""
+
+# Whether the page after a submit is the deposit form again (a visible amount field), and any
+# error or alert text it shows. The confirmation page also carries amount/type, but as hidden fields.
+DEPOSIT_RESULT_JS = r"""
+const amountName = arguments[0];
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+const back = !!amountName && Array.from(document.forms).some(f => {
+  const a = f.elements[amountName];
+  return a && a.tagName === 'INPUT' && a.type !== 'hidden' && vis(a);
+});
+const messages = Array.from(document.querySelectorAll('.error, .alert, .alert-danger, .text-danger, .invalid-feedback, [role=alert]'))
+  .filter(vis).map(e => (e.innerText || '').replace(/\s+/g, ' ').trim()).filter(t => t && t.length < 200);
+return {back, messages: Array.from(new Set(messages)).slice(0, 3)};
+"""
+
 def process_deposit_page(driver, href, directory_name, original_window):
-    def safe_find_elements(by, value, retries=3, delay=1):
-        """Safely find elements and handle StaleElementReferenceException."""
-        for attempt in range(retries):
-            try:
-                elements = driver.find_elements(by, value)
-                if elements is not None:
-                    return [el for el in elements if el is not None]  # Filter out None elements
-                else:
-                    return []  # Return empty list if no elements are found
-            except StaleElementReferenceException:
-                if attempt < retries - 1:
-                    time.sleep(delay)  
-                else:
-                    raise
+    safe_href = href.replace('://', '_').replace('/', '_').replace('?', '_')
 
-    def safe_click_element(element, retries=3, delay=1):
-        """Safely click an element and handle StaleElementReferenceException."""
-        for attempt in range(retries):
-            try:
-                if element is not None:  # Check if element is not None
-                    driver.execute_script("arguments[0].scrollIntoView(true);", element)  # Scroll to the element
-                    time.sleep(0.5)  # Small delay to ensure the element is in view
-                    element.click()
-                return
-            except StaleElementReferenceException:
-                if attempt < retries - 1:
-                    time.sleep(delay)
-                else:
-                    raise
-
-    def disable_google_translate_bar():
-        """Disable the Google Translate bar if it appears."""
-        try:
-            driver.execute_script("""
-                var element = document.querySelector('#google_translate_element');
-                if (element) {
-                    element.style.display = 'none';
-                }
-                var translateBar = document.querySelector('.goog-te-banner-frame');
-                if (translateBar) {
-                    translateBar.style.display = 'none';
-                }
-                var body = document.querySelector('body');
-                if (body) {
-                    body.classList.remove('translated-rtl');
-                }
-            """)
-        except Exception as e:
-            logging.error(f"Failed to disable Google Translate bar: {e}")
-
-    def clear_input_fields(input_elements, select_elements, text_fields):
-        """Clear the values in input fields (radio buttons, checkboxes, text fields, and dropdowns)."""
-        for input_element in input_elements:
-            try:
-                if input_element.get_attribute('type') in ['radio', 'checkbox']:
-                    input_element.click()  # Toggle the state of radio buttons and checkboxes
-            except Exception as e:
-                logging.error(f"Failed to clear input element: {e}")
-
-        for text_field in text_fields:
-            try:
-                text_field.clear()
-            except Exception as e:
-                logging.error(f"Failed to clear text field: {e}")
-
-        for select_element in select_elements:
-            try:
-                select = Select(select_element)
-                select.deselect_all()
-            except Exception as e:
-                logging.error(f"Failed to clear dropdown: {e}")
-
-    def set_radio_option(input_elements, radio_option):
-        """Set the value of a radio button option."""
-        for input_element in input_elements:
-            try:
-                if input_element.get_attribute('type') == 'radio' and input_element.get_attribute('value') == radio_option:
-                    safe_click_element(input_element)
-                    break
-            except Exception as e:
-                logging.error(f"Failed to set radio option: {e}")
-
-    def set_dropdown_options(select_elements, dropdown_options, dropdown_values):
-        """Set the values of dropdown options."""
-        for select_element, options in zip(select_elements, dropdown_values):
-            try:
-                select = Select(select_element)
-                for option in options:
-                    select.select_by_value(option)
-            except Exception as e:
-                logging.error(f"Failed to set dropdown option: {e}")
-
-    def set_text_field_values(text_fields, text_field_value):
-        """Set the values of text fields."""
-        for text_field in text_fields:
-            try:
-                text_field.send_keys(text_field_value)
-            except Exception as e:
-                logging.error(f"Failed to set text field value: {e}")
-
-    def find_submit_button(driver):
-        """Find and return the submit button element."""
-        possible_selectors = ["input[type='submit']", "button[type='submit']", "input[type='button']", "button[type='button']"]
-        for selector in possible_selectors:
-            submit_buttons = safe_find_elements(By.CSS_SELECTOR, selector)
-            if submit_buttons:
-                return submit_buttons[0]
-        return None
-
-    def capture_html_and_screenshot(driver, directory_name, href, counter):
-        """Capture the HTML content and screenshot of the current page."""
-        html_content = driver.page_source
-
-        # Create unique file name based on the combination values for captured web pages
-        html_file_path = os.path.join(directory_name, f"deposit_page_{href.replace('://', '_').replace('/', '_').replace('?', '_')}_{counter}.html")
-
-        with open(html_file_path, 'w', encoding='utf-8') as file:
-            file.write(html_content)
-
+    def capture(counter):
+        """Save the current page as deposit_page_<href>_<counter>.html plus a full-page screenshot."""
+        with open(os.path.join(directory_name, f"deposit_page_{safe_href}_{counter}.html"), 'w', encoding='utf-8') as file:
+            file.write(driver.page_source)
         result = driver.execute_cdp_cmd("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True})
-        screenshot_data = base64.b64decode(result['data'])
-        # Named after the deposit page like the HTML above. "deposit_screenshot_{counter}"
-        # restarted at 1 for every deposit page of a site, so each deposit page's
-        # screenshots overwrote the previous page's.
-        screenshot_path = os.path.join(directory_name, f"deposit_screenshot_{href.replace('://', '_').replace('/', '_').replace('?', '_')}_{counter}.png")
-        with open(screenshot_path, 'wb') as file:
-            file.write(screenshot_data)
-
+        with open(os.path.join(directory_name, f"deposit_screenshot_{safe_href}_{counter}.png"), 'wb') as file:
+            file.write(base64.b64decode(result['data']))
         logging.info(f"Captured and saved data for deposit page {href} with counter: {counter}")
+
+    def wait_for_page():
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+        time.sleep(3)
+
+    def accept_alert(where):
+        try:
+            alert = driver.switch_to.alert
+            logging.info(f"Deposit page {href}: accepted a dialog {where}: {alert.text[:150]!r}")
+            alert.accept()
+        except NoAlertPresentException:
+            pass
 
     driver.execute_script("window.open(arguments[0]);", href)
     driver.switch_to.window(driver.window_handles[-1])
-    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
-    time.sleep(3)
-
     try:
-        # Disable Google Translate bar if it appears
-        disable_google_translate_bar()
+        wait_for_page()
+        # The page as the site serves it, before anything is filled in. Some sites show their
+        # wallet addresses here already, and it shows what the form offered if the passes fail.
+        capture(0)
+        found = driver.execute_script(DEPOSIT_FORM_JS)
+        form, plan, payment = found.get('form'), found.get('plan'), found.get('payment')
+        if not form:
+            logging.info(f"Deposit page {href}: no deposit form ({found.get('forms', 0)} form(s) on the page, "
+                         f"none with an amount field or a choice control and a submit button); 0 passes planned")
+            return
 
-        # Find input elements
-        select_elements = safe_find_elements(By.TAG_NAME, 'select')
-        input_elements = safe_find_elements(By.CSS_SELECTOR, 'input[type="checkbox"], input[type="radio"]')
-        text_fields = safe_find_elements(By.CSS_SELECTOR, 'input[type="text"], input[type="number"]')
+        plan_choice = plan['options'][0] if plan else None
+        options = payment['options'] if payment else [None]
+        if len(options) > MAX_DEPOSIT_PASSES:
+            logging.info(f"Deposit page {href}: {len(options)} payment options, only the first {MAX_DEPOSIT_PASSES} are tried")
+            options = options[:MAX_DEPOSIT_PASSES]
+        chosen = {c['name'] for c in (plan, payment) if c}
+        others = [f"{c['kind']} {c['name']!r}" for c in form['controls'] if c['name'] not in chosen]
+        logging.info(
+            f"Deposit page {href}: form #{form['index']} {form['name']!r}; "
+            + (f"plan {plan['kind']} {plan['name']!r} ({len(plan['options'])} options), using {plan_choice['label']!r}"
+               + (f" range {plan_choice['range']}" if plan_choice.get('range') else "") if plan else "no plan control")
+            + "; " + (f"payment {payment['kind']} {payment['name']!r} with {len(payment['options'])} options "
+                      f"{[o['label'] for o in payment['options']]}" if payment else "no payment-method control, one pass with the site's default")
+            + f"; amount field {form['amount']!r}"
+            + (f"; left as they are: {others}" if others else "")
+            + f"; {len(options)} passes planned")
 
-        # Store input options in separate lists/dictionaries
-        radio_options = [element.get_attribute('value') for element in input_elements if element.get_attribute('type') == 'radio']
-        dropdown_options = {select.get_attribute('name'): [option.get_attribute('value') for option in select.find_elements(By.TAG_NAME, 'option')] for select in select_elements}
-        text_fields_values = ['1000']  # or any other desired values
-        counter = 1
-
-        # Diagnostics only, no behaviour change: what the deposit form offers and how many
-        # passes the loop below will run. A form with no radio button or no <select> gives
-        # zero passes, which used to leave no trace in the log at all.
-        try:
-            radio_groups = {}
-            for element in input_elements:
-                if element.get_attribute('type') == 'radio':
-                    radio_groups.setdefault(element.get_attribute('name'), []).append(element.get_attribute('value'))
-            planned = len(radio_options) * len(dropdown_options) * len(text_fields_values)
-            missing = [what for what, have in (("no radio buttons", radio_options), ("no <select> dropdown", dropdown_options)) if not have]
-            logging.info(f"Deposit page {href}: radio groups {radio_groups or 'none'}; "
-                         f"dropdowns {[(name, len(values)) for name, values in dropdown_options.items()] or 'none'}; "
-                         f"{len(text_fields)} text/number fields; {planned} passes planned"
-                         + (f" ({' and '.join(missing)})" if missing else ""))
-        except Exception as e:
-            logging.info(f"Could not describe deposit page {href}: {e}")
-
-        # Generate all possible combinations of input options
-        all_combinations = itertools.product(radio_options, dropdown_options.values(), text_fields_values)
-
-        # Iterate over each combination
-        for radio_option, dropdown_values, text_field_value in all_combinations:
-            # Find the fields again on the page that is loaded now. The ones found
-            # above belong to the first load, and driver.get(href) at the end of each
-            # pass replaces it, so from pass 2 on they were stale and nothing was set
-
-            select_elements = safe_find_elements(By.TAG_NAME, 'select')
-            input_elements = safe_find_elements(By.CSS_SELECTOR, 'input[type="checkbox"], input[type="radio"]')
-            text_fields = safe_find_elements(By.CSS_SELECTOR, 'input[type="text"], input[type="number"]')
-            logging.info(f"Deposit pass {counter} on {href}: radio {radio_option!r}, dropdown values {list(dropdown_values)[:8]}, amount {text_field_value!r}")
-
-            # Clear existing values
-            clear_input_fields(input_elements, select_elements, text_fields)
-
-            # Set values for the current combination
-            set_radio_option(input_elements, radio_option)
-            set_dropdown_options(select_elements, dropdown_options, dropdown_values)
-            set_text_field_values(text_fields, text_field_value)
-
-            # Find and click the submit button
-            submit_button = find_submit_button(driver)
-
-            # Diagnostics only: what the form actually holds when it is submitted, which can
-            # differ from the values above when setting a field fails.
+        wallets, form_back_in_a_row, passes = set(), 0, 0
+        for counter, option in enumerate(options, start=1):
             try:
-                form_state = {"checked": [(e.get_attribute('name'), e.get_attribute('value')) for e in input_elements if e.is_selected()],
-                              "selects": [(s.get_attribute('name'), Select(s).first_selected_option.get_attribute('value')) for s in select_elements]}
-            except Exception as e:
-                form_state = f"unreadable ({type(e).__name__})"
+                if counter > 1:
+                    driver.get(href)
+                    wait_for_page()
+                state = driver.execute_script(
+                    DEPOSIT_FILL_JS, form['index'],
+                    {'kind': plan['kind'], 'name': plan['name'], 'value': plan_choice['value']} if plan else None,
+                    {'kind': payment['kind'], 'name': payment['name'], 'value': option['value']} if option else None,
+                    form['amount'], (plan_choice or {}).get('range'))
+                if state.get('error'):
+                    logging.info(f"Deposit pass {counter} on {href}: {state['error']}, stopping")
+                    break
+                how = driver.execute_script(DEPOSIT_SUBMIT_JS, form['index'])
+                time.sleep(1)
+                accept_alert("after submitting")
+                wait_for_page()
+                capture(counter)
+                passes += 1
+                found_wallets = wallet_like(driver.page_source)
+                wallets.update(found_wallets)
+                result = driver.execute_script(DEPOSIT_RESULT_JS, form['amount'])
+                logging.info(
+                    f"Deposit pass {counter} on {href}: payment {option['label'] if option else 'site default'!r}"
+                    f"{' (' + option['value'] + ')' if option else ''}; submitted with {state} via {how}; "
+                    f"result title {driver.title[:60]!r}, url {driver.current_url}, wallet-like strings {found_wallets or 'none'}"
+                    + (f"; the deposit form came back{': ' + ' | '.join(result['messages']) if result['messages'] else ' with no message'}"
+                       if result['back'] else ""))
+                form_back_in_a_row = form_back_in_a_row + 1 if result['back'] and not found_wallets else 0
+                if form_back_in_a_row >= 2:
+                    logging.info(f"Deposit page {href}: the form came back on two passes in a row, stopping")
+                    break
+            except UnexpectedAlertPresentException:
+                accept_alert(f"during pass {counter}")
+        logging.info(f"Deposit page {href}: {passes} passes run, {len(wallets)} distinct wallet-like strings")
 
-            if submit_button:
-                safe_click_element(submit_button)
-
-            # Wait for the resulting page to load
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
-            time.sleep(3)
-
-            # Capture HTML and screenshot
-            capture_html_and_screenshot(driver, directory_name, href, counter)
-            try:
-                logging.info(f"Deposit pass {counter} on {href}: submitted with {form_state}; submit button {'found' if submit_button else 'NOT FOUND'}; "
-                             f"result title {driver.title[:60]!r}, url {driver.current_url}, wallet-like strings {wallet_like(driver.page_source) or 'none'}")
-            except Exception as e:
-                logging.info(f"Deposit pass {counter} on {href}: could not log the result: {e}")
-            counter += 1
-
-            # Navigate back to the original deposit page
-            driver.get(href)
-
-        logging.info(f"Deposit page {href}: {counter - 1} passes run")
-
-    except UnexpectedAlertPresentException as e:
-        alert = driver.switch_to.alert
-        logging.warning(f"Unexpected alert present while processing deposit page {href}: {alert.text}")
-        alert.accept()
-        logging.info(f"Accepted unexpected alert for deposit page {href}. Moving to next link.")
+    except UnexpectedAlertPresentException:
+        accept_alert("while reading the page")
     except Exception as e:
         logging.error(f"Failed to process deposit page {href}: {e}")
     finally:
