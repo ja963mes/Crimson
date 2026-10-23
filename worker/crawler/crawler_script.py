@@ -1,4 +1,5 @@
 
+import argparse
 import base64
 import html
 import logging
@@ -69,9 +70,10 @@ sys.stdout = open(log_file_path, 'a', buffering=1)
 sys.stderr = open(log_file_path, 'a', buffering=1)
 logging.info("Script started.")
 
-def setup_chrome_options():
+def setup_chrome_options(headless=True):
     chrome_options = webdriver.ChromeOptions()
-    chrome_options.add_argument("--headless")
+    if headless:
+        chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--start-maximized")
@@ -82,7 +84,10 @@ def setup_chrome_options():
         "translate": {"enabled": False},
         "intl.accept_languages": "en-US,en"
     })
-    chrome_options.binary_location = CHROME_BINARY
+    # Off the VMs (e.g. a local Windows test) these paths don't exist; Selenium then
+    # uses the installed Chrome and fetches a matching chromedriver itself.
+    if os.path.exists(CHROME_BINARY):
+        chrome_options.binary_location = CHROME_BINARY
     return chrome_options
 
 
@@ -116,7 +121,7 @@ def handle_alert(driver):
 # opened at import time and never quit: every run leaked a chromedriver plus
 # Chrome, and later starts reused a Service that was already running.
 def initialize_driver():
-    service = Service(executable_path=CHROMEDRIVER_PATH)
+    service = Service(executable_path=CHROMEDRIVER_PATH if os.path.exists(CHROMEDRIVER_PATH) else None)
     driver = webdriver.Chrome(service=service, options=chrome_options)
     handle_alert(driver)  # Handle alerts immediately after driver initialization
     return driver
@@ -698,7 +703,7 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
         if outcome == "failed":
             return
 
-        directory_name = login_url.replace('://', '_').replace('/', '_')
+        directory_name = windows_safe(login_url.replace('://', '_').replace('/', '_'))
         os.makedirs(directory_name, exist_ok=True)
         if current_site_url:
             with open(os.path.join(directory_name, 'source_url.txt'), 'w') as f:
@@ -721,6 +726,14 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
 def validate_link(href, processed_links, base_domain):
     return href is not None and href not in processed_links and "logout" not in href.lower() and "signout" not in href.lower() and get_base_domain(href) == base_domain
 
+# File and folder names are built from URLs. Windows rejects characters such as
+# ':' and '?' in them and limits paths to 260 characters, so a local test run
+# replaces those characters and shortens the names. Unchanged on the VMs.
+def windows_safe(name):
+    if os.name != 'nt':
+        return name
+    return re.sub(r'[<>:"\\|?*]', '_', name)[:100]
+
 def process_link(driver, href, directory_name, original_window):
     driver.execute_script("window.open(arguments[0]);", href)
     driver.switch_to.window(driver.window_handles[-1])
@@ -728,13 +741,13 @@ def process_link(driver, href, directory_name, original_window):
     time.sleep(3)
 
     html_content = driver.page_source
-    html_file_path = os.path.join(directory_name, f"page_{href.replace('://', '_').replace('/', '_').replace('?', '_')}.html")
+    html_file_path = os.path.join(directory_name, f"page_{windows_safe(href.replace('://', '_').replace('/', '_').replace('?', '_'))}.html")
     with open(html_file_path, 'w', encoding='utf-8') as file:
         file.write(html_content)
 
     result = driver.execute_cdp_cmd("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True})
     screenshot_data = base64.b64decode(result['data'])
-    screenshot_path = os.path.join(directory_name, f"screenshot_{href.replace('://', '_').replace('/', '_').replace('?', '_')}.png")
+    screenshot_path = os.path.join(directory_name, f"screenshot_{windows_safe(href.replace('://', '_').replace('/', '_').replace('?', '_'))}.png")
     with open(screenshot_path, 'wb') as file:
         file.write(screenshot_data)
 
@@ -968,7 +981,7 @@ return {back, messages: Array.from(new Set(messages)).slice(0, 3)};
 """
 
 def process_deposit_page(driver, href, directory_name, original_window):
-    safe_href = href.replace('://', '_').replace('/', '_').replace('?', '_')
+    safe_href = windows_safe(href.replace('://', '_').replace('/', '_').replace('?', '_'))
 
     def capture(counter):
         """Save the current page as deposit_page_<href>_<counter>.html plus a full-page screenshot."""
@@ -1190,10 +1203,28 @@ def check_mailinator_inbox_and_click_links(api_key, driver, email_address, signu
 
 # Main function
 def main():
-    global driver
+    global driver, chrome_options, current_site_url
+    # --url crawls one site without reading urls.txt or touching the crawled_urls.txt
+    # checkpoint, for testing a single site; --show-browser runs Chrome with a window.
+    parser = argparse.ArgumentParser(description="Crimson authenticated crawler")
+    parser.add_argument('--url', help="crawl only this site instead of urls.txt")
+    parser.add_argument('--show-browser', action='store_true', help="run Chrome with a visible window")
+    args = parser.parse_args()
+    if args.show_browser:
+        chrome_options = setup_chrome_options(headless=False)
+    if args.url:  # also print the log to the terminal
+        console = logging.StreamHandler(sys.__stdout__)
+        console.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logging.getLogger().addHandler(console)
+
     driver = initialize_driver()
     handle_alert(driver)  # Handle initial alerts right after the driver is initialized
     try:
+        if args.url:
+            current_site_url = args.url
+            email = fill_sign_up_form_with_timeout(driver, args.url)
+            logging.info(f"{'Success' if email else 'Timeout or failure'}: {args.url}")
+            return
         list_of_urls_file = URLS_FILE #List of URLs (produced by feeder.py from pipeline results)
         last_processed_file_path = CRAWLED_URLS_FILE #Contains the last crawled URL to keep track
         # Login happens per site inside fill_sign_up_form(). A second login search
