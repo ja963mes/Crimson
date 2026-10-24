@@ -1,0 +1,9 @@
+[Unit]
+Description=Restart the Crimson listener when it is running but cannot publish
+Documentation=https://github.com/ja963mes/Crimson
+
+[Service]
+Type=oneshot
+# root: it restarts crimson-listener and reads listen.py's sockets.
+ExecStart=/usr/local/bin/crimson-listener-health.sh
+SyslogIdentifier=crimson-listener-health

@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the Crimson listener every minute
+Documentation=https://github.com/ja963mes/Crimson
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=crimson-listener-health.service
+
+[Install]
+WantedBy=timers.target
