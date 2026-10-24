@@ -1,0 +1,10 @@
+[Unit]
+Description=Remove leftover snap Chromium lock dirs from recv.py screenshots
+Documentation=https://github.com/ja963mes/Crimson
+
+[Service]
+Type=oneshot
+# Only the Crimson rule, so the rest of /tmp keeps the stock once-a-day cleanup.
+ExecStart=/usr/bin/systemd-tmpfiles --clean /etc/tmpfiles.d/crimson-chromium.conf
+Nice=10
+IOSchedulingClass=idle

@@ -1,0 +1,11 @@
+[Unit]
+Description=Clean snap Chromium leftovers every 15 minutes
+Documentation=https://github.com/ja963mes/Crimson
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=15min
+Unit=crimson-chromium-tmp-clean.service
+
+[Install]
+WantedBy=timers.target
