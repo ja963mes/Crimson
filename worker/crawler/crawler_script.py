@@ -434,6 +434,9 @@ SIGNUP_OK_RE = re.compile(r"registration (was |is )?(complete|completed|successf
 FORM_ERROR_RE = re.compile(r"already (exists|registered|in use|taken)|required|invalid|incorrect|do(es)? not match|must (be|contain|have)|"
                            r"please (enter|fill|provide|select|check|agree|type|correct|choose)|captcha|not valid|too (short|long)|wrong|error|failed", re.I)
 LOGIN_FAILED_URL_RE = re.compile(r"say=invalid|invalid_login|login_?error|[?&]error=", re.I)
+# The page after a sign-up asks for the e-mail address to be confirmed (text or URL).
+VERIFY_EMAIL_RE = re.compile(r"verify[-_ ]?(your )?e-?mail|confirm (your )?e-?mail|check your (e-?mail|inbox)|e-?mail[-_ ]?verification|"
+                             r"(confirmation|verification|activation) (link|e-?mail|code) (has been |was )?sent", re.I)
 
 def page_state(driver):
     """Logout link, visible password fields, visible error messages, invalid form fields and body text of the current page."""
@@ -602,7 +605,8 @@ def fill_sign_up_form(driver, start_url):
                         form_url = driver.current_url
                         before_submit = page_state(driver)
                         if submit_form(driver, selectors, form):
-                            outcome, evidence = assess_signup(before_submit, wait_for_outcome(driver, before_submit), form_url)
+                            after_submit = wait_for_outcome(driver, before_submit)
+                            outcome, evidence = assess_signup(before_submit, after_submit, form_url)
                             logging.info(f"Sign-up result: {outcome} - {evidence}")
                             if outcome == "rejected":
                                 # The site refused the form, so there is no account to confirm
@@ -624,8 +628,13 @@ def fill_sign_up_form(driver, start_url):
                                 logging.info("Successfully interacted with new email.")
                             elif MAILINATOR_API_KEY and MAILINATOR_API_KEY != "YOUR_API_KEY":
                                 logging.info(f"No confirmation email clicked within {MAILINATOR_WAIT_SECONDS} seconds.")
+                            if not email_checked and (VERIFY_EMAIL_RE.search(after_submit["text"]) or VERIFY_EMAIL_RE.search(after_submit["url"])):
+                                # cryptocoinprop.com (/verify-email/) and swifttradinginc.live refuse
+                                # login until the address is confirmed, so the search would be wasted.
+                                logging.info("Account created, waiting on e-mail verification (no confirmation link was clicked); skipping the login search")
+                                break
 
-                            login_url = find_login_url_with_single_password_field(driver, current_url, signup_url=form_url)
+                            login_url =find_login_url_with_single_password_field(driver, current_url, signup_url=form_url)
                             if login_url:
                                 login_and_take_screenshot(driver, login_url, ACCOUNT_PASSWORD, email_used)
                             else:
@@ -702,26 +711,33 @@ def fill_sign_up_urls_in_list(urls_file_path, last_processed_file_path):
             if url == last_processed_url:
                 start_processing = True
 
-# Check for single password field
+# Check for single password field on the page the caller has just loaded. A login keyword
+# anywhere in the URL used to be enough on its own, without looking at the page, and the
+# keywords were matched as substrings: 'account' took cryptocoinprop.com's article
+# /academy/library/five-habits-that-keep-a-funded-account-alive/ as the login page. Keywords now
+# match whole words and only decide whether to give the page a few seconds to render its form;
+# the page must show exactly one visible password field. Hidden ones do not count, so a
+# /login/ page that also holds a hidden sign-up tab still qualifies.
+LOGIN_URL_RE = re.compile(r"(?<![a-z])(log-?in|sign-?in|auth|authenticate|userlogin|member)(?![a-z])", re.I)
+LOGIN_TEXT_RE = re.compile(r"^\s*(member )?(log ?in|sign ?in)\s*$", re.I)
+VISIBLE_PASSWORDS_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+return Array.from(document.querySelectorAll('input[type=password]')).filter(vis).length;
+"""
+
 def has_single_password_field(driver, url):
     if url.startswith('javascript:'):
         return None
-    login_keywords = [
-        'login', 'signin', 'log-in', 'sign-in', 'auth', 'authenticate',
-        'account', 'user', 'useraccount', 'user-account', 'myaccount', 'userlogin', 'enter' #Keywords to detect login pages in DOM
-    ]
-    if any(keyword in url.lower() for keyword in login_keywords):
-        logging.info(f"The login URLs are {url}")
-        return url
     try:
-        driver.get(url)
-        page_source = driver.page_source
-        soup = BeautifulSoup(page_source, 'html.parser')
-        password_inputs = soup.find_all('input', {'type': 'password'})
-        if len(password_inputs) == 1:
+        if LOGIN_URL_RE.search(url):
+            try:
+                WebDriverWait(driver, 5).until(lambda d: d.execute_script(VISIBLE_PASSWORDS_JS) > 0)
+            except TimeoutException:
+                pass
+        if driver.execute_script(VISIBLE_PASSWORDS_JS) == 1:
             return url
     except Exception as e:
-        logging.error(f"An error occurred while fetching {url}: {str(e)}")
+        logging.error(f"An error occurred while checking {url} for a login form: {str(e)}")
     return None
 
 # Get base domain from URL. A leading "www." is dropped so that a site which
@@ -776,6 +792,7 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
             return
         global logged_in
         logged_in = True
+        dismiss_blocking_popups(driver)  # before the links are read: an overlay can hide or replace them
 
         directory_name = windows_safe(login_url.replace('://', '_').replace('/', '_'))
         os.makedirs(directory_name, exist_ok=True)
@@ -808,11 +825,92 @@ def windows_safe(name):
         return name
     return re.sub(r'[<>:"\\|?*]', '_', name)[:100]
 
+# --- Popups that cover the page after login ---------------------------------------------------
+# swifttradinginc.live puts a full-screen terms dialog (a fixed overlay, no role="dialog") over
+# every page until "I have read and accept" is ticked and "Accept & continue" is pressed, so every
+# screenshot showed the dialog. Only checkboxes and buttons inside a fixed overlay or a dialog are
+# touched: the accept box, an Accept/Agree/Continue/OK button, and "Not now" on install prompts.
+POPUP_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+const overlay = e => { for (let p = e; p && p !== document.body; p = p.parentElement) {
+    if (p.tagName === 'DIALOG' || p.getAttribute('role') === 'dialog' || p.getAttribute('role') === 'alertdialog' ||
+        p.getAttribute('aria-modal') === 'true' || getComputedStyle(p).position === 'fixed') return true; }
+  return false; };
+const text = e => (e.innerText || e.value || '').trim().replace(/\s+/g, ' ');
+const boxes = Array.from(document.querySelectorAll('input[type=checkbox]')).filter(b => vis(b) && !b.checked && overlay(b) &&
+    /\b(accept|agree|terms|i have read)\b/i.test(text(b.closest('label') || b.parentElement || b)));
+const buttons = Array.from(document.querySelectorAll('button,[role=button],input[type=button],input[type=submit]')).filter(b => {
+    const t = text(b);
+    return vis(b) && overlay(b) && t.length <= 40 &&
+        (/^(i )?(accept|agree)\b|^(continue|got it|ok|okay|i understand)$/i.test(t) || /^(not now|no,? thanks|maybe later|later)$/i.test(t)); });
+return {boxes: boxes, buttons: buttons};
+"""
+
+def dismiss_blocking_popups(driver, rounds=3):
+    for _ in range(rounds):
+        try:
+            found = driver.execute_script(POPUP_JS)
+            if found['boxes']:
+                for box in found['boxes']:
+                    try:
+                        box.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", box)
+                    logging.info("Popup: ticked the accept box")
+                time.sleep(0.5)  # the Accept button is disabled until the box is ticked
+                found = driver.execute_script(POPUP_JS)
+            clicked = False
+            for button in found['buttons']:
+                if not button.is_enabled():
+                    continue
+                label = (button.text or button.get_attribute('value') or '').strip()
+                driver.execute_script("arguments[0].click();", button)
+                logging.info(f"Popup: clicked {label!r}")
+                clicked = True
+            if not clicked:
+                return
+            time.sleep(1)
+        except Exception as e:
+            logging.info(f"Could not dismiss a popup: {e}")
+            return
+
+# --- Invest links ---------------------------------------------------------------------------
+# swifttradinginc.live has no deposit page; each of its 32 plans has an "Invest" link
+# (/invest?sub=cash-elite&cycle=168) that leads to the payment step. The deposit step matched
+# only URLs with "deposit" in them, so it never ran there. Links whose path is /invest (or
+# ?a=invest) are collected with the plan minimum shown on their card, and only the cheapest
+# one is opened, as a deposit page: one plan is enough to reach the payment options, and
+# opening all 32 would use up the link limit.
+INVEST_LINKS_JS = r"""
+const out = [];
+for (const a of document.querySelectorAll('a[href]')) {
+  let u; try { u = new URL(a.href); } catch (e) { continue; }
+  if (!/(^|\/)invest(\/|$)/i.test(u.pathname) && !/[?&]a=invest(&|$)/i.test(u.search)) continue;
+  let min = null;
+  for (let e = a, i = 0; e && i < 6 && min === null; e = e.parentElement, i++) {
+    const m = (e.innerText || '').match(/min(?:imum)?[^\d$]{0,20}\$?\s*([\d,]+(?:\.\d+)?)/i);
+    if (m) min = parseFloat(m[1].replace(/,/g, ''));
+  }
+  out.push([a.href, min]);
+}
+return out;
+"""
+
+def page_links(driver):
+    """Absolute hrefs of the links on the current page, and its invest links as [href, minimum]."""
+    hrefs = driver.execute_script("return Array.from(document.querySelectorAll('a[href]')).map(a => a.href);")
+    return hrefs, driver.execute_script(INVEST_LINKS_JS)
+
+# Opens href in a new tab, saves it, closes the tab, and returns the links on that page so the
+# second layer of process_links() follows them. The second layer used to read the links again
+# from the post-login page the crawler had switched back to, so it never went deeper than the
+# first layer: swifttradinginc.live's /plans page and its Invest links were never looked at.
 def process_link(driver, href, directory_name, original_window):
     driver.execute_script("window.open(arguments[0]);", href)
     driver.switch_to.window(driver.window_handles[-1])
     WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
     time.sleep(3)
+    dismiss_blocking_popups(driver)
 
     html_content = driver.page_source
     html_file_path = os.path.join(directory_name, f"page_{windows_safe(href.replace('://', '_').replace('/', '_').replace('?', '_'))}.html")
@@ -826,8 +924,10 @@ def process_link(driver, href, directory_name, original_window):
         file.write(screenshot_data)
 
     logging.info(f"Captured and saved data for {href}")
+    links_on_page = page_links(driver)
     driver.close()
     driver.switch_to.window(original_window)
+    return links_on_page
 
 # Wallet-looking strings on a page, for the deposit-stage log lines only. A hint for reading
 # the log: iocs_searcher.sh still does the real extraction. Script and style blocks are
@@ -853,35 +953,59 @@ def process_links(driver, links, processed_links, base_domain, directory_name, o
     except Exception as e:
         logging.info(f"Could not list the deposit links on the post-login page: {e}")
 
+    invest_links_seen = set()  # never opened as ordinary pages; one of them goes to the deposit step
+    invest_done = False
+
+    def wanted(href):
+        return validate_link(href, processed_links, base_domain) and href not in invest_links_seen
+
+    def open_page(href):
+        """Open one link: deposit links go to the deposit step. Returns the links on the page
+        (empty for deposit pages) as (hrefs, invest links)."""
+        nonlocal deposit_page_counter
+        processed_links.add(href)
+        is_deposit = re.search(r'\bdeposits?\b', href.lower()) # condition true if either deposit or deposits in url
+        if is_deposit and deposit_page_counter < 5: # and within limit
+            logging.info(f"Opening deposit page {href} (deposit link {deposit_page_counter + 1} of at most 5)")
+            process_deposit_page(driver, href, directory_name, original_window)
+            deposit_page_counter += 1
+            return [], []
+        if is_deposit:
+            logging.info(f"Deposit link {href} handled as an ordinary page: the limit of 5 deposit pages was reached")
+        return process_link(driver, href, directory_name, original_window)
+
+    def try_invest(entries, where):
+        nonlocal invest_done, deposit_page_counter
+        entries = [e for e in entries if wanted(e[0])]
+        invest_links_seen.update(e[0] for e in entries)
+        if invest_done or not entries or deposit_page_counter >= 5:
+            return
+        # The lowest minimum first; links whose card shows no minimum come last.
+        href, minimum = min(entries, key=lambda e: (e[1] is None, e[1] or 0))
+        logging.info(f"Opening invest page {href} as a deposit page: "
+                     + (f"minimum ${minimum:g}, " if minimum is not None else "")
+                     + f"the cheapest of {len(entries)} invest link(s) on {where}")
+        invest_done = True
+        deposit_page_counter += 1
+        processed_links.add(href)
+        process_deposit_page(driver, href, directory_name, original_window)
+
+    try:
+        try_invest(driver.execute_script(INVEST_LINKS_JS), "the post-login page")
+    except Exception as e:
+        logging.info(f"Could not look for invest links on the post-login page: {e}")
+
     for link in links:
         href = link.get_attribute('href')
-        if validate_link(href, processed_links, base_domain):
+        if wanted(href):
             try:
-                is_deposit = re.search(r'\bdeposits?\b', href.lower()) # condition true if either deposit or deposits in url
-                if is_deposit and deposit_page_counter < 5: # and within limit
-                    logging.info(f"Opening deposit page {href} (deposit link {deposit_page_counter + 1} of at most 5)")
-                    process_deposit_page(driver, href, directory_name, original_window)
-                    deposit_page_counter += 1
-                else:
-                    if is_deposit:
-                        logging.info(f"Deposit link {href} handled as an ordinary page: the limit of 5 deposit pages was reached")
-                    process_link(driver, href, directory_name, original_window)
-                processed_links.add(href)
+                second_hrefs, second_invest = open_page(href)
+                try_invest(second_invest, href)
 
-                second_layer_links = driver.find_elements(By.TAG_NAME, 'a')
-                for second_link in second_layer_links:
-                    second_href = second_link.get_attribute('href')
-                    if validate_link(second_href, processed_links, base_domain) and len(processed_links) < max_links:
-                        is_deposit = re.search(r'\bdeposits?\b', second_href.lower())
-                        if is_deposit and deposit_page_counter < 5:
-                            logging.info(f"Opening deposit page {second_href} (deposit link {deposit_page_counter + 1} of at most 5)")
-                            process_deposit_page(driver, second_href, directory_name, original_window)
-                            deposit_page_counter += 1
-                        else:
-                            if is_deposit:
-                                logging.info(f"Deposit link {second_href} handled as an ordinary page: the limit of 5 deposit pages was reached")
-                            process_link(driver, second_href, directory_name, original_window)
-                        processed_links.add(second_href)
+                for second_href in second_hrefs:
+                    if wanted(second_href) and len(processed_links) < max_links:
+                        _, third_invest = open_page(second_href)
+                        try_invest(third_invest, second_href)
                     if len(processed_links) >= max_links:
                         logging.info("Reached max links limit during second-layer processing.")
                         break
@@ -1082,6 +1206,7 @@ def process_deposit_page(driver, href, directory_name, original_window):
     driver.switch_to.window(driver.window_handles[-1])
     try:
         wait_for_page()
+        dismiss_blocking_popups(driver)
         # The page as the site serves it, before anything is filled in. Some sites show their
         # wallet addresses here already, and it shows what the form offered if the passes fail.
         capture(0)
@@ -1181,13 +1306,19 @@ def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=300):
 # 'auth' login keyword and has one password field, so "login" was tried on the sign-up form
 # (swifttradinginc.live). Its links are still followed.
 SIGNUP_URL_KEYWORDS = ('joinus', 'register', 'signup', 'sign-up', 'createaccount', 'newuser', 'registration')
+# The search used to follow every link, off-site ones included, with no limit; on
+# cryptocoinprop.com it walked the site for 2 minutes. Links that look like login (by URL or by
+# link text) are now tried first, only the site's own pages are followed, and it stops after
+# this many pages.
+MAX_LOGIN_SEARCH_PAGES = 25
 
 def find_login_url_with_single_password_field(driver, start_url, signup_url=None):
+    base_domain = get_base_domain(start_url)
     visited_urls = set()
     urls_to_check = [start_url]
     login_url = None
 
-    while urls_to_check:
+    while urls_to_check and len(visited_urls) < MAX_LOGIN_SEARCH_PAGES:
         current_url = urls_to_check.pop(0)
         if current_url in visited_urls or is_blacklisted(current_url):
             continue
@@ -1199,14 +1330,26 @@ def find_login_url_with_single_password_field(driver, start_url, signup_url=None
             if login_url:
                 logging.info(f"URL with a single password field in a form: {login_url}")
                 return login_url
-            links = driver.find_elements(By.TAG_NAME, 'a')
-            for link in links:
-                absolute_link = urljoin(current_url, link.get_attribute('href'))
-                if absolute_link not in visited_urls and absolute_link not in urls_to_check and not is_blacklisted(absolute_link):
+            login_like = []
+            for link in driver.find_elements(By.TAG_NAME, 'a'):
+                href = link.get_attribute('href')
+                if not href or href.startswith(('javascript:', 'mailto:', 'tel:')):
+                    continue
+                absolute_link = urljoin(current_url, href)
+                if (get_base_domain(absolute_link) != base_domain or absolute_link in visited_urls
+                        or absolute_link in urls_to_check or is_blacklisted(absolute_link)):
+                    continue
+                if LOGIN_URL_RE.search(absolute_link) or LOGIN_TEXT_RE.match(link.text or ''):
+                    login_like.append(absolute_link)
+                else:
                     urls_to_check.append(absolute_link)
+            urls_to_check[:0] = login_like
         except Exception as e:
             logging.error(f"An error occurred while crawling {current_url}: {str(e)}")
-    logging.info("No page with a single password field found.")
+    if urls_to_check:
+        logging.info(f"No page with a single password field found in the first {MAX_LOGIN_SEARCH_PAGES} pages.")
+    else:
+        logging.info("No page with a single password field found.")
     return None
 
 # Save and retrieve last processed URL
