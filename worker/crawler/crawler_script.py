@@ -385,12 +385,23 @@ def ensure_driver(drv):
         return driver
 
 # Handle dropdowns
+# Placeholder options ("Select…", "Choose…", "--") used to be picked at random like real ones.
+# On swifttradinginc.live, where "Select…" is the disabled first option of country (50 options)
+# and gender (5), 4 of 5 sign-ups were refused with "Please select an item in the list".
+PLACEHOLDER_OPTION_RE = re.compile(r"^\s*(-+.*|select\b.*|choose\b.*|please (select|choose)\b.*|\.\.\.|…)?\s*$", re.I)
+
+def usable_options(options):
+    usable = [o for o in options if o.is_enabled() and (o.get_attribute("value") or "").strip()
+              and not PLACEHOLDER_OPTION_RE.match(o.text or "")]
+    return usable or [o for o in options if o.is_enabled()] or options
+
 def handle_dropdowns(form, driver):
     select_elements = form.find_elements(By.TAG_NAME, 'select')
     for select_element in select_elements:
+        options = []
         try:
             select = Select(select_element)
-            options = select.options
+            options = usable_options(select.options)
             if options:
                 random_option = random.choice(options)
                 select.select_by_value(random_option.get_attribute("value"))
@@ -398,7 +409,10 @@ def handle_dropdowns(form, driver):
             try:
                 if options:
                     random_value = random.choice(options).get_attribute("value")
-                    driver.execute_script("arguments[0].value = arguments[1];", select_element, random_value)
+                    # The change event lets script-driven forms (React) see the new value.
+                    driver.execute_script("arguments[0].value = arguments[1];"
+                                          "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+                                          select_element, random_value)
             except WebDriverException as e:
                 logging.error(f"Failed to select dropdown option using JavaScript: {e}")
 
@@ -634,9 +648,13 @@ def fill_sign_up_form(driver, start_url):
                                 logging.info("Account created, waiting on e-mail verification (no confirmation link was clicked); skipping the login search")
                                 break
 
-                            login_url =find_login_url_with_single_password_field(driver, current_url, signup_url=form_url)
+                            if crawl_if_already_logged_in(driver, "after sign-up"):
+                                break
+                            login_url, logged_in_url = find_login_url_with_single_password_field(driver, current_url, signup_url=form_url)
                             if login_url:
                                 login_and_take_screenshot(driver, login_url, ACCOUNT_PASSWORD, email_used)
+                            elif logged_in_url:
+                                crawl_if_already_logged_in(driver, "during the login search")
                             else:
                                 logging.info("Could not find a login URL to proceed with login.")
                                 return False
@@ -790,19 +808,7 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
         logging.info(f"Login result: {outcome} - {evidence}")
         if outcome == "failed":
             return
-        global logged_in
-        logged_in = True
-        dismiss_blocking_popups(driver)  # before the links are read: an overlay can hide or replace them
-
-        directory_name = windows_safe(login_url.replace('://', '_').replace('/', '_'))
-        os.makedirs(directory_name, exist_ok=True)
-        if current_site_url:
-            with open(os.path.join(directory_name, 'source_url.txt'), 'w') as f:
-                f.write(current_site_url + '\n')
-        processed_links = set()
-
-        links = driver.find_elements(By.TAG_NAME, 'a')
-        process_links(driver, links, processed_links, base_domain, directory_name, original_window, max_links=25)
+        crawl_logged_in(driver, login_url, base_domain, original_window)
     except NoSuchElementException as e:
         logging.error(f"Element not found during login process: {e}")
     except TimeoutException as e:
@@ -812,6 +818,35 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
     finally:
         if original_window and original_window in driver.window_handles:
             driver.switch_to.window(original_window)
+
+# Save and crawl the site from the current, logged-in page. The folder is named after
+# folder_url: the login page, or the page that was already logged in when no login was needed.
+def crawl_logged_in(driver, folder_url, base_domain, original_window):
+    global logged_in
+    logged_in = True
+    dismiss_blocking_popups(driver)  # before the links are read: an overlay can hide or replace them
+
+    directory_name = windows_safe(folder_url.replace('://', '_').replace('/', '_'))
+    os.makedirs(directory_name, exist_ok=True)
+    if current_site_url:
+        with open(os.path.join(directory_name, 'source_url.txt'), 'w') as f:
+            f.write(current_site_url + '\n')
+    processed_links = set()
+
+    links = driver.find_elements(By.TAG_NAME, 'a')
+    process_links(driver, links, processed_links, base_domain, directory_name, original_window, max_links=25)
+
+# Some sites log the new account in when the confirmation link is clicked (likely on
+# cryptocoinprop.com, where the login search then found no login form in 25 pages, which
+# fits a logged-in visitor being sent away from /login/). A visible Logout link on the
+# current page means no login is needed.
+def crawl_if_already_logged_in(driver, where):
+    state = page_state(driver)
+    if not state["logout"]:
+        return False
+    logging.info(f"Already logged in ({where}): {state['url']} has a Logout link; skipping the login step")
+    crawl_logged_in(driver, state["url"], get_base_domain(state["url"]), driver.current_window_handle)
+    return True
 
 #Validate links to avoid clicking on logout/signout buttons
 def validate_link(href, processed_links, base_domain):
@@ -934,9 +969,13 @@ def process_link(driver, href, directory_name, original_window):
 # dropped first so tokens inside them are not reported.
 WALLET_LIKE_RE = re.compile(r"\b(bc1[02-9ac-hj-np-z]{25,60}|[13][1-9A-HJ-NP-Za-km-z]{25,34}|0x[0-9a-fA-F]{40}|T[1-9A-HJ-NP-Za-km-z]{33})\b")
 
+# Hidden inputs are dropped too, and all-hex strings are skipped: bitvestwise.net's hidden
+# form_token 388d8db1cc6a514b9dafc5a8bb51c484 (an MD5) fits the legacy Bitcoin pattern.
 def wallet_like(html_content):
     visible = re.sub(r"<(script|style)\b.*?</\1>", " ", html_content, flags=re.S | re.I)
-    return sorted(set(WALLET_LIKE_RE.findall(visible)))
+    visible = re.sub(r"<input\b[^>]*\btype=[\"']?hidden\b[^>]*>", " ", visible, flags=re.I)
+    return sorted({w for w in WALLET_LIKE_RE.findall(visible)
+                   if w.startswith('0x') or not re.fullmatch(r"[0-9a-fA-F]+", w)})
 
 def process_links(driver, links, processed_links, base_domain, directory_name, original_window, max_links=25):
     if len(processed_links) >= max_links:
@@ -944,6 +983,7 @@ def process_links(driver, links, processed_links, base_domain, directory_name, o
         return
 
     deposit_page_counter = 0
+    deposit_hrefs = []
 
     # Logged so a site whose deposit page was never opened can be told apart from one whose
     # deposit page was opened but produced nothing (process_deposit_page logs that case).
@@ -1021,6 +1061,66 @@ def process_links(driver, links, processed_links, base_domain, directory_name, o
                     logging.error("Original window has been closed.")
                 else:
                     driver.switch_to.window(original_window)
+
+    # Last, because clicking can navigate the post-login page away and leave `links` stale.
+    if not deposit_hrefs and original_window in driver.window_handles:
+        try:
+            click_deposit_button(driver, directory_name, base_domain, original_window, processed_links)
+        except Exception as e:
+            logging.error(f"Deposit button step failed: {e}")
+        finally:
+            if original_window in driver.window_handles:
+                driver.switch_to.window(original_window)
+
+# --- Deposit buttons --------------------------------------------------------------------------
+# swifttradinginc.live's dashboard has a "Deposit" <button> and no deposit link, and the crawler
+# only followed <a href>. When the post-login page has no deposit link, the first visible button
+# labelled like a deposit is clicked on that page and whatever it opens (a modal, a new route
+# or a new tab) is saved. If it led to another page of the site, the deposit step runs there.
+DEPOSIT_BUTTONS_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+return Array.from(document.querySelectorAll('button,[role=button],input[type=button],input[type=submit]')).filter(b =>
+    vis(b) && !b.disabled && b.tagName !== 'A' &&
+    /^(deposit|deposit funds|make a deposit|fund|fund account|fund wallet|add funds|top ?up)$/i.test(
+        (b.innerText || b.value || '').trim().replace(/\s+/g, ' ')));
+"""
+
+def click_deposit_button(driver, directory_name, base_domain, original_window, processed_links):
+    buttons = driver.execute_script(DEPOSIT_BUTTONS_JS)
+    if not buttons:
+        logging.info("No deposit link or deposit button on the post-login page")
+        return
+    button = buttons[0]
+    label = (button.text or button.get_attribute('value') or '').strip()
+    start_url = driver.current_url
+    handles_before = set(driver.window_handles)
+    driver.execute_script("arguments[0].click();", button)
+    time.sleep(3)
+    new_tabs = [h for h in driver.window_handles if h not in handles_before]
+    if new_tabs:
+        driver.switch_to.window(new_tabs[0])
+
+    stem = windows_safe(f"deposit_button_{label}_" + start_url.replace('://', '_').replace('/', '_').replace('?', '_'))
+    with open(os.path.join(directory_name, f"{stem}.html"), 'w', encoding='utf-8') as file:
+        file.write(driver.page_source)
+    result = driver.execute_cdp_cmd("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True})
+    with open(os.path.join(directory_name, f"{stem}.png"), 'wb') as file:
+        file.write(base64.b64decode(result['data']))
+    now_url = driver.current_url
+    logging.info(f"Deposit button {label!r} on {start_url}: "
+                 + (f"opened a new tab at {now_url}" if new_tabs else
+                    f"now at {now_url}" if now_url != start_url else "same URL (a dialog or an in-page panel)")
+                 + f"; saved as {stem}; wallet-like strings {wallet_like(driver.page_source) or 'none'}")
+
+    if new_tabs:
+        driver.close()
+        driver.switch_to.window(original_window)
+    elif now_url != start_url:
+        driver.get(start_url)
+    if now_url != start_url and get_base_domain(now_url) == base_domain and now_url not in processed_links:
+        processed_links.add(now_url)
+        logging.info(f"Opening {now_url} (reached with the deposit button) as a deposit page")
+        process_deposit_page(driver, now_url, directory_name, original_window)
 
 # --- Deposit step ----------------------------------------------------------------------------
 # One pass per payment option that the site's own deposit form lists (dropdown or radios),
@@ -1312,6 +1412,9 @@ SIGNUP_URL_KEYWORDS = ('joinus', 'register', 'signup', 'sign-up', 'createaccount
 # this many pages.
 MAX_LOGIN_SEARCH_PAGES = 25
 
+# Returns (login URL, None), or (None, URL of a page with a Logout link) when a page shows the
+# account is already logged in, or (None, None). Each page visited is logged with where it ended
+# up, so a failed search shows what it saw.
 def find_login_url_with_single_password_field(driver, start_url, signup_url=None):
     base_domain = get_base_domain(start_url)
     visited_urls = set()
@@ -1327,9 +1430,16 @@ def find_login_url_with_single_password_field(driver, start_url, signup_url=None
             driver.get(current_url)
             is_signup_page = current_url in (start_url, signup_url) or any(k in current_url.lower() for k in SIGNUP_URL_KEYWORDS)
             login_url = None if is_signup_page else has_single_password_field(driver, current_url)
+            state = page_state(driver)
+            logging.info(f"Login search: {current_url}"
+                         + (f" -> {state['url']}" if state['url'] and state['url'] != current_url else "")
+                         + f"; {state['passwords']} visible password field(s)"
+                         + ("; Logout link" if state['logout'] else "") + ("; sign-up page, skipped" if is_signup_page else ""))
             if login_url:
                 logging.info(f"URL with a single password field in a form: {login_url}")
-                return login_url
+                return login_url, None
+            if state['logout'] and not state['passwords']:
+                return None, state['url']
             login_like = []
             for link in driver.find_elements(By.TAG_NAME, 'a'):
                 href = link.get_attribute('href')
@@ -1350,7 +1460,7 @@ def find_login_url_with_single_password_field(driver, start_url, signup_url=None
         logging.info(f"No page with a single password field found in the first {MAX_LOGIN_SEARCH_PAGES} pages.")
     else:
         logging.info("No page with a single password field found.")
-    return None
+    return None, None
 
 # Save and retrieve last processed URL
 def save_last_processed_url(file_path, last_url):
