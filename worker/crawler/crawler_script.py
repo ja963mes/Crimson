@@ -49,14 +49,16 @@ CRAWLED_URLS_FILE = os.path.join(HERE, 'crawled_urls.txt')   # single-URL resume
 # Mailinator email-confirmation is optional; set these env vars to enable it.
 # On the Crimson VMs they come from ~/.crimson_env.systemd via the unit's
 # EnvironmentFile, so the API token never lives in this file or the repo.
-EMAIL_DOMAIN = os.environ.get('MAILINATOR_DOMAIN', 'your-email-domain.com')
-MAILINATOR_API_KEY = os.environ.get('MAILINATOR_API_KEY', 'YOUR_API_KEY')
+EMAIL_DOMAIN = "<MAILINATOR_DOMAIN>"
+MAILINATOR_API_KEY =  "<MAILINATOR_API_KEY>" 
 # "private" addresses the account's private domain (EMAIL_DOMAIN) in the v2 API.
 MAILINATOR_API = 'https://api.mailinator.com/api/v2/domains/private'
 MAILINATOR_WAIT_SECONDS = 60   # how long to poll the sign-up inbox for a confirmation email
 # The password every sign-up form gets, and therefore the one login must use.
 # Login used to send the literal string "PASSWORD", so no login could succeed.
-ACCOUNT_PASSWORD = 'Pass@1234'
+# 'Pass@1234' was refused as too weak by sign-up checks against breached-password
+# lists (swifttradinginc.live, Oct 24); this one is long and not a common password.
+ACCOUNT_PASSWORD = '<CRAWLER_PASSWORD>'
 # Chromium/chromedriver locations. Defaults match the Crimson worker nodes
 # (snap Chromium shim + system chromedriver), the same paths recv.py uses.
 # Override via env for other environments.
@@ -132,6 +134,9 @@ driver = None  # created in main(); fill_form() and the URL loop use this global
 # URL, which can be on another host than the site feeder.py gave the crawler.
 # build_wallets.py reads it to tie each wallet to its domain.
 current_site_url = None
+# Set by login_and_take_screenshot() when the login is not judged failed, so the
+# per-site "Success" line means logged in, not merely that a form was filled.
+logged_in = False
 
 # Generate random strings and emails for filling forms
 def generate_random_string(length=8, names_file=NAMES_FILE): #names.txt contains a dictionary of common names
@@ -278,14 +283,58 @@ def predict_values(form):
                 predictions[input_name] = predicted_password
             elif "email" in input_name.lower():
                 predictions[input_name] = predicted_email
+            elif is_phone_field(input_tag):
+                predictions[input_name] = generate_phone_number()
             else:
                 predictions[input_name] = generate_random_string()
     return predictions
 
-# Fill form
-def fill_form(predictions):
+# Phone fields used to get a name from names.txt, which forms with phone
+# validation refuse (swifttradinginc.live: name="phone", type="tel").
+def is_phone_field(input_tag):
+    if (input_tag.get_attribute('type') or '').lower() == 'tel':
+        return True
+    hints = ' '.join((input_tag.get_attribute(a) or '') for a in ('name', 'id', 'placeholder', 'autocomplete')).lower()
+    return any(h in hints for h in ('phone', 'mobile', 'tel', 'whatsapp', 'cell'))
+
+def generate_phone_number():
+    return f"+1 555 {random.randint(200, 999)} {random.randint(1000, 9999)}"
+
+# Pick the form to sign up with. The first <form> on the page used to be taken, which on
+# pages holding both a login and a sign-up form (cryptocoinprop.com /login/ and /register/,
+# where one is a hidden tab) was the login form. Prefer a visible form with a password field
+# that looks like sign-up: more visible fields, a second password, a terms box, a sign-up
+# word in its action/id/class or button, and no login word. A form that looks like login
+# (a login word, no sign-up word, one password field) is skipped, so on /login/ with the
+# sign-up tab hidden the crawl moves on to /register/ instead of filling the login form.
+def pick_signup_form(driver):
+    best, best_score = None, None
+    for form in driver.find_elements(By.TAG_NAME, 'form'):
+        try:
+            visible = [e for e in form.find_elements(By.CSS_SELECTOR, 'input,select,textarea')
+                       if e.get_attribute('type') != 'hidden' and e.is_displayed()]
+            passwords = [e for e in visible if e.get_attribute('type') == 'password']
+            if not passwords:
+                continue
+            words = ' '.join((form.get_attribute(a) or '') for a in ('action', 'id', 'class', 'name')).lower()
+            words += ' ' + ' '.join(b.text.lower() for b in form.find_elements(By.CSS_SELECTOR, 'button,input[type="submit"]'))
+            signup_word = any(k in words for k in ('register', 'signup', 'sign-up', 'sign up', 'create', 'join'))
+            login_word = any(k in words for k in ('login', 'log in', 'signin', 'sign-in', 'sign in'))
+            if login_word and not signup_word and len(passwords) < 2:
+                continue
+            score = len(visible) + 3 * (len(passwords) >= 2) + 3 * signup_word - 3 * login_word
+            score += 1 * any(e.get_attribute('type') == 'checkbox' for e in visible)
+            if best_score is None or score > best_score:
+                best, best_score = form, score
+        except StaleElementReferenceException:
+            continue
+    return best
+
+# Fill form. Fields are looked up inside the chosen form; a page-wide lookup by name found
+# the hidden login form's "email" and "password" first on pages with two forms.
+def fill_form(form, predictions):
     for input_name, prediction in predictions.items():
-        input_field = driver.find_element(By.NAME, input_name)
+        input_field = form.find_element(By.NAME, input_name)
         try:
             if input_field.is_displayed() and input_field.is_enabled():
                 input_field.send_keys(prediction)
@@ -294,10 +343,13 @@ def fill_form(predictions):
         except ElementNotInteractableException:
             logging.info(f"Element {input_name} is not interactable")
 
-# Handle checkboxes
-def handle_checkbox(driver):
+# Handle checkboxes in the chosen form. The form is already loaded, so there is nothing to
+# wait for; a 10 s wait for checkboxes used to stall every form that has none.
+def handle_checkbox(driver, form):
     try:
-        checkboxes = WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'input[type="checkbox"]')))
+        checkboxes = form.find_elements(By.CSS_SELECTOR, 'input[type="checkbox"]')
+        if not checkboxes:
+            logging.info("No checkboxes in the form.")
         for checkbox in checkboxes:
             try:
                 if checkbox.is_displayed() and checkbox.is_enabled() and not checkbox.is_selected():
@@ -311,8 +363,6 @@ def handle_checkbox(driver):
             except Exception:
                 driver.execute_script("arguments[0].click();", checkbox)
                 logging.info("Checkbox clicked using JavaScript.")
-    except TimeoutException as e:
-        logging.error(f"Timed out waiting for checkboxes: {e}")
     except Exception as e:
         logging.error(f"An error occurred while handling checkboxes: {e}")
 
@@ -461,7 +511,17 @@ def click_and_submit(driver, button, button_type):
         button.send_keys(Keys.RETURN)
     return False
 
-def submit_form(driver, selectors):
+def submit_form(driver, selectors, form=None):
+    # The chosen form's own submit button first: the page-wide search below clicked the first
+    # matching button on the page ("Log in" on cryptocoinprop.com) and waited 10 s for each
+    # selector the page does not use. A <button> without a type attribute submits too.
+    if form is not None:
+        for button in form.find_elements(By.CSS_SELECTOR, 'button[type="submit"],input[type="submit"],button:not([type])'):
+            try:
+                if button.is_displayed() and button.is_enabled() and click_and_submit(driver, button, By.CSS_SELECTOR):
+                    return True
+            except StaleElementReferenceException:
+                continue
     for selector, selector_type in selectors:
         try:
             submit_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((selector_type, selector)))
@@ -509,10 +569,12 @@ def fill_sign_up_form(driver, start_url):
 
                 wait = WebDriverWait(driver, 5)
                 try:
-                    form = wait.until(EC.presence_of_element_located((By.TAG_NAME, 'form')))
+                    wait.until(EC.presence_of_element_located((By.TAG_NAME, 'form')))
+                    form = pick_signup_form(driver)
                     if form and should_continue:
+                        logging.info(f"Sign-up form chosen: action={form.get_attribute('action')!r}")
                         predictions = predict_values(form)
-                        fill_form(predictions)
+                        fill_form(form, predictions)
                         time.sleep(1)
 
                         if not should_continue:
@@ -524,7 +586,7 @@ def fill_sign_up_form(driver, start_url):
                         if not should_continue:
                             return False
 
-                        handle_checkbox(driver)
+                        handle_checkbox(driver, form)
 
                         # After the fields are filled, so predict_values() cannot overwrite it.
                         if captcha_answer is not None:
@@ -539,7 +601,7 @@ def fill_sign_up_form(driver, start_url):
 
                         form_url = driver.current_url
                         before_submit = page_state(driver)
-                        if submit_form(driver, selectors):
+                        if submit_form(driver, selectors, form):
                             outcome, evidence = assess_signup(before_submit, wait_for_outcome(driver, before_submit), form_url)
                             logging.info(f"Sign-up result: {outcome} - {evidence}")
                             if outcome == "rejected":
@@ -552,15 +614,18 @@ def fill_sign_up_form(driver, start_url):
                             email_used = next((v for v in predictions.values()
                                                if isinstance(v, str) and v.endswith(f"@{EMAIL_DOMAIN}")), None)
                             form_filled = True
-                            logging.info(f"Form submission successful. Signed up using {email_used}")
+                            if outcome == "success":
+                                logging.info(f"Sign-up succeeded with {email_used}")
+                            else:
+                                logging.info(f"Sign-up submitted with {email_used}, but the page gave no sign of success; trying to log in anyway")
                             email_checked = check_mailinator_inbox_and_click_links(
                                 MAILINATOR_API_KEY, driver, email_used, signup_time=time.time())
                             if email_checked:
                                 logging.info("Successfully interacted with new email.")
-                            else:
+                            elif MAILINATOR_API_KEY and MAILINATOR_API_KEY != "YOUR_API_KEY":
                                 logging.info(f"No confirmation email clicked within {MAILINATOR_WAIT_SECONDS} seconds.")
 
-                            login_url = find_login_url_with_single_password_field(driver, current_url)
+                            login_url = find_login_url_with_single_password_field(driver, current_url, signup_url=form_url)
                             if login_url:
                                 login_and_take_screenshot(driver, login_url, ACCOUNT_PASSWORD, email_used)
                             else:
@@ -571,7 +636,7 @@ def fill_sign_up_form(driver, start_url):
                         else:
                             logging.info("Form submission unsuccessful.")
                     else:
-                        logging.info("No form found on the page.")
+                        logging.info("No sign-up form found on the page (no visible form with a password field that is not a login form).")
                 except Exception as e:
                     logging.error(f"An error occurred: {str(e)}")
 
@@ -603,6 +668,16 @@ def has_two_or_more_password_fields(driver, url):
     except Exception as e:
         logging.error(f"An error occurred while fetching {url}: {str(e)}")
 
+# "Success" used to be logged whenever a sign-up form was submitted, including sites where
+# the login then failed (swifttradinginc.live). It now needs a login that was not judged failed.
+def log_site_result(url, email):
+    if logged_in:
+        logging.info(f"Success: {url} (logged in as {email})")
+    elif email:
+        logging.info(f"Signed up but not logged in: {url} ({email})")
+    else:
+        logging.info(f"Timeout or failure: {url}")
+
 # Process URLs from a list
 def fill_sign_up_urls_in_list(urls_file_path, last_processed_file_path):
     global current_site_url
@@ -619,10 +694,7 @@ def fill_sign_up_urls_in_list(urls_file_path, last_processed_file_path):
                 try:
                     current_site_url = url
                     email_used = fill_sign_up_form_with_timeout(driver, url)
-                    if email_used:
-                        logging.info(f"Success: {url} ")
-                    else:
-                        logging.info(f"Timeout or failure: {url}")
+                    log_site_result(url, email_used)
                     save_last_processed_url(last_processed_file_path, url)
                 except Exception as e:
                     logging.error(f"An error occurred while processing {url}: {e}")
@@ -702,6 +774,8 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
         logging.info(f"Login result: {outcome} - {evidence}")
         if outcome == "failed":
             return
+        global logged_in
+        logged_in = True
 
         directory_name = windows_safe(login_url.replace('://', '_').replace('/', '_'))
         os.makedirs(directory_name, exist_ok=True)
@@ -1082,9 +1156,11 @@ def process_deposit_page(driver, href, directory_name, original_window):
 
 # Sign-up form with timeout
 def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=300):
-    global should_continue, form_filled
+    global should_continue, form_filled, logged_in, email_used
     should_continue = True
     form_filled = False
+    logged_in = False
+    email_used = None  # else a previous site's address leaked into this site's result
 
     def target():
         global form_filled
@@ -1101,7 +1177,12 @@ def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=300):
     return email_used if form_filled else None
 
 # Find login URL with a single password field
-def find_login_url_with_single_password_field(driver, start_url):
+# The sign-up page itself is never taken as the login page: /auth?mode=signup matched the
+# 'auth' login keyword and has one password field, so "login" was tried on the sign-up form
+# (swifttradinginc.live). Its links are still followed.
+SIGNUP_URL_KEYWORDS = ('joinus', 'register', 'signup', 'sign-up', 'createaccount', 'newuser', 'registration')
+
+def find_login_url_with_single_password_field(driver, start_url, signup_url=None):
     visited_urls = set()
     urls_to_check = [start_url]
     login_url = None
@@ -1113,7 +1194,8 @@ def find_login_url_with_single_password_field(driver, start_url):
         visited_urls.add(current_url)
         try:
             driver.get(current_url)
-            login_url = has_single_password_field(driver, current_url)
+            is_signup_page = current_url in (start_url, signup_url) or any(k in current_url.lower() for k in SIGNUP_URL_KEYWORDS)
+            login_url = None if is_signup_page else has_single_password_field(driver, current_url)
             if login_url:
                 logging.info(f"URL with a single password field in a form: {login_url}")
                 return login_url
@@ -1222,8 +1304,7 @@ def main():
     try:
         if args.url:
             current_site_url = args.url
-            email = fill_sign_up_form_with_timeout(driver, args.url)
-            logging.info(f"{'Success' if email else 'Timeout or failure'}: {args.url}")
+            log_site_result(args.url, fill_sign_up_form_with_timeout(driver, args.url))
             return
         list_of_urls_file = URLS_FILE #List of URLs (produced by feeder.py from pipeline results)
         last_processed_file_path = CRAWLED_URLS_FILE #Contains the last crawled URL to keep track
