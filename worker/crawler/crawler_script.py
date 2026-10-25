@@ -285,6 +285,8 @@ def predict_values(form):
                 predictions[input_name] = predicted_email
             elif is_phone_field(input_tag):
                 predictions[input_name] = generate_phone_number()
+            elif input_type.lower() in DATE_INPUT_FORMATS:
+                predictions[input_name] = generate_date_value(input_type.lower())
             else:
                 predictions[input_name] = generate_random_string()
     return predictions
@@ -299,6 +301,16 @@ def is_phone_field(input_tag):
 
 def generate_phone_number():
     return f"+1 555 {random.randint(200, 999)} {random.randint(1000, 9999)}"
+
+# Date inputs (minnercoinex.org's required type="date" "dob") used to get a name from names.txt,
+# which a date field ignores, so the form was refused with "dob: Please fill out this field".
+# They get an adult's birth date in the value format the input type takes; fill_form() sets it
+# with JavaScript because typed dates depend on the browser's locale.
+DATE_INPUT_FORMATS = {'date': '%Y-%m-%d', 'datetime-local': '%Y-%m-%dT%H:%M', 'month': '%Y-%m', 'week': '%G-W%V', 'time': '%H:%M'}
+
+def generate_date_value(input_type):
+    moment = datetime(random.randint(1965, 1998), random.randint(1, 12), random.randint(1, 28), 10, 30)
+    return moment.strftime(DATE_INPUT_FORMATS[input_type])
 
 # Pick the form to sign up with. The first <form> on the page used to be taken, which on
 # pages holding both a login and a sign-up form (cryptocoinprop.com /login/ and /register/,
@@ -336,7 +348,12 @@ def fill_form(form, predictions):
     for input_name, prediction in predictions.items():
         input_field = form.find_element(By.NAME, input_name)
         try:
-            if input_field.is_displayed() and input_field.is_enabled():
+            if input_field.is_displayed() and input_field.is_enabled() and (input_field.get_attribute('type') or '').lower() in DATE_INPUT_FORMATS:
+                driver.execute_script("arguments[0].value = arguments[1];"
+                                      "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));"
+                                      "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+                                      input_field, prediction)
+            elif input_field.is_displayed() and input_field.is_enabled():
                 input_field.send_keys(prediction)
             else:
                 logging.info(f"Element {input_name} is not interactable")
@@ -390,9 +407,16 @@ def ensure_driver(drv):
 # and gender (5), 4 of 5 sign-ups were refused with "Please select an item in the list".
 PLACEHOLDER_OPTION_RE = re.compile(r"^\s*(-+.*|select\b.*|choose\b.*|please (select|choose)\b.*|\.\.\.|…)?\s*$", re.I)
 
-def usable_options(options):
-    usable = [o for o in options if o.is_enabled() and (o.get_attribute("value") or "").strip()
-              and not PLACEHOLDER_OPTION_RE.match(o.text or "")]
+# A first option that repeats the dropdown's own name is a placeholder too, even when it is
+# enabled and has a value (minnercoinex.org: "Gender", "Plan", and "Security Question" on
+# name="question "), so "Gender" was submitted as a gender.
+def usable_options(options, select_element=None):
+    names = {re.sub(r"\W+", "", (select_element.get_attribute(a) or "")).lower()
+             for a in ("name", "id")} - {""} if select_element is not None else set()
+    def names_itself(i, o):
+        return i == 0 and any(n in re.sub(r"\W+", "", o.text or "").lower() for n in names)
+    usable = [o for i, o in enumerate(options) if o.is_enabled() and (o.get_attribute("value") or "").strip()
+              and not PLACEHOLDER_OPTION_RE.match(o.text or "") and not names_itself(i, o)]
     return usable or [o for o in options if o.is_enabled()] or options
 
 def handle_dropdowns(form, driver):
@@ -401,7 +425,7 @@ def handle_dropdowns(form, driver):
         options = []
         try:
             select = Select(select_element)
-            options = usable_options(select.options)
+            options = usable_options(select.options, select_element)
             if options:
                 random_option = random.choice(options)
                 select.select_by_value(random_option.get_attribute("value"))
