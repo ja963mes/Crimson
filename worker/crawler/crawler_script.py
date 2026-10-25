@@ -680,14 +680,16 @@ def fill_sign_up_form(driver, start_url):
 
                             if crawl_if_already_logged_in(driver, "after sign-up"):
                                 break
-                            login_url, logged_in_url = find_login_url_with_single_password_field(driver, current_url, signup_url=form_url)
+                            login_url, logged_in_url = find_login_url_with_single_password_field(
+                                driver, current_url, signup_url=form_url, landed_url=after_submit["url"])
                             if login_url:
                                 login_and_take_screenshot(driver, login_url, ACCOUNT_PASSWORD, email_used)
                             elif logged_in_url:
                                 crawl_if_already_logged_in(driver, "during the login search")
                             else:
+                                # break, not return False: the account exists, so the site's result
+                                # line should say "Signed up but not logged in", not "failure".
                                 logging.info("Could not find a login URL to proceed with login.")
-                                return False
                             break
 
                         else:
@@ -1445,10 +1447,15 @@ MAX_LOGIN_SEARCH_PAGES = 25
 # Returns (login URL, None), or (None, URL of a page with a Logout link) when a page shows the
 # account is already logged in, or (None, None). Each page visited is logged with where it ended
 # up, so a failed search shows what it saw.
-def find_login_url_with_single_password_field(driver, start_url, signup_url=None):
+# landed_url, the page the sign-up submit ended on, is checked first: minnercoinex.org sends the
+# new account to signin.php, but the search began at signup.php, whose only links are the terms
+# and privacy pages, and gave up after 3 pages.
+def find_login_url_with_single_password_field(driver, start_url, signup_url=None, landed_url=None):
     base_domain = get_base_domain(start_url)
     visited_urls = set()
     urls_to_check = [start_url]
+    if landed_url and landed_url not in (start_url, signup_url) and get_base_domain(landed_url) == base_domain:
+        urls_to_check.insert(0, landed_url)
     login_url = None
 
     while urls_to_check and len(visited_urls) < MAX_LOGIN_SEARCH_PAGES:
