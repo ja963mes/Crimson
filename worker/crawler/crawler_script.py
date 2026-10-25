@@ -516,8 +516,14 @@ def assess_signup(before, after, form_url):
         return "success", "a Logout link is on the page"
     if ok and not SIGNUP_OK_RE.search(before["text"]):
         return "success", f"success message {ok.group(0)!r}"
-    if after["passwords"] and (errors or after["invalid"]):
-        return "rejected", "; ".join(errors + after["invalid"])[:300]
+    # Empty required fields only count while the sign-up form is still shown. On minnercoinex.org
+    # the sign-up went on to signin.php, whose untouched login fields ("email: Please fill out this
+    # field") were read as the sign-up being refused.
+    invalid = after["invalid"] if after["url"] == form_url else []
+    if after["passwords"] and (errors or invalid):
+        return "rejected", "; ".join(errors + invalid)[:300]
+    if after["url"] != form_url and LOGIN_URL_RE.search(after["url"]):
+        return "success", f"moved to the login page {after['url']} with no error message"
     if after["url"] != form_url and not after["passwords"]:
         return "success", f"moved to {after['url']} and the form is gone"
     where = "URL unchanged" if after["url"] == form_url else f"now at {after['url']}"
