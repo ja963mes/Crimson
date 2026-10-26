@@ -1195,7 +1195,57 @@ def click_deposit_button(driver, directory_name, base_domain, original_window, p
 # JavaScript, which also reaches hidden radios and select2-wrapped selects, so nothing goes stale.
 MAX_DEPOSIT_PASSES = 12
 
-DEPOSIT_FORM_JS = r"""
+# Payment methods chosen with a button per method outside the form. On swantradecapital.com the
+# deposit form holds only the amount and an empty hidden payment_method; a "Select Deposit Method"
+# table has a "Deposit" button per method (onclick="checkpamethd('1')") that fetches the method
+# and writes it into the hidden field, and the site refuses the form while it is empty ("Please
+# choose a payment method by clicking on it"). The buttons are those outside the form, outside
+# menus, labelled like a choice; when several groups qualify, the largest group of buttons that
+# call the same onclick function (or share a label) wins. Each gets the label of its table row
+# or card, and the row text for the amount range ("Min: $50.00").
+METHOD_BUTTONS_JS = r"""
+function methodButtons(form) {
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+  const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  const LABEL = /^(deposit|deposit now|select|choose|pay|pay now|use|use this|proceed|continue|fund)$/i;
+  const cands = Array.from(document.querySelectorAll('button, a, [role=button], input[type=button]')).filter(b =>
+      vis(b) && !(form && form.contains(b)) && LABEL.test(clean(b.innerText || b.value))
+      && !b.closest('nav, header, aside, footer, [class*=sidebar], [class*=menu], [class*=navbar]'));
+  const groups = {};
+  cands.forEach(b => {
+    const m = (b.getAttribute('onclick') || '').match(/^\s*([\w$.]+)\s*\(/);
+    const key = m ? 'fn:' + m[1] : 'text:' + clean(b.innerText || b.value).toLowerCase();
+    (groups[key] = groups[key] || []).push(b);
+  });
+  const best = Object.values(groups).sort((a, b) => b.length - a.length)[0] || [];
+  return best.map(b => {
+    const row = b.closest('tr, li, [class*=card], [class*=method], [class*=item]') || b.parentElement;
+    let label = row && row.tagName === 'TR' && row.cells.length ? clean(row.cells[0].innerText) : '';
+    if (!label) { const img = row && row.querySelector('img[alt]'); label = img ? clean(img.alt) : ''; }
+    if (!label) label = clean((row ? row.innerText : '').replace(b.innerText || '', ''));
+    return {el: b, label: label.slice(0, 60), text: clean(row ? row.innerText : '').slice(0, 300)};
+  });
+}
+"""
+
+# Clicks method button number arguments[1] (in methodButtons() order) on the reloaded page.
+METHOD_CLICK_JS = METHOD_BUTTONS_JS + r"""
+const f = document.forms[arguments[0]];
+const b = methodButtons(f)[parseInt(arguments[1])];
+if (!b) return {error: 'method button ' + arguments[1] + ' is not on the reloaded page'};
+window.alert = () => {}; window.confirm = () => true;
+b.el.click();
+return {label: b.label};
+"""
+
+# The value of the form's field arguments[1], which the method button should have filled.
+FIELD_VALUE_JS = r"""
+const f = document.forms[arguments[0]];
+const e = f && f.elements[arguments[1]];
+return e ? e.value : null;
+"""
+
+DEPOSIT_FORM_JS = METHOD_BUTTONS_JS + r"""
 const clean = s => (s || '').replace(/\s+/g, ' ').trim();
 const PLACEHOLDER = /^(select|choose|please|--|-)/i;
 const PLANLIKE = /%|\bdaily\b|\bhours?\b|\bdays?\b|\bweeks?\b|\bprofit|\bmin(imum)?\b|\bmax(imum)?\b|\bplan\b|\bpackage\b|\blevel\b/i;
@@ -1259,7 +1309,18 @@ const form = described.filter(d => d.amount).sort(byControls)[0]
 if (!form) return {forms: described.length};
 const plan = form.controls.find(c => c.plan) || null;
 const rest = form.controls.filter(c => c !== plan);
-const payment = rest.find(c => PAYNAME.test(c.name)) || rest.sort((a, b) => b.options.length - a.options.length)[0] || null;
+let payment = rest.find(c => PAYNAME.test(c.name)) || rest.sort((a, b) => b.options.length - a.options.length)[0] || null;
+if (!payment) {
+  // No radio or dropdown for the payment: an empty hidden payment field filled by buttons outside the form.
+  const f = document.forms[form.index];
+  const hidden = Array.from(f.elements).find(e => e.type === 'hidden' && !e.value && (e.name || e.id)
+      && PAYNAME.test(e.name || e.id) && !/token|csrf/i.test(e.name || e.id));
+  const buttons = hidden ? methodButtons(f) : [];
+  if (buttons.length) {
+    payment = {kind: 'button', name: hidden.name || hidden.id,
+               options: buttons.map((b, i) => ({value: String(i), label: b.label, range: range(b.text)}))};
+  }
+}
 return {forms: described.length, form, plan, payment};
 """
 
@@ -1392,14 +1453,28 @@ def process_deposit_page(driver, href, directory_name, original_window):
                 if counter > 1:
                     driver.get(href)
                     wait_for_page()
+                by_button = bool(payment) and payment['kind'] == 'button'
+                if by_button:
+                    clicked = driver.execute_script(METHOD_CLICK_JS, form['index'], option['value'])
+                    if clicked.get('error'):
+                        logging.info(f"Deposit pass {counter} on {href}: {clicked['error']}, stopping")
+                        break
+                    try:
+                        WebDriverWait(driver, 8).until(lambda d: d.execute_script(FIELD_VALUE_JS, form['index'], payment['name']))
+                    except TimeoutException:
+                        logging.info(f"Deposit pass {counter} on {href}: the {option['label']!r} button did not fill "
+                                     f"{payment['name']!r}; skipping this method")
+                        continue
                 state = driver.execute_script(
                     DEPOSIT_FILL_JS, form['index'],
                     {'kind': plan['kind'], 'name': plan['name'], 'value': plan_choice['value']} if plan else None,
-                    {'kind': payment['kind'], 'name': payment['name'], 'value': option['value']} if option else None,
-                    form['amount'], (plan_choice or {}).get('range'))
+                    {'kind': payment['kind'], 'name': payment['name'], 'value': option['value']} if option and not by_button else None,
+                    form['amount'], (plan_choice or {}).get('range') or (option or {}).get('range'))
                 if state.get('error'):
                     logging.info(f"Deposit pass {counter} on {href}: {state['error']}, stopping")
                     break
+                if by_button:
+                    state['payment'] = driver.execute_script(FIELD_VALUE_JS, form['index'], payment['name'])
                 how = driver.execute_script(DEPOSIT_SUBMIT_JS, form['index'])
                 time.sleep(1)
                 accept_alert("after submitting")
