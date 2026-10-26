@@ -459,9 +459,13 @@ const errors = Array.from(document.querySelectorAll(errSel))
 const invalid = Array.from(document.querySelectorAll('input,select,textarea'))
     .filter(e => vis(e) && e.willValidate && !e.checkValidity())
     .map(e => (e.name || e.id || e.type) + ': ' + e.validationMessage);
+// A form that posts to a logout URL counts too, visible or not: Laravel sites log out with
+// <form action=".../logout"> and an icon-only button (opextrade.com's dashboard) or a hidden
+// "logout-form" (swantradecapital.com), so no Logout link was seen while logged in.
 const logout = Array.from(document.querySelectorAll('a,button')).filter(vis).some(e =>
     /log-?out|sign-?out|logoff|a=logout/i.test(e.getAttribute('href') || '') ||
-    /^\s*(log ?out|sign ?out|log off)\s*$/i.test(e.innerText || ''));
+    /^\s*(log ?out|sign ?out|log off)\s*$/i.test(e.innerText || ''))
+  || Array.from(document.forms).some(f => /log-?out|sign-?out|logoff/i.test(f.getAttribute('action') || ''));
 return {url: location.href, errors: [...new Set(errors)].slice(0, 8), invalid: invalid.slice(0, 5), logout: logout,
         passwords: Array.from(document.querySelectorAll('input[type=password]')).filter(vis).length,
         text: (document.body ? document.body.innerText : '').slice(0, 20000)};
