@@ -666,12 +666,27 @@ def fill_sign_up_form(driver, start_url):
                                 logging.info(f"Sign-up succeeded with {email_used}")
                             else:
                                 logging.info(f"Sign-up submitted with {email_used}, but the page gave no sign of success; trying to log in anyway")
-                            email_checked = check_mailinator_inbox_and_click_links(
-                                MAILINATOR_API_KEY, driver, email_used, signup_time=time.time())
+                            want_code = bool(driver.execute_script(CODE_INPUTS_JS))
+                            if want_code:
+                                logging.info(f"The page after sign-up ({driver.current_url}) asks for a code; waiting for it by e-mail")
+                            email_checked, email_code = check_mailinator_inbox_and_click_links(
+                                MAILINATOR_API_KEY, driver, email_used, signup_time=time.time(),
+                                site_url=form_url, want_code=want_code)
                             if email_checked:
                                 logging.info("Successfully interacted with new email.")
-                            elif MAILINATOR_API_KEY and MAILINATOR_API_KEY != "YOUR_API_KEY":
+                            elif MAILINATOR_API_KEY and MAILINATOR_API_KEY != "YOUR_API_KEY" and not email_code:
                                 logging.info(f"No confirmation email clicked within {MAILINATOR_WAIT_SECONDS} seconds.")
+                            if email_code:
+                                code_state, code_url = enter_email_code(driver, email_code, after_submit["url"])
+                                if code_state:
+                                    email_checked = True
+                                    if code_state["logout"] or (code_state["url"] != code_url and not code_state["passwords"]):
+                                        # The code page let go of the session: the account is in, no login needed.
+                                        logging.info(f"E-mail code accepted; logged in at {code_state['url']}")
+                                        crawl_logged_in(driver, code_state["url"], get_base_domain(code_state["url"]),
+                                                        driver.current_window_handle)
+                                        break
+                                    after_submit = code_state  # the login search starts where the code step ended
                             if not email_checked and (VERIFY_EMAIL_RE.search(after_submit["text"]) or VERIFY_EMAIL_RE.search(after_submit["url"])):
                                 # cryptocoinprop.com (/verify-email/) and swifttradinginc.live refuse
                                 # login until the address is confirmed, so the search would be wasted.
@@ -881,8 +896,13 @@ def crawl_if_already_logged_in(driver, where):
     return True
 
 #Validate links to avoid clicking on logout/signout buttons
+# Language switchers lead back to the same page in another language; on swantradecapital.com
+# 16 of the login search's 25 pages were /locale/fr, /locale/es, ...
+LANGUAGE_LINK_RE = re.compile(r"/(locale|lang|language)/[a-z]{2}([_-][a-z]{2})?/?$|[?&](lang|locale|hl|language)=", re.I)
+
 def validate_link(href, processed_links, base_domain):
-    return href is not None and href not in processed_links and "logout" not in href.lower() and "signout" not in href.lower() and get_base_domain(href) == base_domain
+    return (href is not None and href not in processed_links and "logout" not in href.lower() and "signout" not in href.lower()
+            and get_base_domain(href) == base_domain and not LANGUAGE_LINK_RE.search(href))
 
 # File and folder names are built from URLs. Windows rejects characters such as
 # ':' and '?' in them and limits paths to 260 characters, so a local test run
@@ -1483,7 +1503,7 @@ def find_login_url_with_single_password_field(driver, start_url, signup_url=None
                 if not href or href.startswith(('javascript:', 'mailto:', 'tel:')):
                     continue
                 absolute_link = urljoin(current_url, href)
-                if (get_base_domain(absolute_link) != base_domain or absolute_link in visited_urls
+                if (get_base_domain(absolute_link) != base_domain or absolute_link in visited_urls or LANGUAGE_LINK_RE.search(absolute_link)
                         or absolute_link in urls_to_check or is_blacklisted(absolute_link)):
                     continue
                 if LOGIN_URL_RE.search(absolute_link) or LOGIN_TEXT_RE.match(link.text or ''):
@@ -1523,8 +1543,22 @@ def get_last_processed_url(file_path):
 # seconds and "data.parts" for the body, so it could never click anything.
 MAILINATOR_CONFIRM_HINTS = ('verif', 'confirm', 'activat', 'token', 'valid', 'register', 'signup', 'sign-up')
 MAILINATOR_MAX_CLICKS = 3
+# Links that are not pages to open: images and the like (xcelholdingsltd.org's header.png),
+# and, off the site's own domain, anything without a confirmation word in it
+# (swantradecapital.com's http://www.w3.org/2000/svg). Off-site confirmation links stay:
+# swifttradinginc.live confirms through supabase.co/auth/v1/verify?token=...
+ASSET_LINK_RE = re.compile(r"\.(png|jpe?g|gif|svg|webp|ico|css|js)$", re.I)
+OFFSITE_CONFIRM_HINTS = ('verif', 'confirm', 'activat', 'token')
+# A 4-8 digit code shortly after the word code/OTP/PIN, as in swantradecapital.com's
+# "please verify your email address by entering the verification code below: Your
+# Verification Code 667415".
+EMAIL_CODE_RE = re.compile(r"\b(?:code|otp|pin)\b[^0-9]{0,80}?\b(\d{4,8})\b", re.I)
 
-def _mailinator_links(inbox, msg_id, params):
+def same_site(url, site_domain):
+    d = get_base_domain(url)
+    return d == site_domain or d.endswith('.' + site_domain) or site_domain.endswith('.' + d)
+
+def _mailinator_links(inbox, msg_id, params, site_domain=None):
     base = f"{MAILINATOR_API}/inboxes/{inbox}/messages/{msg_id}"
     resp = curl_requests.get(f"{base}/links", params=params, timeout=15)
     resp.raise_for_status()
@@ -1535,23 +1569,41 @@ def _mailinator_links(inbox, msg_id, params):
         for part in resp.json().get('parts', []):
             links += [html.unescape(l) for l in re.findall(r'https?://[^\s"\'<>]+', part.get('body', ''))]
     # Confirmation-looking links first, unsubscribe links never, each link once.
-    links = [l for l in dict.fromkeys(links) if 'unsubscribe' not in l.lower()]
+    links = [l for l in dict.fromkeys(links) if 'unsubscribe' not in l.lower() and not ASSET_LINK_RE.search(urlparse(l).path)]
+    if site_domain:
+        links = [l for l in links if same_site(l, site_domain) or any(h in l.lower() for h in OFFSITE_CONFIRM_HINTS)]
     return sorted(links, key=lambda l: not any(h in l.lower() for h in MAILINATOR_CONFIRM_HINTS))
 
+def _mailinator_code(inbox, msg_id, params):
+    """The verification code in a message's text, or None."""
+    resp = curl_requests.get(f"{MAILINATOR_API}/inboxes/{inbox}/messages/{msg_id}", params=params, timeout=15)
+    resp.raise_for_status()
+    for part in resp.json().get('parts', []):
+        text = html.unescape(re.sub(r"<(style|script)\b.*?</\1>|<[^>]+>", " ", part.get('body', ''), flags=re.S | re.I))
+        match = EMAIL_CODE_RE.search(re.sub(r"\s+", " ", text))
+        if match:
+            return match.group(1)
+    return None
+
+# Returns (whether a link was clicked, the verification code found or None). With want_code
+# (the page after sign-up asks for a code) it keeps polling until a code turns up, not just
+# until the first link is clicked: swantradecapital.com sends a welcome e-mail with a link
+# and a separate e-mail with the code.
 def check_mailinator_inbox_and_click_links(api_key, driver, email_address, signup_time,
-                                           wait_seconds=MAILINATOR_WAIT_SECONDS):
+                                           wait_seconds=MAILINATOR_WAIT_SECONDS, site_url=None, want_code=False):
     if not api_key or api_key == "YOUR_API_KEY":
         logging.info("Mailinator API key not configured; skipping email-confirmation step.")
-        return False
+        return False, None
     if not email_address or not email_address.endswith(f"@{EMAIL_DOMAIN}"):
         logging.info(f"Sign-up email {email_address!r} is not on {EMAIL_DOMAIN}; skipping email-confirmation step.")
-        return False
+        return False, None
     inbox = email_address.split('@')[0]
     params = {"token": api_key}
+    site_domain = get_base_domain(site_url) if site_url else None
     since_ms = (signup_time - 30) * 1000  # small allowance for clock skew
-    seen, clicked = set(), 0
+    seen, clicked, code = set(), 0, None
     deadline = time.time() + wait_seconds
-    while time.time() < deadline and should_continue and not clicked:
+    while time.time() < deadline and should_continue and not (code if want_code else clicked):
         try:
             resp = curl_requests.get(f"{MAILINATOR_API}/inboxes/{inbox}",
                                 params={**params, "limit": 10, "sort": "descending"}, timeout=15)
@@ -1561,7 +1613,11 @@ def check_mailinator_inbox_and_click_links(api_key, driver, email_address, signu
                     continue
                 seen.add(msg['id'])
                 logging.info(f"Mailinator: '{msg.get('subject', '')}' arrived for {email_address}")
-                for link in _mailinator_links(inbox, msg['id'], params)[:MAILINATOR_MAX_CLICKS]:
+                if want_code and not code:
+                    code = _mailinator_code(inbox, msg['id'], params)
+                    if code:
+                        logging.info(f"Mailinator: verification code {code} in '{msg.get('subject', '')}'")
+                for link in _mailinator_links(inbox, msg['id'], params, site_domain)[:MAILINATOR_MAX_CLICKS]:
                     driver.get(link)
                     clicked += 1
                     logging.info(f"Clicked link in email: {link}")
@@ -1569,9 +1625,56 @@ def check_mailinator_inbox_and_click_links(api_key, driver, email_address, signu
             logging.error(f"Error checking Mailinator inbox {inbox}: {e}")
         except WebDriverException as e:
             logging.error(f"Error opening a link from the Mailinator inbox {inbox}: {e}")
-        if not clicked:
+        if not (code if want_code else clicked):
             time.sleep(5)
-    return clicked > 0
+    return clicked > 0, code
+
+# --- Verification codes ------------------------------------------------------------------------
+# swantradecapital.com sends a 6-digit code by e-mail and redirects every page to /verify-code
+# until it is entered. A code field is: one box per digit (4 or more inputs with maxlength 1),
+# or an input named/labelled like a code (code, otp, token, pin, verif, or autocomplete
+# "one-time-code"), or the only text input on a page that mentions a code.
+CODE_INPUTS_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+const inputs = Array.from(document.querySelectorAll('input')).filter(e =>
+    vis(e) && !e.disabled && !e.readOnly && ['text', 'number', 'tel'].includes(e.type));
+const boxes = inputs.filter(e => e.maxLength === 1);
+if (boxes.length >= 4) return boxes;
+const hinted = inputs.filter(e => e.autocomplete === 'one-time-code' ||
+    /code|otp|token|pin|verif/i.test([e.name, e.id, e.placeholder, e.getAttribute('aria-label')].join(' ')));
+if (hinted.length) return hinted.slice(0, 1);
+if (inputs.length === 1 && /\bcode\b/i.test(document.body ? document.body.innerText : '')) return inputs;
+return [];
+"""
+
+def enter_email_code(driver, code, code_page_url):
+    """Type the e-mailed code into the code field and submit it. Returns (page state after the
+    submit, URL of the code page), or (None, None) when no code field is found."""
+    fields = driver.execute_script(CODE_INPUTS_JS)
+    if not fields and code_page_url and driver.current_url != code_page_url:
+        driver.get(code_page_url)  # a clicked e-mail link may have left the code page
+        time.sleep(2)
+        fields = driver.execute_script(CODE_INPUTS_JS)
+    if not fields:
+        logging.info(f"E-mail code {code} found, but no code field on {driver.current_url}")
+        return None, None
+    code_url = driver.current_url
+    before = page_state(driver)
+    if len(fields) > 1:
+        for field, digit in zip(fields, code):
+            field.send_keys(digit)
+    else:
+        fields[0].clear()
+        fields[0].send_keys(code)
+    time.sleep(1)
+    form = driver.execute_script("return arguments[0].form;", fields[0])
+    if form is None or not submit_form(driver, [], form):
+        fields[-1].send_keys(Keys.RETURN)
+    after = wait_for_outcome(driver, before)
+    logging.info(f"Entered the e-mail code {code} on {code_url}: now at {after['url']}; "
+                 f"{after['passwords']} visible password field(s)" + ("; Logout link" if after['logout'] else "")
+                 + (f"; messages: {' | '.join(new_errors(before, after))[:200]}" if new_errors(before, after) else ""))
+    return after, code_url
 
 # Main function
 def main():
