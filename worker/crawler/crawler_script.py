@@ -1405,7 +1405,23 @@ const messages = Array.from(document.querySelectorAll('.error, .alert, .alert-da
 return {back, messages: Array.from(new Set(messages)).slice(0, 3)};
 """
 
-def process_deposit_page(driver, href, directory_name, original_window):
+# Links on a deposit page without a deposit form that lead to more deposit pages of the same
+# site, one per method: opextrade.com's /dashboard/deposit lists 5 links such as
+# /dashboard/deposit/create?method=btc, and each of those shows its address ("Send BTC to this
+# address: bc1q...") before anything is submitted. History and list pages are left out.
+DEPOSIT_SUBPAGE_LINKS_JS = r"""
+const here = location.href.split('#')[0];
+const seen = new Set();
+return Array.from(document.querySelectorAll('a[href]')).map(a => a.href.split('#')[0]).filter(h => {
+  let u; try { u = new URL(h); } catch (e) { return false; }
+  if (u.host !== location.host || h === here || seen.has(h)) return false;
+  if (!/deposit/i.test(u.pathname + u.search) || /histor|list|log|transaction/i.test(u.pathname + u.search)) return false;
+  seen.add(h);
+  return true;
+});
+"""
+
+def process_deposit_page(driver, href, directory_name, original_window, depth=0):
     safe_href = windows_safe(href.replace('://', '_').replace('/', '_').replace('?', '_'))
 
     def capture(counter):
@@ -1437,11 +1453,22 @@ def process_deposit_page(driver, href, directory_name, original_window):
         # The page as the site serves it, before anything is filled in. Some sites show their
         # wallet addresses here already, and it shows what the form offered if the passes fail.
         capture(0)
+        shown = wallet_like(driver.page_source)
+        if shown:
+            logging.info(f"Deposit page {href}: wallet-like strings on the page as served: {shown}")
         found = driver.execute_script(DEPOSIT_FORM_JS)
         form, plan, payment = found.get('form'), found.get('plan'), found.get('payment')
         if not form:
             logging.info(f"Deposit page {href}: no deposit form ({found.get('forms', 0)} form(s) on the page, "
                          f"none with an amount field or a choice control and a submit button); 0 passes planned")
+            # One level down only, so a method page that links back to the list is not reopened.
+            subpages = driver.execute_script(DEPOSIT_SUBPAGE_LINKS_JS) if depth == 0 else []
+            if subpages:
+                logging.info(f"Deposit page {href}: opening {min(len(subpages), MAX_DEPOSIT_PASSES)} linked deposit "
+                             f"page(s) as deposit pages: {subpages[:MAX_DEPOSIT_PASSES]}")
+                this_tab = driver.current_window_handle
+                for subpage in subpages[:MAX_DEPOSIT_PASSES]:
+                    process_deposit_page(driver, subpage, directory_name, this_tab, depth=1)
             return
 
         plan_choice = plan['options'][0] if plan else None
