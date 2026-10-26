@@ -600,7 +600,9 @@ def fill_sign_up_form(driver, start_url):
     urls_to_check = [start_url]
     form_filled = False
 
-    while urls_to_check and should_continue:
+    # Stops once an account is made. After an error past that point (swantradecapital.com, Oct 26)
+    # the loop carried on and loaded every queued page again, about 55 s of page loads for nothing.
+    while urls_to_check and should_continue and not form_filled:
         current_url = urls_to_check.pop(0)
         if current_url in visited_urls or is_blacklisted(current_url):
             continue
@@ -1019,7 +1021,9 @@ def process_link(driver, href, directory_name, original_window):
 # Wallet-looking strings on a page, for the deposit-stage log lines only. A hint for reading
 # the log: iocs_searcher.sh still does the real extraction. Script and style blocks are
 # dropped first so tokens inside them are not reported.
-WALLET_LIKE_RE = re.compile(r"\b(bc1[02-9ac-hj-np-z]{25,60}|[13][1-9A-HJ-NP-Za-km-z]{25,34}|0x[0-9a-fA-F]{40}|T[1-9A-HJ-NP-Za-km-z]{33})\b")
+# addr1... is a Cardano (Shelley) address, as on swantradecapital.com's Cardano payment page.
+WALLET_LIKE_RE = re.compile(r"\b(bc1[02-9ac-hj-np-z]{25,60}|[13][1-9A-HJ-NP-Za-km-z]{25,34}|0x[0-9a-fA-F]{40}|T[1-9A-HJ-NP-Za-km-z]{33}"
+                            r"|addr1[02-9ac-hj-np-z]{50,110})\b")
 
 # Hidden inputs are dropped too, and all-hex strings are skipped: bitvestwise.net's hidden
 # form_token 388d8db1cc6a514b9dafc5a8bb51c484 (an MD5) fits the legacy Bitcoin pattern.
@@ -1037,13 +1041,20 @@ def process_links(driver, links, processed_links, base_domain, directory_name, o
     deposit_page_counter = 0
     deposit_hrefs = []
 
+    # The hrefs are read once, up front. Reading them from the link elements as the loop got to
+    # them failed on swantradecapital.com: the dashboard had changed by then, a link was stale,
+    # and the StaleElementReferenceException (raised outside the loop's try) ended the crawl.
+    hrefs = []
+    for link in links:
+        try:
+            hrefs.append(link.get_attribute('href'))
+        except StaleElementReferenceException:
+            continue
+
     # Logged so a site whose deposit page was never opened can be told apart from one whose
     # deposit page was opened but produced nothing (process_deposit_page logs that case).
-    try:
-        deposit_hrefs = sorted({h for h in (l.get_attribute('href') for l in links) if h and re.search(r'\bdeposits?\b', h.lower())})
-        logging.info(f"Post-login page has {len(links)} links; deposit links: {deposit_hrefs or 'none'}")
-    except Exception as e:
-        logging.info(f"Could not list the deposit links on the post-login page: {e}")
+    deposit_hrefs = sorted({h for h in hrefs if h and re.search(r'\bdeposits?\b', h.lower())})
+    logging.info(f"Post-login page has {len(hrefs)} links; deposit links: {deposit_hrefs or 'none'}")
 
     invest_links_seen = set()  # never opened as ordinary pages; one of them goes to the deposit step
     invest_done = False
@@ -1087,8 +1098,7 @@ def process_links(driver, links, processed_links, base_domain, directory_name, o
     except Exception as e:
         logging.info(f"Could not look for invest links on the post-login page: {e}")
 
-    for link in links:
-        href = link.get_attribute('href')
+    for href in hrefs:
         if wanted(href):
             try:
                 second_hrefs, second_invest = open_page(href)
