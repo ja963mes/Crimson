@@ -209,6 +209,9 @@ return {widgets: widgets, invisible: invisible, images: images.length,
 CAPTCHA_MATH_RE = re.compile(r"(\d{1,3})\s*(\+|-|−|x|×|\*|÷|/|plus|minus|times)\s*(\d{1,3})\s*(?:=|\?)", re.I)
 CAPTCHA_SPACED_RE = re.compile(r"(?<!\w)\d(?: \d){3,7}(?!\w)")                    # "8 9 5 7 1 3"
 CAPTCHA_CODE_RE = re.compile(r"\b(?=[A-Z0-9]*\d)[A-Z0-9]{4,8}\b")                 # "B730FF", "0EAAB3"
+# A code right after "code/captcha/token ...:" may be letters only: fxtastytrades.com showed
+# "Enter the code below: PCULLW" (another load: "X7DPDX"), which CAPTCHA_CODE_RE needs a digit for.
+CAPTCHA_CUED_RE = re.compile(r"(?i:code|captcha|token)(?:\s+(?i:below|above))?\s*[:：]\s*([A-Z0-9]{4,8})\b")
 CAPTCHA_OPS = {"+": lambda a, b: a + b, "plus": lambda a, b: a + b, "-": lambda a, b: a - b, "−": lambda a, b: a - b,
                "minus": lambda a, b: a - b, "x": lambda a, b: a * b, "×": lambda a, b: a * b, "*": lambda a, b: a * b,
                "times": lambda a, b: a * b, "÷": lambda a, b: a // b, "/": lambda a, b: a // b}
@@ -223,6 +226,9 @@ def solve_text_captcha(texts):
         m = CAPTCHA_SPACED_RE.search(t)
         if m:
             return m.group(0).replace(" ", ""), m.group(0)
+        m = CAPTCHA_CUED_RE.search(t)
+        if m:
+            return m.group(1), m.group(0)
         m = CAPTCHA_CODE_RE.search(t)
         if m:
             return m.group(0), m.group(0)
@@ -265,55 +271,143 @@ def answer_captcha(driver, answer, target):
     except Exception as e:
         logging.info(f"Could not enter the captcha answer: {e}")
 
+# The fields that belong to a form: form.elements, not the elements inside its markup.
+# amvinvestmentltd.com's register page has broken HTML that closes the <form> after its first
+# two fields, so the other ten (password and submit button included) sit outside the <form>
+# element but still belong to the form; the sign-up form was skipped as having no password field.
+def form_controls(form, css='input, select, textarea, button'):
+    return form.parent.execute_script(
+        "return Array.from(arguments[0].elements).filter(e => e.matches(arguments[1]));", form, css)
+
+# Fields are keyed by name, or "#id", or "@n" (position among the form's inputs) when they have
+# neither: duduinvest.com's and expacraftcapitals.org's sign-up fields have no names (filled by the
+# page's own script, Livewire on expacraftcapitals), so nothing was typed and the form went out empty.
+FIELD_BY_KEY_JS = r"""
+const els = Array.from(arguments[0].elements), k = arguments[1];
+if (k.startsWith('#')) return els.find(e => e.id === k.slice(1)) || null;
+if (k.startsWith('@')) return els.filter(e => e.tagName === 'INPUT')[parseInt(k.slice(1))] || null;
+return els.find(e => e.name === k) || null;
+"""
+# name, id, placeholder, autocomplete, aria-label and label text of each input, for choosing values.
+FIELD_HINTS_JS = r"""
+return Array.from(arguments[0].elements).filter(e => e.tagName === 'INPUT').map(e => {
+  const l = (e.id && document.querySelector('label[for="' + CSS.escape(e.id) + '"]')) || e.closest('label');
+  return [e.name || '', e.id || '', e.type || 'text', [e.name, e.id, e.placeholder, e.autocomplete, e.getAttribute('aria-label'),
+          l ? l.innerText : ''].join(' ').replace(/\s+/g, ' ').toLowerCase(), e.required];
+});
+"""
+TEXT_LIKE_TYPES = ('text', 'email', 'password', 'tel', 'number', 'url', 'search', '')
+# Whole words, now that label text is part of the hints ("Tell us about you" is not a phone field).
+PHONE_HINT_RE = re.compile(r"phone|mobile|whatsapp|\btel\b|\bcell\b|telephone|cellphone")
+
+def field_by_key(form, key):
+    return form.parent.execute_script(FIELD_BY_KEY_JS, form, key)
+
+# A captcha gate: a page whose only form is a captcha (elitesterlingglobal.com/register shows
+# "Security Check: 16 + 10 = ?" and the sign-up form only after it is answered). Answer it, submit
+# that form, and report whether a password field is visible afterwards. Other empty required text
+# boxes in the gate get the token the page shows: elitesterlingglobal.com also asks for "Your
+# Authentication Token PEMJ RGJX" (typed without the space, maxlength 8).
+GATE_TOKEN_RE = re.compile(r"(?i:token|code)\s*:?\s*([A-Z0-9]{2,8}(?: [A-Z0-9]{2,8})?)\b")
+
+def pass_captcha_gate(driver, answer, target):
+    try:
+        field = driver.find_element(*target)
+        gate = driver.execute_script("return arguments[0].form;", field)
+        if gate is None or form_controls(gate, 'input[type="password"]'):
+            return False
+        field.clear()
+        field.send_keys(answer)
+        page_text = driver.execute_script("return document.body.innerText;")
+        token = GATE_TOKEN_RE.search(page_text)
+        for other in form_controls(gate, 'input[type="text"], input:not([type])'):
+            if other != field and other.is_displayed() and not other.get_attribute('value') and other.get_attribute('required') and token:
+                other.send_keys(token.group(1).replace(" ", ""))
+                logging.info(f"Captcha gate: typed the token {token.group(1)!r} shown on the page")
+        buttons = [b for b in form_controls(gate, 'button[type="submit"], input[type="submit"], button:not([type])') if b.is_displayed()]
+        if buttons:
+            driver.execute_script("arguments[0].click();", buttons[0])
+        else:
+            driver.execute_script("arguments[0].requestSubmit ? arguments[0].requestSubmit() : arguments[0].submit();", gate)
+        time.sleep(3)
+        shown = driver.execute_script("return Array.from(document.querySelectorAll('input[type=password]')).some(e => e.offsetWidth || e.offsetHeight);")
+        logging.info(f"Captcha gate: answered {answer!r}, now at {driver.current_url}; "
+                     + ("a password field is shown" if shown else "still no password field"))
+        return bool(shown)
+    except Exception as e:
+        logging.info(f"Captcha gate could not be answered: {e}")
+        return False
+
 # Predict form values
 def predict_values(form):
     predictions = {}
-    predicted_password = ACCOUNT_PASSWORD
+    predicted_password = password_for(form)
     # Lower case: aziminer.com refused "Florence95@..." with "The email field must be lowercase."
     # Mailinator inboxes ignore case, and the login username derived from the address stays the same.
     predicted_username = generate_random_string().lower()
     predicted_email = f"{predicted_username}{random.randint(60, 99)}@{EMAIL_DOMAIN}"
-    input_tags = form.find_elements(By.TAG_NAME, 'input')
 
-    for input_tag in input_tags:
-        input_name = input_tag.get_attribute('name')
-        input_type = input_tag.get_attribute('type')
-        if input_name:
-            if is_optional_referral_field(input_tag):
-                continue  # left empty; see REFERRAL_FIELD_RE
-            if "username" in input_name.lower():
-                predictions[input_name] = predicted_username
-            elif input_type.lower() == "password":
-                predictions[input_name] = predicted_password
-            elif "email" in input_name.lower():
-                predictions[input_name] = predicted_email
-            elif is_phone_field(input_tag):
-                predictions[input_name] = generate_phone_number()
-            elif input_type.lower() in DATE_INPUT_FORMATS:
-                predictions[input_name] = generate_date_value(input_type.lower())
-            else:
-                predictions[input_name] = generate_random_string()
+    for position, (name, field_id, input_type, hints, required) in enumerate(form.parent.execute_script(FIELD_HINTS_JS, form)):
+        input_type = (input_type or 'text').lower()
+        if name:
+            key = name
+        elif input_type in TEXT_LIKE_TYPES or input_type in DATE_INPUT_FORMATS:
+            key = f"#{field_id}" if field_id else f"@{position}"
+        else:
+            continue  # unnamed checkboxes, buttons, hidden fields: nothing to type
+        if REFERRAL_FIELD_RE.search(hints) and not required:
+            continue  # left empty; see REFERRAL_FIELD_RE
+        if "username" in hints or "user name" in hints:
+            predictions[key] = predicted_username
+        elif input_type == "password":
+            predictions[key] = predicted_password
+        elif input_type == "email" or "email" in hints or "e-mail" in hints:
+            predictions[key] = predicted_email
+        elif input_type == "tel" or PHONE_HINT_RE.search(hints):
+            predictions[key] = generate_phone_number()
+        elif input_type in DATE_INPUT_FORMATS:
+            predictions[key] = generate_date_value(input_type)
+        else:
+            predictions[key] = generate_random_string()
     return predictions
+
+# Passwords. ACCOUNT_PASSWORD has symbols and is 14 characters long. Sites that allow only
+# letters and digits, 8-12 characters, get ACCOUNT_PASSWORD_ALT: tradevistavelocityinvestmentmark.com
+# checks /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[A-Za-z\d]{8,12}$/ in its own script and keeps "Create
+# Account" disabled until it passes. The alternative is used when a password field's maxlength or
+# pattern refuses ACCOUNT_PASSWORD, or (see fill_sign_up_form) when the submit button stays disabled.
+# password_used is the one the account got, for the login.
+ACCOUNT_PASSWORD_ALT = '<CRAWLER_PASSWORD_ALT>'
+password_used = ACCOUNT_PASSWORD
+
+def password_for(form):
+    refused = form.parent.execute_script(r"""
+const pw = arguments[1];
+return Array.from(arguments[0].elements).filter(e => e.type === 'password').some(e => {
+  if (e.maxLength > 0 && pw.length > e.maxLength) return true;
+  if (e.pattern) { try { return !new RegExp('^(?:' + e.pattern + ')$').test(pw); } catch (x) { return false; } }
+  return false;
+});""", form, ACCOUNT_PASSWORD)
+    return ACCOUNT_PASSWORD_ALT if refused else ACCOUNT_PASSWORD
+
+def submit_disabled(form):
+    """True when the form's submit buttons are all disabled (a script is holding the form back)."""
+    return form.parent.execute_script(r"""
+const b = Array.from(arguments[0].elements).filter(e => e.matches('button[type=submit], input[type=submit], button:not([type])'));
+return b.length > 0 && b.every(e => e.disabled);""", form)
 
 # Optional referral-type fields stay empty. A made-up value is checked against real codes:
 # beacondigital.ltd answered POST /api/register with 422 "The selected referral code is invalid."
-# because "referralCode" got a name from names.txt. A required one still gets a value.
-REFERRAL_FIELD_RE = re.compile(r"refer|ref_?by|ref_?code|^ref$|promo|invite|invitation|sponsor|coupon|voucher|upline", re.I)
+# because "referralCode" got a name from names.txt. A required one still gets a value. Words are
+# matched from their start, since label text is in the hints ("Preferred currency" is not one).
+REFERRAL_FIELD_RE = re.compile(r"\brefer|\bref_?by|\bref_?code|\bref\b|promo|invite|invitation|sponsor|coupon|voucher|upline", re.I)
 
-def is_optional_referral_field(input_tag):
-    hints = ' '.join((input_tag.get_attribute(a) or '') for a in ('name', 'id', 'placeholder'))
-    return bool(REFERRAL_FIELD_RE.search(hints)) and not input_tag.get_attribute('required')
-
-# Phone fields used to get a name from names.txt, which forms with phone
-# validation refuse (swifttradinginc.live: name="phone", type="tel").
-def is_phone_field(input_tag):
-    if (input_tag.get_attribute('type') or '').lower() == 'tel':
-        return True
-    hints = ' '.join((input_tag.get_attribute(a) or '') for a in ('name', 'id', 'placeholder', 'autocomplete')).lower()
-    return any(h in hints for h in ('phone', 'mobile', 'tel', 'whatsapp', 'cell'))
-
+# Phone fields used to get a name from names.txt, which forms with phone validation refuse
+# (swifttradinginc.live: name="phone", type="tel"); predict_values() uses type and PHONE_HINT_RE.
+# Digits only: tradevistavelocityinvestmentmark.com requires /^\d{10,15}$/ and "+1 555 ..." failed.
+# Eleven digits still read as a US number where the "+1 555" form was accepted.
 def generate_phone_number():
-    return f"+1 555 {random.randint(200, 999)} {random.randint(1000, 9999)}"
+    return f"1555{random.randint(200, 999)}{random.randint(1000, 9999)}"
 
 # Date inputs (minnercoinex.org's required type="date" "dob") used to get a name from names.txt,
 # which a date field ignores, so the form was refused with "dob: Please fill out this field".
@@ -336,17 +430,17 @@ def pick_signup_form(driver):
     best, best_score = None, None
     for form in driver.find_elements(By.TAG_NAME, 'form'):
         try:
-            visible = [e for e in form.find_elements(By.CSS_SELECTOR, 'input,select,textarea')
+            visible = [e for e in form_controls(form, 'input, select, textarea')
                        if e.get_attribute('type') != 'hidden' and e.is_displayed()]
             passwords = [e for e in visible if e.get_attribute('type') == 'password']
             if not passwords:
                 # A multi-step form shows its password fields only after "Next"
                 # (account.securenovatrade.com/register: step 1 is username, name, email, phone).
-                if not (visible and form.find_elements(By.CSS_SELECTOR, 'input[type="password"]') and next_step_buttons(form)):
+                if not (visible and form_controls(form, 'input[type="password"]') and next_step_buttons(form)):
                     continue
-                passwords = form.find_elements(By.CSS_SELECTOR, 'input[type="password"]')
+                passwords = form_controls(form, 'input[type="password"]')
             words = ' '.join((form.get_attribute(a) or '') for a in ('action', 'id', 'class', 'name')).lower()
-            words += ' ' + ' '.join(b.text.lower() for b in form.find_elements(By.CSS_SELECTOR, 'button,input[type="submit"]'))
+            words += ' ' + ' '.join(((b.text or b.get_attribute('value') or '')).lower() for b in form_controls(form, 'button, input[type="submit"]'))
             signup_word = any(k in words for k in ('register', 'signup', 'sign-up', 'sign up', 'create', 'join'))
             login_word = any(k in words for k in ('login', 'log in', 'signin', 'sign-in', 'sign in'))
             if login_word and not signup_word and len(passwords) < 2:
@@ -364,36 +458,43 @@ def pick_signup_form(driver):
 NEXT_STEP_RE = re.compile(r"^\s*(next|continue|next step|proceed)\b", re.I)
 
 def next_step_buttons(form):
-    return [b for b in form.find_elements(By.CSS_SELECTOR, 'button, input[type="button"], [role="button"]')
+    return [b for b in form_controls(form, 'button, input[type="button"]') + form.find_elements(By.CSS_SELECTOR, '[role="button"]')
             if (b.get_attribute('type') or '').lower() != 'submit' and b.is_displayed()
             and NEXT_STEP_RE.match(b.text or b.get_attribute('value') or '')]
 
 def advance_form_steps(driver, form, predictions, max_steps=3):
     """While the chosen form still hides its password fields or its submit button, click its
     Next button and fill the fields the new step shows. securenovatrade.com has three steps:
-    contact details, passwords, then country and the submit button."""
+    contact details, passwords, then country and the submit button. Returns the steps clicked."""
+    clicked = 0
     for step in range(2, max_steps + 2):
-        hidden_passwords = [e for e in form.find_elements(By.CSS_SELECTOR, 'input[type="password"]') if not e.is_displayed()]
-        submit_shown = any(b.is_displayed() for b in form.find_elements(By.CSS_SELECTOR, 'button[type="submit"], input[type="submit"]'))
+        hidden_passwords = [e for e in form_controls(form, 'input[type="password"]') if not e.is_displayed()]
+        submit_shown = any(b.is_displayed() for b in form_controls(form, 'button[type="submit"], input[type="submit"]'))
         if not hidden_passwords and (submit_shown or not next_step_buttons(form)):
-            return
+            return clicked
         buttons = next_step_buttons(form)
         if not buttons:
             logging.info("Multi-step sign-up form: password fields still hidden and no Next button")
-            return
+            return clicked
         label = (buttons[0].text or buttons[0].get_attribute('value') or '').strip()
         driver.execute_script("arguments[0].click();", buttons[0])
         logging.info(f"Multi-step sign-up form: clicked {label!r} for step {step}")
+        clicked += 1
         time.sleep(1.5)
         fill_form(form, predictions, only_empty=True)
         handle_dropdowns(form, driver)
+    return clicked
 
-# Fill form. Fields are looked up inside the chosen form; a page-wide lookup by name found
-# the hidden login form's "email" and "password" first on pages with two forms. only_empty is
-# for later steps of a multi-step form, so fields filled in an earlier step are not typed twice.
+# Fill form. Fields are looked up among the chosen form's own fields (see form_controls and
+# field_by_key); a page-wide lookup by name found the hidden login form's "email" and "password"
+# first on pages with two forms. only_empty is for later steps of a multi-step form, so fields
+# filled in an earlier step are not typed twice.
 def fill_form(form, predictions, only_empty=False):
     for input_name, prediction in predictions.items():
-        input_field = form.find_element(By.NAME, input_name)
+        input_field = field_by_key(form, input_name)
+        if input_field is None:
+            logging.info(f"Element {input_name} is no longer on the page")
+            continue
         if only_empty and (not input_field.is_displayed() or (input_field.get_attribute('value') or '')):
             continue
         try:
@@ -413,7 +514,7 @@ def fill_form(form, predictions, only_empty=False):
 # wait for; a 10 s wait for checkboxes used to stall every form that has none.
 def handle_checkbox(driver, form):
     try:
-        checkboxes = form.find_elements(By.CSS_SELECTOR, 'input[type="checkbox"]')
+        checkboxes = form_controls(form, 'input[type="checkbox"]')
         if not checkboxes:
             logging.info("No checkboxes in the form.")
         # A hidden (custom-styled) checkbox is ticked with a JavaScript click on the box itself, not
@@ -473,7 +574,7 @@ def usable_options(options, select_element=None):
     return usable or [o for o in options if o.is_enabled()] or options
 
 def handle_dropdowns(form, driver):
-    select_elements = form.find_elements(By.TAG_NAME, 'select')
+    select_elements = form_controls(form, 'select')
     for select_element in select_elements:
         options = []
         try:
@@ -620,7 +721,7 @@ def submit_form(driver, selectors, form=None):
     # matching button on the page ("Log in" on cryptocoinprop.com) and waited 10 s for each
     # selector the page does not use. A <button> without a type attribute submits too.
     if form is not None:
-        for button in form.find_elements(By.CSS_SELECTOR, 'button[type="submit"],input[type="submit"],button:not([type])'):
+        for button in form_controls(form, 'button[type="submit"], input[type="submit"], button:not([type])'):
             try:
                 if button.is_displayed() and button.is_enabled() and click_and_submit(driver, button, By.CSS_SELECTOR):
                     return True
@@ -650,7 +751,7 @@ def is_blacklisted(url):
 
 # Fill sign-up form
 def fill_sign_up_form(driver, start_url):
-    global should_continue, email_used
+    global should_continue, email_used, password_used
     driver = ensure_driver(driver)
     base_domain = get_base_domain(start_url)
     visited_urls = set()
@@ -677,9 +778,18 @@ def fill_sign_up_form(driver, start_url):
                 try:
                     wait.until(EC.presence_of_element_located((By.TAG_NAME, 'form')))
                     form = pick_signup_form(driver)
+                    if form is None and captcha_answer is not None and should_continue and pass_captcha_gate(driver, captcha_answer, captcha_target):
+                        captcha_blocks, captcha_summary, captcha_answer, captcha_target = check_captcha(driver)
+                        logging.info(f"Captcha check after the gate on {driver.current_url}: {captcha_summary}")
+                        if captcha_blocks:
+                            return False
+                        form = pick_signup_form(driver)
                     if form and should_continue:
                         logging.info(f"Sign-up form chosen: action={form.get_attribute('action')!r}")
                         predictions = predict_values(form)
+                        password_used = next((v for v in predictions.values() if v in (ACCOUNT_PASSWORD, ACCOUNT_PASSWORD_ALT)), ACCOUNT_PASSWORD)
+                        if password_used == ACCOUNT_PASSWORD_ALT:
+                            logging.info(f"The password fields' maxlength/pattern refuse the usual password; using {ACCOUNT_PASSWORD_ALT!r}")
                         fill_form(form, predictions)
                         time.sleep(1)
 
@@ -688,7 +798,13 @@ def fill_sign_up_form(driver, start_url):
 
                         handle_dropdowns(form, driver)
                         time.sleep(1)
-                        advance_form_steps(driver, form, predictions)
+                        # A captcha in a later step was hidden when the page was first checked:
+                        # fxtastytrades.com's step 3 is "Enter the code below: X7DPDX". Check again.
+                        if advance_form_steps(driver, form, predictions) and captcha_answer is None:
+                            captcha_blocks, captcha_summary, captcha_answer, captcha_target = check_captcha(driver)
+                            logging.info(f"Captcha check after the form steps: {captcha_summary}")
+                            if captcha_blocks:
+                                return False
 
                         if not should_continue:
                             return False
@@ -699,11 +815,29 @@ def fill_sign_up_form(driver, start_url):
                         if captcha_answer is not None:
                             answer_captcha(driver, captcha_answer, captcha_target)
 
+                        # The page's own script can hold the submit button disabled until its rules pass;
+                        # a password rule that refuses symbols (tradevistavelocityinvestmentmark.com) is
+                        # the one this can change. Retry with the letters-and-digits password.
+                        if submit_disabled(form) and password_used != ACCOUNT_PASSWORD_ALT:
+                            password_used = ACCOUNT_PASSWORD_ALT
+                            for key, value in predictions.items():
+                                if value == ACCOUNT_PASSWORD:
+                                    predictions[key] = ACCOUNT_PASSWORD_ALT
+                                    field = field_by_key(form, key)
+                                    if field is not None and field.is_displayed():
+                                        field.clear()
+                                        field.send_keys(ACCOUNT_PASSWORD_ALT)
+                            time.sleep(0.5)
+                            logging.info(f"Submit button disabled with the usual password; retried with {ACCOUNT_PASSWORD_ALT!r}: "
+                                         + ("now enabled" if not submit_disabled(form) else "still disabled"))
+
                         selectors = [
                             ('input[type="submit"]', By.CSS_SELECTOR),
                             ('button[type="submit"]', By.CSS_SELECTOR),
                             ('button[type="button"]', By.CSS_SELECTOR),
-                            ('input[name="submit"]', By.NAME)
+                            # A CSS selector: as By.NAME it was an invalid locator that raised and
+                            # ended the attempt (tradevistavelocityinvestmentmark.com, Oct 26).
+                            ('input[name="submit"]', By.CSS_SELECTOR)
                         ]
 
                         form_url = driver.current_url
@@ -758,9 +892,12 @@ def fill_sign_up_form(driver, start_url):
                             login_url, logged_in_url = find_login_url_with_single_password_field(
                                 driver, current_url, signup_url=form_url, landed_url=after_submit["url"])
                             if login_url:
-                                login_and_take_screenshot(driver, login_url, ACCOUNT_PASSWORD, email_used)
+                                login_and_take_screenshot(driver, login_url, password_used, email_used)
                             elif logged_in_url:
-                                crawl_if_already_logged_in(driver, "during the login search")
+                                # find_login_url_with_single_password_field() saw a Logout link, or a login
+                                # page that sends the browser on to an account page; the driver is there.
+                                logging.info(f"Already logged in (during the login search): {logged_in_url}")
+                                crawl_logged_in(driver, logged_in_url, get_base_domain(logged_in_url), driver.current_window_handle)
                             else:
                                 # break, not return False: the account exists, so the site's result
                                 # line should say "Signed up but not logged in", not "failure".
@@ -892,7 +1029,10 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
         try:
             username_input = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[name="username"],input[type="email"],input[type="text"]')))
             input_type = username_input.get_attribute('type')
-            if input_type == "text":
+            # A text box named or labelled e-mail gets the address: fxtastytrades.com's login answered
+            # "The email must be a valid email address" when it got the derived username.
+            email_box = re.search(r"mail", ' '.join((username_input.get_attribute(a) or '') for a in ('name', 'id', 'placeholder', 'autocomplete')), re.I)
+            if input_type == "text" and not email_box:
                 modified_email = re.sub(r'\d+', '', email_used).replace(f"@{EMAIL_DOMAIN}", "")
                 username_input.send_keys(modified_email)
             else:
@@ -1704,11 +1844,12 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
 
 # Sign-up form with timeout
 def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=300):
-    global should_continue, form_filled, logged_in, email_used
+    global should_continue, form_filled, logged_in, email_used, password_used
     should_continue = True
     form_filled = False
     logged_in = False
     email_used = None  # else a previous site's address leaked into this site's result
+    password_used = ACCOUNT_PASSWORD
     deposit_pages_opened.clear()
 
     def target():
@@ -1770,6 +1911,15 @@ def find_login_url_with_single_password_field(driver, start_url, signup_url=None
                 logging.info(f"URL with a single password field in a form: {login_url}")
                 return login_url, None
             if state['logout'] and not state['passwords']:
+                return None, state['url']
+            # A login page that sends the browser on to an account page means the session is already
+            # logged in, even with no Logout link to see: ultrabitfx.com's /login went to
+            # /user/dashboard after the e-mail confirmation, and its dashboard has no logout element.
+            # The site's front page does not count: some sites send visitors there from /login.
+            landed_path = urlparse(state['url']).path.strip('/').lower()
+            if (LOGIN_URL_RE.search(current_url) and state['url'] and state['url'] != current_url and not state['passwords']
+                    and landed_path not in ('', 'index', 'index.html', 'index.php', 'home') and same_site(state['url'], base_domain)):
+                logging.info(f"Login search: {current_url} sends a logged-in browser on to {state['url']}")
                 return None, state['url']
             login_like = []
             for link in driver.find_elements(By.TAG_NAME, 'a'):
