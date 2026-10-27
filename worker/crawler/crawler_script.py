@@ -148,7 +148,7 @@ def generate_random_string(length=8, names_file=NAMES_FILE): #names.txt contains
 
 def generate_random_email():
     random_number = random.randint(60, 99)
-    username = generate_random_string()
+    username = generate_random_string().lower()
     return f"{username}{random_number}@{EMAIL_DOMAIN}"
 
 # Generate crypto addresses
@@ -269,7 +269,9 @@ def answer_captcha(driver, answer, target):
 def predict_values(form):
     predictions = {}
     predicted_password = ACCOUNT_PASSWORD
-    predicted_username = generate_random_string()
+    # Lower case: aziminer.com refused "Florence95@..." with "The email field must be lowercase."
+    # Mailinator inboxes ignore case, and the login username derived from the address stays the same.
+    predicted_username = generate_random_string().lower()
     predicted_email = f"{predicted_username}{random.randint(60, 99)}@{EMAIL_DOMAIN}"
     input_tags = form.find_elements(By.TAG_NAME, 'input')
 
@@ -367,18 +369,22 @@ def handle_checkbox(driver, form):
         checkboxes = form.find_elements(By.CSS_SELECTOR, 'input[type="checkbox"]')
         if not checkboxes:
             logging.info("No checkboxes in the form.")
+        # A hidden (custom-styled) checkbox is ticked with a JavaScript click on the box itself, not
+        # by clicking its label: hubguardfxz.com's label is "I agree with <a href="?a=rules">Terms
+        # and conditions</a>", so the label click opened the rules page and the form went stale.
+        # An already ticked box is left alone (clicking its label used to untick it).
         for checkbox in checkboxes:
             try:
-                if checkbox.is_displayed() and checkbox.is_enabled() and not checkbox.is_selected():
+                if checkbox.is_selected() or not checkbox.is_enabled():
+                    continue
+                if checkbox.is_displayed():
                     checkbox.click()
                     logging.info("Checkbox clicked directly.")
                 else:
-                    label = driver.find_element(By.XPATH, f"//label[@for='{checkbox.get_attribute('id')}']")
-                    if label.is_displayed():
-                        label.click()
-                        logging.info("Checkbox label clicked.")
+                    driver.execute_script("arguments[0].click();", checkbox)
+                    logging.info("Hidden checkbox ticked using JavaScript.")
             except Exception:
-                driver.execute_script("arguments[0].click();", checkbox)
+                driver.execute_script("if (!arguments[0].checked) arguments[0].click();", checkbox)
                 logging.info("Checkbox clicked using JavaScript.")
     except Exception as e:
         logging.error(f"An error occurred while handling checkboxes: {e}")
@@ -723,7 +729,9 @@ def fill_sign_up_form(driver, start_url):
             if not form_filled:
                 for link in driver.find_elements(By.CSS_SELECTOR, 'a[href]'):
                     absolute_link = urljoin(current_url, link.get_attribute('href'))
-                    if get_base_domain(absolute_link) == base_domain and not is_blacklisted(absolute_link):
+                    # same_site() also takes subdomains: securenovatrade.com's sign-up and login are on
+                    # account.securenovatrade.com, which used to count as another site.
+                    if same_site(absolute_link, base_domain) and not is_blacklisted(absolute_link):
                         if absolute_link not in visited_urls and absolute_link not in urls_to_check and should_continue:
                             urls_to_check.append(absolute_link)
         except TimeoutException:
@@ -857,7 +865,13 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
 
         # Judged from the page, not from a URL change: a failed login that redirects to
         # ?a=login&say=invalid_login changes the URL too.
-        outcome, evidence = assess_login(before_submit, wait_for_outcome(driver, before_submit))
+        after_login = wait_for_outcome(driver, before_submit)
+        outcome, evidence = assess_login(before_submit, after_login)
+        # Ending up on another site is not a login: tradeglobalast.com.dbxubite87.world sends the
+        # logged-in browser to recaptcha.cloud (a bot wall), which has no password field and no
+        # Logout link, so it read as "unclear", was crawled as the dashboard and reported Success.
+        if outcome != "failed" and after_login["url"] and not same_site(after_login["url"], base_domain):
+            outcome, evidence = "failed", f"sent off the site to {after_login['url'][:150]}"
         logging.info(f"Login result: {outcome} - {evidence}")
         if outcome == "failed":
             return
@@ -908,7 +922,7 @@ LANGUAGE_LINK_RE = re.compile(r"/(locale|lang|language)/[a-z]{2}([_-][a-z]{2})?/
 
 def validate_link(href, processed_links, base_domain):
     return (href is not None and href not in processed_links and "logout" not in href.lower() and "signout" not in href.lower()
-            and get_base_domain(href) == base_domain and not LANGUAGE_LINK_RE.search(href))
+            and same_site(href, base_domain) and not LANGUAGE_LINK_RE.search(href))
 
 # File and folder names are built from URLs. Windows rejects characters such as
 # ':' and '?' in them and limits paths to 260 characters, so a local test run
@@ -1295,12 +1309,15 @@ const described = Array.from(document.forms).map((f, index) => {
   const amount = els.find(e => e.tagName === 'INPUT'
       && ['text', 'number', 'tel', ''].includes((e.getAttribute('type') || '').toLowerCase())
       && AMOUNTNAME.test([e.name, e.id, e.placeholder].join(' ')));
+  // Fields are keyed by name, or by id when they have none: digital4xtrade.com's crypto deposit
+  // form is <input id="cryptoAmount"> and <select id="cryptoMethod"> without names, read by its
+  // own script, so the form used to look like it had no amount field and no choices.
   const controls = [];
-  els.filter(e => e.tagName === 'SELECT' && !e.disabled && e.name).forEach(s => {
+  els.filter(e => e.tagName === 'SELECT' && !e.disabled && (e.name || e.id)).forEach(s => {
     const options = Array.from(s.options)
       .filter(o => !o.disabled && o.value !== '' && !PLACEHOLDER.test(clean(o.text)))
       .map(o => ({value: o.value, label: clean(o.text).slice(0, 80), range: range(o.text)}));
-    controls.push({kind: 'select', name: s.name, options});
+    controls.push({kind: 'select', name: s.name || s.id, options});
   });
   const groups = {};
   els.filter(e => e.type === 'radio' && !e.disabled && e.name && e.value !== '').forEach(r => {
@@ -1314,7 +1331,7 @@ const described = Array.from(document.forms).map((f, index) => {
   });
   const submit = els.some(e => (e.tagName === 'BUTTON' && (e.getAttribute('type') || 'submit').toLowerCase() === 'submit')
       || (e.tagName === 'INPUT' && ['submit', 'image'].includes(e.type)));
-  return {index, name: f.getAttribute('name') || f.id || '', amount: amount ? amount.name : null,
+  return {index, name: f.getAttribute('name') || f.id || '', amount: amount ? (amount.name || amount.id || null) : null,
           controls: controls.filter(c => c.options.length), submit};
 });
 const byControls = (a, b) => b.controls.length - a.controls.length;
@@ -1352,7 +1369,7 @@ const els = Array.from(f.elements);
 function set(c) {
   if (!c) return null;
   if (c.kind === 'select') {
-    const s = els.find(e => e.tagName === 'SELECT' && e.name === c.name);
+    const s = els.find(e => e.tagName === 'SELECT' && (e.name || e.id) === c.name);
     if (!s) return 'missing';
     s.value = c.value;
     Array.from(s.options).forEach(o => { o.selected = o.value === c.value; });
@@ -1368,7 +1385,7 @@ function set(c) {
   return now ? now.value : '';
 }
 const state = {plan: set(plan)};
-const a = amountName ? els.find(e => e.name === amountName) : null;
+const a = amountName ? els.find(e => (e.name || e.id) === amountName) : null;
 if (a) {
   const [min, max] = range || [null, null];
   let v = parseFloat((a.value || '').replace(/[^\d.]/g, ''));
@@ -1619,7 +1636,7 @@ def find_login_url_with_single_password_field(driver, start_url, signup_url=None
                 if not href or href.startswith(('javascript:', 'mailto:', 'tel:')):
                     continue
                 absolute_link = urljoin(current_url, href)
-                if (get_base_domain(absolute_link) != base_domain or absolute_link in visited_urls or LANGUAGE_LINK_RE.search(absolute_link)
+                if (not same_site(absolute_link, base_domain) or absolute_link in visited_urls or LANGUAGE_LINK_RE.search(absolute_link)
                         or absolute_link in urls_to_check or is_blacklisted(absolute_link)):
                     continue
                 if LOGIN_URL_RE.search(absolute_link) or LOGIN_TEXT_RE.match(link.text or ''):
@@ -1756,10 +1773,14 @@ const inputs = Array.from(document.querySelectorAll('input')).filter(e =>
     vis(e) && !e.disabled && !e.readOnly && ['text', 'number', 'tel'].includes(e.type));
 const boxes = inputs.filter(e => e.maxLength === 1);
 if (boxes.length >= 4) return boxes;
-const hinted = inputs.filter(e => e.autocomplete === 'one-time-code' ||
-    /code|otp|token|pin|verif/i.test([e.name, e.id, e.placeholder, e.getAttribute('aria-label')].join(' ')));
+// Referral-type fields are not verification codes: beacondigital.ltd's optional "referralCode" on
+// the sign-up form made the crawler wait 60 s for an e-mailed code that never came.
+const NOT_A_CODE = /refer|ref_?code|promo|invite|invitation|sponsor|coupon|voucher|bonus|upline|zip|postal/i;
+const hinted = inputs.filter(e => !NOT_A_CODE.test([e.name, e.id, e.placeholder].join(' ')) && (e.autocomplete === 'one-time-code' ||
+    /code|otp|token|pin|verif/i.test([e.name, e.id, e.placeholder, e.getAttribute('aria-label')].join(' '))));
 if (hinted.length) return hinted.slice(0, 1);
-if (inputs.length === 1 && /\bcode\b/i.test(document.body ? document.body.innerText : '')) return inputs;
+const plain = inputs.filter(e => !NOT_A_CODE.test([e.name, e.id, e.placeholder].join(' ')));
+if (inputs.length === 1 && plain.length === 1 && /\bcode\b/i.test(document.body ? document.body.innerText : '')) return plain;
 return [];
 """
 
