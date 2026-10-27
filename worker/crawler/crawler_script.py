@@ -275,22 +275,24 @@ def answer_captcha(driver, answer, target):
 # amvinvestmentltd.com's register page has broken HTML that closes the <form> after its first
 # two fields, so the other ten (password and submit button included) sit outside the <form>
 # element but still belong to the form; the sign-up form was skipped as having no password field.
+# "form" can also be the box of a sign-up without a <form> element (see signup_box), which has no
+# .elements; then the controls inside it count. CONTROLS_JS is that rule as a JavaScript expression.
+CONTROLS_JS = "(f => f.elements ? Array.from(f.elements) : Array.from(f.querySelectorAll('input, select, textarea, button')))"
+
 def form_controls(form, css='input, select, textarea, button'):
     return form.parent.execute_script(
-        "return Array.from(arguments[0].elements).filter(e => e.matches(arguments[1]));", form, css)
+        f"return {CONTROLS_JS}(arguments[0]).filter(e => e.matches(arguments[1]));", form, css)
 
 # Fields are keyed by name, or "#id", or "@n" (position among the form's inputs) when they have
 # neither: duduinvest.com's and expacraftcapitals.org's sign-up fields have no names (filled by the
 # page's own script, Livewire on expacraftcapitals), so nothing was typed and the form went out empty.
-FIELD_BY_KEY_JS = r"""
-const els = Array.from(arguments[0].elements), k = arguments[1];
+FIELD_BY_KEY_JS = f"const els = {CONTROLS_JS}(arguments[0]), k = arguments[1];" + r"""
 if (k.startsWith('#')) return els.find(e => e.id === k.slice(1)) || null;
 if (k.startsWith('@')) return els.filter(e => e.tagName === 'INPUT')[parseInt(k.slice(1))] || null;
 return els.find(e => e.name === k) || null;
 """
 # name, id, placeholder, autocomplete, aria-label and label text of each input, for choosing values.
-FIELD_HINTS_JS = r"""
-return Array.from(arguments[0].elements).filter(e => e.tagName === 'INPUT').map(e => {
+FIELD_HINTS_JS = f"return {CONTROLS_JS}(arguments[0])" + r""".filter(e => e.tagName === 'INPUT').map(e => {
   const l = (e.id && document.querySelector('label[for="' + CSS.escape(e.id) + '"]')) || e.closest('label');
   return [e.name || '', e.id || '', e.type || 'text', [e.name, e.id, e.placeholder, e.autocomplete, e.getAttribute('aria-label'),
           l ? l.innerText : ''].join(' ').replace(/\s+/g, ' ').toLowerCase(), e.required];
@@ -381,9 +383,7 @@ ACCOUNT_PASSWORD_ALT = '<CRAWLER_PASSWORD_ALT>'
 password_used = ACCOUNT_PASSWORD
 
 def password_for(form):
-    refused = form.parent.execute_script(r"""
-const pw = arguments[1];
-return Array.from(arguments[0].elements).filter(e => e.type === 'password').some(e => {
+    refused = form.parent.execute_script(f"const pw = arguments[1]; return {CONTROLS_JS}(arguments[0])" + r""".filter(e => e.type === 'password').some(e => {
   if (e.maxLength > 0 && pw.length > e.maxLength) return true;
   if (e.pattern) { try { return !new RegExp('^(?:' + e.pattern + ')$').test(pw); } catch (x) { return false; } }
   return false;
@@ -392,8 +392,7 @@ return Array.from(arguments[0].elements).filter(e => e.type === 'password').some
 
 def submit_disabled(form):
     """True when the form's submit buttons are all disabled (a script is holding the form back)."""
-    return form.parent.execute_script(r"""
-const b = Array.from(arguments[0].elements).filter(e => e.matches('button[type=submit], input[type=submit], button:not([type])'));
+    return form.parent.execute_script(f"const b = {CONTROLS_JS}(arguments[0])" + r""".filter(e => e.matches('button[type=submit], input[type=submit], button:not([type])'));
 return b.length > 0 && b.every(e => e.disabled);""", form)
 
 # Optional referral-type fields stay empty. A made-up value is checked against real codes:
@@ -452,6 +451,29 @@ def pick_signup_form(driver):
         except StaleElementReferenceException:
             continue
     return best
+
+# Sign-ups without a <form> element: aegisinvestmentgroup.com/auth is a React page whose fields
+# (firstName ... password, password2, agreeTerms) and "Create account" button sit in plain <div>s,
+# and the crawler waited 5 s for a <form> that never came, on six URL variants. The box is the
+# nearest ancestor of the first visible password field outside any form that also holds three or
+# more visible inputs and a button labelled like sign-up. The rest of the sign-up code takes it as
+# the form (form_controls falls back to the inputs inside it).
+SIGNUP_BUTTON_RE = re.compile(r"^\s*(create( an| my| your)? account|create|sign ?up|register|join( now)?|get started|open( an)? account|submit)\b", re.I)
+SIGNUP_BOX_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+const button = new RegExp(arguments[0], 'i');
+const pw = Array.from(document.querySelectorAll('input[type=password]')).find(e => vis(e) && !e.form);
+for (let box = pw ? pw.parentElement : null, i = 0; box && i < 12; box = box.parentElement, i++) {
+  const inputs = Array.from(box.querySelectorAll('input')).filter(e => vis(e) && e.type !== 'hidden');
+  const send = Array.from(box.querySelectorAll('button, input[type=submit], input[type=button]'))
+      .some(b => vis(b) && button.test((b.innerText || b.value || '').trim()));
+  if (inputs.length >= 3 && send) return box;
+}
+return null;
+"""
+
+def signup_box(driver):
+    return driver.execute_script(SIGNUP_BOX_JS, SIGNUP_BUTTON_RE.pattern)
 
 # Multi-step sign-up forms: visible buttons that move to the next step. Submit buttons are left
 # out so this never sends the form early.
@@ -721,9 +743,23 @@ def submit_form(driver, selectors, form=None):
     # matching button on the page ("Log in" on cryptocoinprop.com) and waited 10 s for each
     # selector the page does not use. A <button> without a type attribute submits too.
     if form is not None:
-        for button in form_controls(form, 'button[type="submit"], input[type="submit"], button:not([type])'):
+        # A box without a <form> (signup_box) has no submit buttons of its own; its typeless buttons
+        # can be tab switches ("Create account" / "Log in" on aegisinvestmentgroup.com).
+        is_box = form.tag_name.lower() != 'form'
+        for button in ([] if is_box else form_controls(form, 'button[type="submit"], input[type="submit"], button:not([type])')):
             try:
                 if button.is_displayed() and button.is_enabled() and click_and_submit(driver, button, By.CSS_SELECTOR):
+                    return True
+            except StaleElementReferenceException:
+                continue
+        # Script-driven sign-ups (a box without a <form>, or type="button") are sent by a button
+        # labelled like sign-up. In a box the last one is taken: the tab switch comes first, the
+        # button that sends the fields comes after them.
+        labelled = [b for b in form_controls(form, 'button, input[type="button"], input[type="submit"]')
+                    if b.is_displayed() and b.is_enabled() and SIGNUP_BUTTON_RE.match(b.text or b.get_attribute('value') or '')]
+        for button in (labelled[::-1] if is_box else labelled):
+            try:
+                if click_and_submit(driver, button, By.CSS_SELECTOR):
                     return True
             except StaleElementReferenceException:
                 continue
@@ -776,8 +812,13 @@ def fill_sign_up_form(driver, start_url):
 
                 wait = WebDriverWait(driver, 5)
                 try:
-                    wait.until(EC.presence_of_element_located((By.TAG_NAME, 'form')))
+                    # A <form>, or a password field outside any form (see signup_box).
+                    wait.until(lambda d: d.find_elements(By.TAG_NAME, 'form') or d.find_elements(By.CSS_SELECTOR, 'input[type="password"]'))
                     form = pick_signup_form(driver)
+                    if form is None:
+                        form = signup_box(driver)
+                        if form is not None:
+                            logging.info("Sign-up fields are not in a <form>; using the box around them and its sign-up button")
                     if form is None and captcha_answer is not None and should_continue and pass_captcha_gate(driver, captcha_answer, captcha_target):
                         captcha_blocks, captcha_summary, captcha_answer, captcha_target = check_captcha(driver)
                         logging.info(f"Captcha check after the gate on {driver.current_url}: {captcha_summary}")
@@ -1030,9 +1071,13 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
             username_input = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[name="username"],input[type="email"],input[type="text"]')))
             input_type = username_input.get_attribute('type')
             # A text box named or labelled e-mail gets the address: fxtastytrades.com's login answered
-            # "The email must be a valid email address" when it got the derived username.
+            # "The email must be a valid email address" when it got the derived username. A box whose
+            # name or id says user keeps the username even if its placeholder offers e-mail too:
+            # hubguardfxz.com's name="username" placeholder="Username or Email" refused the address
+            # (say=invalid_login) and accepted the username.
             email_box = re.search(r"mail", ' '.join((username_input.get_attribute(a) or '') for a in ('name', 'id', 'placeholder', 'autocomplete')), re.I)
-            if input_type == "text" and not email_box:
+            user_box = re.search(r"user", ' '.join((username_input.get_attribute(a) or '') for a in ('name', 'id')), re.I)
+            if input_type == "text" and (user_box or not email_box):
                 modified_email = re.sub(r'\d+', '', email_used).replace(f"@{EMAIL_DOMAIN}", "")
                 username_input.send_keys(modified_email)
             else:
@@ -1112,8 +1157,12 @@ LANGUAGE_LINK_RE = re.compile(r"/(locale|lang|language)/[a-z]{2}([_-][a-z]{2})?/
                               r"|^https?://[^/]+/(en|de|fr|es|it|pt|ru|ar|zh|ja|ko|tr|nl|pl|hi|id|vi|th|fa|ur|bn|sv|no|da|fi"
                               r"|cs|sk|ro|hu|el|bg|uk|he|ms|tl|sw)([_-][a-z]{2})?/?$", re.I)
 
+# Links that end the session. Only "logout" and "signout" were skipped, and fxtastytrades.com's
+# /user/logoff logged the crawl out: every page saved after it was the "Sign In" page.
+SESSION_END_RE = re.compile(r"log-?out|log-?off|sign-?out|sign-?off|/exit(?:[/?#.]|$)|a=logout", re.I)
+
 def validate_link(href, processed_links, base_domain):
-    return (href is not None and href not in processed_links and "logout" not in href.lower() and "signout" not in href.lower()
+    return (href is not None and href not in processed_links and not SESSION_END_RE.search(href)
             and same_site(href, base_domain) and not LANGUAGE_LINK_RE.search(href))
 
 # File and folder names are built from URLs. Windows rejects characters such as
@@ -1372,13 +1421,81 @@ def process_links(driver, links, processed_links, base_domain, directory_name, o
 # only followed <a href>. When the post-login page has no deposit link, the first visible button
 # labelled like a deposit is clicked on that page and whatever it opens (a modal, a new route
 # or a new tab) is saved. If it led to another page of the site, the deposit step runs there.
+# Invest buttons count when there is no deposit button: aiblockchainmining.com's dashboard only has
+# "Invest Now" / "Create Your First Investment", which open a "New Investment" dialog (plan cards,
+# "Cryptocurrency" select, amount, "Proceed to Payment") that leads to a NOWPayments invoice.
 DEPOSIT_BUTTONS_JS = r"""
 const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
-return Array.from(document.querySelectorAll('button,[role=button],input[type=button],input[type=submit]')).filter(b =>
-    vis(b) && !b.disabled && b.tagName !== 'A' &&
-    /^(deposit|deposit funds|make a deposit|fund|fund account|fund wallet|add funds|top ?up)$/i.test(
-        (b.innerText || b.value || '').trim().replace(/\s+/g, ' ')));
+const label = b => (b.innerText || b.value || '').trim().replace(/\s+/g, ' ');
+const all = Array.from(document.querySelectorAll('button,[role=button],input[type=button],input[type=submit]')).filter(b =>
+    vis(b) && !b.disabled && b.tagName !== 'A');
+const deposit = all.filter(b => /^(deposit|deposit funds|make a deposit|fund|fund account|fund wallet|add funds|top ?up)$/i.test(label(b)));
+return deposit.length ? deposit : all.filter(b =>
+    /^(invest now|invest|new investment|start investing|make an investment|create (your )?(first )?investment)$/i.test(label(b)));
 """
+
+# A payment processor's hosted invoice (NOWPayments on aiblockchainmining.com: "Payment ID:
+# 5296811223", BTC 3DEBx5XYNBS8MZ9jMjJLcGtXQF7rj2kCNn) shows an address the processor likely issues
+# per invoice, not one the site reuses, so the log names the processor host and payment ID.
+PAYMENT_ID_RE = re.compile(r"payment\s*id\s*[:#]?\s*([A-Za-z0-9-]{6,40})", re.I)
+
+def save_page(driver, directory_name, stem):
+    with open(os.path.join(directory_name, f"{stem}.html"), 'w', encoding='utf-8') as file:
+        file.write(driver.page_source)
+    result = driver.execute_cdp_cmd("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True})
+    with open(os.path.join(directory_name, f"{stem}.png"), 'wb') as file:
+        file.write(base64.b64decode(result['data']))
+
+def deposit_passes_in_dialog(driver, start_url, label, directory_name, stem):
+    """Run the deposit passes on a dialog that the deposit/invest button opened on start_url: fill
+    and submit the form in it, save where that lands (on another site too), and reopen the dialog
+    for the next payment option."""
+    found = driver.execute_script(DEPOSIT_FORM_JS)
+    form, plan, payment = found.get('form'), found.get('plan'), found.get('payment')
+    if not form:
+        logging.info(f"Deposit button {label!r}: no deposit form in what it opened")
+        return
+    plan_choice = plan['options'][0] if plan else None
+    options = (payment['options'] if payment and payment['kind'] != 'button' else [None])[:MAX_DEPOSIT_PASSES]
+    logging.info(f"Deposit button {label!r}: form #{form['index']} {form['name']!r} in the dialog; amount field {form['amount']!r}; "
+                 + (f"payment {payment['kind']} {payment['name']!r} with {len(payment['options'])} options" if payment else "no payment-method control")
+                 + f"; {len(options)} passes planned")
+    site = get_base_domain(start_url)
+    for counter, option in enumerate(options, start=1):
+        if counter > 1:
+            driver.get(start_url)
+            time.sleep(3)
+            again = driver.execute_script(DEPOSIT_BUTTONS_JS)
+            if not again:
+                logging.info(f"Deposit button {label!r}: not on the page again for pass {counter}, stopping")
+                break
+            driver.execute_script("arguments[0].click();", again[0])
+            time.sleep(3)
+        state = driver.execute_script(
+            DEPOSIT_FILL_JS, form['index'],
+            {'kind': plan['kind'], 'name': plan['name'], 'value': plan_choice['value']} if plan else None,
+            {'kind': payment['kind'], 'name': payment['name'], 'value': option['value']} if option else None,
+            form['amount'], (plan_choice or {}).get('range') or (option or {}).get('range'))
+        if state.get('error'):
+            logging.info(f"Deposit button {label!r} pass {counter}: {state['error']}, stopping")
+            break
+        how = driver.execute_script(DEPOSIT_SUBMIT_JS, form['index'])
+        found_wallets = []
+        for _ in range(6):  # a hosted invoice renders its address a few seconds after loading
+            time.sleep(2)
+            found_wallets = wallet_like(driver.page_source)
+            if found_wallets:
+                break
+        landed = driver.current_url
+        save_page(driver, directory_name, f"{stem}_{counter}")
+        processor = ""
+        if not same_site(landed, site):
+            pid = PAYMENT_ID_RE.search(driver.execute_script("return document.body ? document.body.innerText : '';") or "")
+            processor = (f"; payment processor page on {urlparse(landed).netloc}" + (f", payment ID {pid.group(1)}" if pid else "")
+                         + " (its address may be issued for this invoice only)")
+        logging.info(f"Deposit button {label!r} pass {counter}: payment {(option or {}).get('label', 'site default')!r}; "
+                     f"submitted with {state} via {how}; now at {landed}; wallet-like strings {found_wallets or 'none'}{processor}")
+    driver.get(start_url)
 
 def click_deposit_button(driver, directory_name, base_domain, original_window, processed_links):
     buttons = driver.execute_script(DEPOSIT_BUTTONS_JS)
@@ -1396,16 +1513,15 @@ def click_deposit_button(driver, directory_name, base_domain, original_window, p
         driver.switch_to.window(new_tabs[0])
 
     stem = windows_safe(f"deposit_button_{label}_" + start_url.replace('://', '_').replace('/', '_').replace('?', '_'))
-    with open(os.path.join(directory_name, f"{stem}.html"), 'w', encoding='utf-8') as file:
-        file.write(driver.page_source)
-    result = driver.execute_cdp_cmd("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True})
-    with open(os.path.join(directory_name, f"{stem}.png"), 'wb') as file:
-        file.write(base64.b64decode(result['data']))
+    save_page(driver, directory_name, stem)
     now_url = driver.current_url
     logging.info(f"Deposit button {label!r} on {start_url}: "
                  + (f"opened a new tab at {now_url}" if new_tabs else
                     f"now at {now_url}" if now_url != start_url else "same URL (a dialog or an in-page panel)")
                  + f"; saved as {stem}; wallet-like strings {wallet_like(driver.page_source) or 'none'}")
+    if not new_tabs and now_url == start_url:
+        deposit_passes_in_dialog(driver, start_url, label, directory_name, stem)
+        return
 
     if new_tabs:
         driver.close()
@@ -1928,6 +2044,7 @@ def find_login_url_with_single_password_field(driver, start_url, signup_url=None
                     continue
                 absolute_link = urljoin(current_url, href)
                 if (not same_site(absolute_link, base_domain) or absolute_link in visited_urls or LANGUAGE_LINK_RE.search(absolute_link)
+                        or SESSION_END_RE.search(absolute_link)
                         or absolute_link in urls_to_check or is_blacklisted(absolute_link)):
                     continue
                 if LOGIN_URL_RE.search(absolute_link) or LOGIN_TEXT_RE.match(link.text or ''):
@@ -1967,6 +2084,7 @@ def get_last_processed_url(file_path):
 # seconds and "data.parts" for the body, so it could never click anything.
 MAILINATOR_CONFIRM_HINTS = ('verif', 'confirm', 'activat', 'token', 'valid', 'register', 'signup', 'sign-up')
 MAILINATOR_MAX_CLICKS = 3
+MAILINATOR_EXTRA_WAIT = 20  # seconds to keep polling after clicking links that were not confirmation links
 # Links that are not pages to open: images and the like (xcelholdingsltd.org's header.png),
 # and, off the site's own domain, anything without a confirmation word in it
 # (swantradecapital.com's http://www.w3.org/2000/svg). Off-site confirmation links stay:
@@ -2026,8 +2144,20 @@ def check_mailinator_inbox_and_click_links(api_key, driver, email_address, signu
     site_domain = get_base_domain(site_url) if site_url else None
     since_ms = (signup_time - 30) * 1000  # small allowance for clock skew
     seen, clicked, code = set(), 0, None
+    confirm_clicked, first_click_at, extra_wait_logged = False, None, False
     deadline = time.time() + wait_seconds
-    while time.time() < deadline and should_continue and not (code if want_code else clicked):
+
+    # Without a code to wait for, stop once a confirmation-looking link was opened, or
+    # MAILINATOR_EXTRA_WAIT seconds after the first click. duduinvest.com sent "Welcome" (home and
+    # login links) and "Confirm your email" (supabase.co/auth/v1/verify) in the same second; the
+    # first poll only had the welcome mail, the loop stopped after clicking it, and the login then
+    # failed with "Email not confirmed".
+    def done():
+        if want_code:
+            return bool(code)
+        return confirm_clicked or (clicked and time.time() - first_click_at >= MAILINATOR_EXTRA_WAIT)
+
+    while time.time() < deadline and should_continue and not done():
         try:
             resp = curl_requests.get(f"{MAILINATOR_API}/inboxes/{inbox}",
                                 params={**params, "limit": 10, "sort": "descending"}, timeout=15)
@@ -2044,12 +2174,17 @@ def check_mailinator_inbox_and_click_links(api_key, driver, email_address, signu
                 for link in _mailinator_links(inbox, msg['id'], params, site_domain)[:MAILINATOR_MAX_CLICKS]:
                     driver.get(link)
                     clicked += 1
+                    first_click_at = first_click_at or time.time()
+                    confirm_clicked = confirm_clicked or any(h in link.lower() for h in OFFSITE_CONFIRM_HINTS)
                     logging.info(f"Clicked link in email: {link}")
+                if clicked and not confirm_clicked and not want_code and not extra_wait_logged:
+                    extra_wait_logged = True
+                    logging.info(f"No confirmation link among the clicked e-mail links; checking the inbox up to {MAILINATOR_EXTRA_WAIT} s more")
         except (curl_requests.exceptions.RequestException, ValueError, KeyError) as e:
             logging.error(f"Error checking Mailinator inbox {inbox}: {e}")
         except WebDriverException as e:
             logging.error(f"Error opening a link from the Mailinator inbox {inbox}: {e}")
-        if not (code if want_code else clicked):
+        if not done():
             time.sleep(5)
     return clicked > 0, code
 
