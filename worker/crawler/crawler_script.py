@@ -1047,7 +1047,7 @@ for (const a of document.querySelectorAll('a[href]')) {
   if (!/(^|\/)invest(\/|$)/i.test(u.pathname) && !/[?&]a=invest(&|$)/i.test(u.search)) continue;
   let min = null;
   for (let e = a, i = 0; e && i < 6 && min === null; e = e.parentElement, i++) {
-    const m = (e.innerText || '').match(/min(?:imum)?[^\d$]{0,20}\$?\s*([\d,]+(?:\.\d+)?)/i);
+    const m = (e.innerText || '').match(/\bmin(?:imum)?\b[^\d$]{0,20}\$?\s*([\d,]+(?:\.\d+)?)/i);
     if (m) min = parseFloat(m[1].replace(/,/g, ''));
   }
   out.push([a.href, min]);
@@ -1113,6 +1113,13 @@ def wallet_like(html_content):
                    if (w.startswith('0x') or not re.fullmatch(r"[0-9a-fA-F]+", w))
                    and (w[0] not in 'rD' or mixed(w))})
 
+# Deposit pages: "deposit"/"deposits" as a word in the URL, as before, or an add-funds path part
+# (beacondigital.ltd's "Add Funds" is /dashboard/fund, minnercoinex.org's "Fund wallet" is
+# fund.php), or a post-login link labelled like one. /transfer-funds and /withdraw-funds do not
+# match: the path part has to start with the word.
+DEPOSIT_URL_RE = re.compile(r"\bdeposits?\b|/(funds?|add-?funds?|fund-?(account|wallet)|top-?up|recharge)(?=[/?#.]|$)", re.I)
+DEPOSIT_LINK_TEXT_RE = re.compile(r"^\s*(add funds|fund (your )?(account|wallet)|top ?up|deposit( funds)?|make a deposit)\s*$", re.I)
+
 def process_links(driver, links, processed_links, base_domain, directory_name, original_window, max_links=25):
     if len(processed_links) >= max_links:
         logging.info(f"Reached maximum link processing threshold of {max_links}. Stopping further processing.")
@@ -1124,16 +1131,22 @@ def process_links(driver, links, processed_links, base_domain, directory_name, o
     # The hrefs are read once, up front. Reading them from the link elements as the loop got to
     # them failed on swantradecapital.com: the dashboard had changed by then, a link was stale,
     # and the StaleElementReferenceException (raised outside the loop's try) ended the crawl.
-    hrefs = []
+    hrefs, deposit_by_text = [], set()
     for link in links:
         try:
-            hrefs.append(link.get_attribute('href'))
+            href = link.get_attribute('href')
+            hrefs.append(href)
+            if href and DEPOSIT_LINK_TEXT_RE.match(link.text or ''):
+                deposit_by_text.add(href)
         except StaleElementReferenceException:
             continue
 
+    def is_deposit_link(href):
+        return bool(href) and (bool(DEPOSIT_URL_RE.search(href)) or href in deposit_by_text)
+
     # Logged so a site whose deposit page was never opened can be told apart from one whose
     # deposit page was opened but produced nothing (process_deposit_page logs that case).
-    deposit_hrefs = sorted({h for h in hrefs if h and re.search(r'\bdeposits?\b', h.lower())})
+    deposit_hrefs = sorted({h for h in hrefs if is_deposit_link(h)})
     logging.info(f"Post-login page has {len(hrefs)} links; deposit links: {deposit_hrefs or 'none'}")
 
     invest_links_seen = set()  # never opened as ordinary pages; one of them goes to the deposit step
@@ -1147,7 +1160,7 @@ def process_links(driver, links, processed_links, base_domain, directory_name, o
         (empty for deposit pages) as (hrefs, invest links)."""
         nonlocal deposit_page_counter
         processed_links.add(href)
-        is_deposit = re.search(r'\bdeposits?\b', href.lower()) # condition true if either deposit or deposits in url
+        is_deposit = is_deposit_link(href)
         if is_deposit and deposit_page_counter < 5: # and within limit
             logging.info(f"Opening deposit page {href} (deposit link {deposit_page_counter + 1} of at most 5)")
             process_deposit_page(driver, href, directory_name, original_window)
@@ -1285,21 +1298,58 @@ def click_deposit_button(driver, directory_name, base_domain, original_window, p
 # JavaScript, which also reaches hidden radios and select2-wrapped selects, so nothing goes stale.
 MAX_DEPOSIT_PASSES = 12
 
-# Payment methods chosen with a button per method outside the form. On swantradecapital.com the
-# deposit form holds only the amount and an empty hidden payment_method; a "Select Deposit Method"
-# table has a "Deposit" button per method (onclick="checkpamethd('1')") that fetches the method
-# and writes it into the hidden field, and the site refuses the form while it is empty ("Please
-# choose a payment method by clicking on it"). The buttons are those outside the form, outside
-# menus, labelled like a choice; when several groups qualify, the largest group of buttons that
-# call the same onclick function (or share a label) wins. Each gets the label of its table row
-# or card, and the row text for the amount range ("Min: $50.00").
+# Shared by the deposit-step scripts below. formAt(i) is document.forms[i], or for i = -1 the
+# deposit box of a page without a deposit <form>: beacondigital.ltd's "Add Funds" page is a React
+# box with a coin <select>, an amount input and a "Proceed to Deposit" button, none of them in a
+# form or with a name or id. The box is the nearest ancestor of a visible deposit-like button
+# (outside any form and outside menus) that also holds a visible amount input and a dropdown or
+# radios. Controls are keyed by name, else id, else tag and position ("@select0"), which is the
+# same on every reload. React keeps its own copy of input values, so values are set through the
+# native value setter and announced with input/change events.
+DEPOSIT_HELPERS_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+const BOX_BUTTON = /deposit|proceed|pay|continue|submit|fund|confirm/i;
+function depositBox() {
+  const buttons = Array.from(document.querySelectorAll('button, [role=button], input[type=button], input[type=submit]'))
+    .filter(b => vis(b) && BOX_BUTTON.test(clean(b.innerText || b.value))
+            && !b.closest('form, nav, header, aside, footer, [class*=sidebar], [class*=menu], [class*=navbar]'));
+  for (const b of buttons) {
+    let box = b.parentElement;
+    for (let i = 0; box && i < 6; i++, box = box.parentElement) {
+      const amount = Array.from(box.querySelectorAll('input')).some(e => vis(e) && ['number', 'text', 'tel'].includes(e.type));
+      if (amount && box.querySelector('select, input[type=radio]')) return box;
+    }
+  }
+  return null;
+}
+function formAt(index) { return index >= 0 ? document.forms[index] : depositBox(); }
+function controlsOf(f) { return f.elements ? Array.from(f.elements) : Array.from(f.querySelectorAll('input, select, textarea, button')); }
+function keyOf(e, els) {
+  return e.name || e.id || ('@' + e.tagName.toLowerCase() + els.filter(x => x.tagName === e.tagName).indexOf(e));
+}
+function setValue(e, v) {
+  const proto = e.tagName === 'SELECT' ? HTMLSelectElement.prototype : e.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  Object.getOwnPropertyDescriptor(proto, 'value').set.call(e, v);
+}
+"""
+
+# Payment methods chosen with a button per method. On swantradecapital.com the deposit form holds
+# only the amount and an empty hidden payment_method; a "Select Deposit Method" table outside the
+# form has a "Deposit" button per method (onclick="checkpamethd('1')") that fetches the method and
+# writes it into the hidden field, and the site refuses the form while it is empty ("Please choose
+# a payment method by clicking on it"). securenovatrade.com has the same template with the "Select"
+# buttons inside the form, so buttons inside the form count too, except its submit button. Menus
+# are left out, the buttons must be labelled like a choice, and when several groups qualify the
+# largest group of buttons that call the same onclick function (or share a label) wins. Each gets
+# the label of its table row or card, and the row text for the amount range ("Min: $50.00").
 METHOD_BUTTONS_JS = r"""
 function methodButtons(form) {
   const clean = s => (s || '').replace(/\s+/g, ' ').trim();
   const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
   const LABEL = /^(deposit|deposit now|select|choose|pay|pay now|use|use this|proceed|continue|fund)$/i;
   const cands = Array.from(document.querySelectorAll('button, a, [role=button], input[type=button]')).filter(b =>
-      vis(b) && !(form && form.contains(b)) && LABEL.test(clean(b.innerText || b.value))
+      vis(b) && !(form && form.contains(b) && (b.type || '').toLowerCase() === 'submit') && LABEL.test(clean(b.innerText || b.value))
       && !b.closest('nav, header, aside, footer, [class*=sidebar], [class*=menu], [class*=navbar]'));
   const groups = {};
   cands.forEach(b => {
@@ -1319,8 +1369,8 @@ function methodButtons(form) {
 """
 
 # Clicks method button number arguments[1] (in methodButtons() order) on the reloaded page.
-METHOD_CLICK_JS = METHOD_BUTTONS_JS + r"""
-const f = document.forms[arguments[0]];
+METHOD_CLICK_JS = DEPOSIT_HELPERS_JS + METHOD_BUTTONS_JS + r"""
+const f = formAt(arguments[0]);
 const b = methodButtons(f)[parseInt(arguments[1])];
 if (!b) return {error: 'method button ' + arguments[1] + ' is not on the reloaded page'};
 window.alert = () => {}; window.confirm = () => true;
@@ -1329,14 +1379,15 @@ return {label: b.label};
 """
 
 # The value of the form's field arguments[1], which the method button should have filled.
-FIELD_VALUE_JS = r"""
-const f = document.forms[arguments[0]];
-const e = f && f.elements[arguments[1]];
+FIELD_VALUE_JS = DEPOSIT_HELPERS_JS + r"""
+const f = formAt(arguments[0]);
+if (!f) return null;
+const els = controlsOf(f);
+const e = els.find(x => keyOf(x, els) === arguments[1]);
 return e ? e.value : null;
 """
 
-DEPOSIT_FORM_JS = METHOD_BUTTONS_JS + r"""
-const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+DEPOSIT_FORM_JS = DEPOSIT_HELPERS_JS + METHOD_BUTTONS_JS + r"""
 const PLACEHOLDER = /^(select|choose|please|--|-)/i;
 const PLANLIKE = /%|\bdaily\b|\bhours?\b|\bdays?\b|\bweeks?\b|\bprofit|\bmin(imum)?\b|\bmax(imum)?\b|\bplan\b|\bpackage\b|\blevel\b/i;
 const PLANNAME = /h_id|plan|package|scheme|tariff|level/i;
@@ -1345,7 +1396,7 @@ const AMOUNTNAME = /amount|sum/i;
 function range(s) {
   const m = (s || '').match(/\$?\s?([\d,]+(?:\.\d+)?)\s*(?:-|–|to)\s*\$?\s?([\d,]+(?:\.\d+)?)/i);
   if (m) return [parseFloat(m[1].replace(/,/g, '')), parseFloat(m[2].replace(/,/g, ''))];
-  const n = (s || '').match(/min(?:imum)?[^0-9$]{0,15}\$?\s?([\d,]+(?:\.\d+)?)/i);
+  const n = (s || '').match(/\bmin(?:imum)?\b[^0-9$]{0,15}\$?\s?([\d,]+(?:\.\d+)?)/i);
   return n ? [parseFloat(n[1].replace(/,/g, '')), null] : null;
 }
 function radioText(r) {
@@ -1366,20 +1417,21 @@ function radioText(r) {
   const box = r.closest('table, .card, .plan, .package, div');
   return [label.slice(0, 160), clean(box ? box.innerText || box.textContent : '').slice(0, 400)];
 }
-const described = Array.from(document.forms).map((f, index) => {
-  const els = Array.from(f.elements);
+// index -1 describes the deposit box of a page without a deposit form (see DEPOSIT_HELPERS_JS);
+// there a visible number input counts as the amount field even without a telling name.
+function describe(f, index) {
+  const els = controlsOf(f);
   const amount = els.find(e => e.tagName === 'INPUT'
       && ['text', 'number', 'tel', ''].includes((e.getAttribute('type') || '').toLowerCase())
-      && AMOUNTNAME.test([e.name, e.id, e.placeholder].join(' ')));
-  // Fields are keyed by name, or by id when they have none: digital4xtrade.com's crypto deposit
-  // form is <input id="cryptoAmount"> and <select id="cryptoMethod"> without names, read by its
-  // own script, so the form used to look like it had no amount field and no choices.
+      && (AMOUNTNAME.test([e.name, e.id, e.placeholder].join(' ')) || (index < 0 && e.type === 'number' && vis(e))));
+  // Fields are keyed by name, or by id when they have none (digital4xtrade.com's crypto deposit
+  // form is <input id="cryptoAmount"> and <select id="cryptoMethod">), else by position.
   const controls = [];
-  els.filter(e => e.tagName === 'SELECT' && !e.disabled && (e.name || e.id)).forEach(s => {
+  els.filter(e => e.tagName === 'SELECT' && !e.disabled).forEach(s => {
     const options = Array.from(s.options)
       .filter(o => !o.disabled && o.value !== '' && !PLACEHOLDER.test(clean(o.text)))
       .map(o => ({value: o.value, label: clean(o.text).slice(0, 80), range: range(o.text)}));
-    controls.push({kind: 'select', name: s.name || s.id, options});
+    controls.push({kind: 'select', name: keyOf(s, els), options});
   });
   const groups = {};
   els.filter(e => e.type === 'radio' && !e.disabled && e.name && e.value !== '').forEach(r => {
@@ -1393,20 +1445,26 @@ const described = Array.from(document.forms).map((f, index) => {
   });
   const submit = els.some(e => (e.tagName === 'BUTTON' && (e.getAttribute('type') || 'submit').toLowerCase() === 'submit')
       || (e.tagName === 'INPUT' && ['submit', 'image'].includes(e.type)));
-  return {index, name: f.getAttribute('name') || f.id || '', amount: amount ? (amount.name || amount.id || null) : null,
-          controls: controls.filter(c => c.options.length), submit};
-});
+  return {index, name: index < 0 ? 'deposit box without a form' : (f.getAttribute('name') || f.id || ''),
+          amount: amount ? keyOf(amount, els) : null, controls: controls.filter(c => c.options.length), submit};
+}
+const described = Array.from(document.forms).map((f, index) => describe(f, index));
 const byControls = (a, b) => b.controls.length - a.controls.length;
-const form = described.filter(d => d.amount).sort(byControls)[0]
-          || described.filter(d => d.controls.length && d.submit).sort(byControls)[0];
+let form = described.filter(d => d.amount).sort(byControls)[0]
+        || described.filter(d => d.controls.length && d.submit).sort(byControls)[0];
+if (!form) {
+  const box = depositBox();
+  const d = box ? describe(box, -1) : null;
+  if (d && d.amount && d.controls.length) form = d;
+}
 if (!form) return {forms: described.length};
 const plan = form.controls.find(c => c.plan) || null;
 const rest = form.controls.filter(c => c !== plan);
 let payment = rest.find(c => PAYNAME.test(c.name)) || rest.sort((a, b) => b.options.length - a.options.length)[0] || null;
 if (!payment) {
-  // No radio or dropdown for the payment: an empty hidden payment field filled by buttons outside the form.
-  const f = document.forms[form.index];
-  const hidden = Array.from(f.elements).find(e => e.type === 'hidden' && !e.value && (e.name || e.id)
+  // No radio or dropdown for the payment: an empty hidden payment field filled by method buttons.
+  const f = formAt(form.index);
+  const hidden = controlsOf(f).find(e => e.type === 'hidden' && !e.value && (e.name || e.id)
       && PAYNAME.test(e.name || e.id) && !/token|csrf/i.test(e.name || e.id));
   const buttons = hidden ? methodButtons(f) : [];
   if (buttons.length) {
@@ -1420,20 +1478,20 @@ return {forms: described.length, form, plan, payment};
 # Sets the plan, the amount and one payment option on the reloaded page, and returns what the
 # form holds afterwards. The plan goes first because some sites refill the amount when the plan
 # changes; that amount is kept when it lies inside the plan's range.
-DEPOSIT_FILL_JS = r"""
+DEPOSIT_FILL_JS = DEPOSIT_HELPERS_JS + r"""
 const [index, plan, payment, amountName, range] = arguments;
-const f = document.forms[index];
+const f = formAt(index);
 if (!f) return {error: 'the deposit form is not on the reloaded page'};
 // The crawler's alert/confirm override (handle_alert) only covered the first page; a
 // "Are you sure?" confirm() on submit would otherwise block the pass.
 window.alert = () => {}; window.confirm = () => true;
-const els = Array.from(f.elements);
+const els = controlsOf(f);
 function set(c) {
   if (!c) return null;
   if (c.kind === 'select') {
-    const s = els.find(e => e.tagName === 'SELECT' && (e.name || e.id) === c.name);
+    const s = els.find(e => e.tagName === 'SELECT' && keyOf(e, els) === c.name);
     if (!s) return 'missing';
-    s.value = c.value;
+    setValue(s, c.value);
     Array.from(s.options).forEach(o => { o.selected = o.value === c.value; });
     ['input', 'change'].forEach(t => s.dispatchEvent(new Event(t, {bubbles: true})));
     if (window.jQuery) { try { window.jQuery(s).trigger('change'); } catch (e) {} }
@@ -1447,12 +1505,12 @@ function set(c) {
   return now ? now.value : '';
 }
 const state = {plan: set(plan)};
-const a = amountName ? els.find(e => (e.name || e.id) === amountName) : null;
+const a = amountName ? els.find(e => keyOf(e, els) === amountName) : null;
 if (a) {
   const [min, max] = range || [null, null];
   let v = parseFloat((a.value || '').replace(/[^\d.]/g, ''));
   if (!(v > 0) || (min && v < min) || (max && v > max)) v = min || 100;
-  a.value = String(v);
+  setValue(a, String(v));
   ['input', 'change', 'keyup', 'blur'].forEach(t => a.dispatchEvent(new Event(t, {bubbles: true})));
   state.amount = a.value;
 }
@@ -1461,24 +1519,34 @@ return state;
 """
 
 # Clicks the form's own submit button (or submits the form) once this script has returned, so
-# the navigation does not cut the WebDriver call short.
-DEPOSIT_SUBMIT_JS = r"""
-const f = document.forms[arguments[0]];
-const b = Array.from(f.elements).find(e => (e.tagName === 'BUTTON' && (e.getAttribute('type') || 'submit').toLowerCase() === 'submit')
-    || (e.tagName === 'INPUT' && ['submit', 'image'].includes(e.type)));
-setTimeout(() => { if (b) b.click(); else if (f.requestSubmit) f.requestSubmit(); else f.submit(); }, 0);
+# the navigation does not cut the WebDriver call short. A deposit box without a form has no
+# submit; its deposit-like button is clicked.
+DEPOSIT_SUBMIT_JS = DEPOSIT_HELPERS_JS + r"""
+const f = formAt(arguments[0]);
+const els = controlsOf(f);
+const b = els.find(e => (e.tagName === 'BUTTON' && (e.getAttribute('type') || 'submit').toLowerCase() === 'submit')
+    || (e.tagName === 'INPUT' && ['submit', 'image'].includes(e.type)))
+  || els.find(e => (e.tagName === 'BUTTON' || e.type === 'button') && BOX_BUTTON.test(clean(e.innerText || e.value)));
+setTimeout(() => { if (b) b.click(); else if (f.requestSubmit) f.requestSubmit(); else if (f.submit) f.submit(); }, 0);
 return b ? 'button ' + JSON.stringify((b.innerText || b.value || '').trim().slice(0, 30)) : 'form.submit()';
 """
 
 # Whether the page after a submit is the deposit form again (a visible amount field), and any
 # error or alert text it shows. The confirmation page also carries amount/type, but as hidden fields.
-DEPOSIT_RESULT_JS = r"""
-const amountName = arguments[0];
-const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
-const back = !!amountName && Array.from(document.forms).some(f => {
-  const a = f.elements[amountName];
-  return a && a.tagName === 'INPUT' && a.type !== 'hidden' && vis(a);
-});
+DEPOSIT_RESULT_JS = DEPOSIT_HELPERS_JS + r"""
+const [amountName, index] = arguments;
+let back = false;
+if (amountName && index >= 0) {
+  back = Array.from(document.forms).some(f => {
+    const a = f.elements[amountName];
+    return a && a.tagName === 'INPUT' && a.type !== 'hidden' && vis(a);
+  });
+} else if (amountName) {
+  const box = depositBox();
+  const els = box ? controlsOf(box) : [];
+  const a = els.find(e => keyOf(e, els) === amountName);
+  back = !!a && vis(a);
+}
 const messages = Array.from(document.querySelectorAll('.error, .alert, .alert-danger, .text-danger, .invalid-feedback, [role=alert]'))
   .filter(vis).map(e => (e.innerText || '').replace(/\s+/g, ' ').trim()).filter(t => t && t.length < 200);
 return {back, messages: Array.from(new Set(messages)).slice(0, 3)};
@@ -1611,7 +1679,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                 passes += 1
                 found_wallets = wallet_like(driver.page_source)
                 wallets.update(found_wallets)
-                result = driver.execute_script(DEPOSIT_RESULT_JS, form['amount'])
+                result = driver.execute_script(DEPOSIT_RESULT_JS, form['amount'], form['index'])
                 logging.info(
                     f"Deposit pass {counter} on {href}: payment {option['label'] if option else 'site default'!r}"
                     f"{' (' + option['value'] + ')' if option else ''}; submitted with {state} via {how}; "
