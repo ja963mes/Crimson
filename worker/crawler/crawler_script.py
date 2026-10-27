@@ -279,6 +279,8 @@ def predict_values(form):
         input_name = input_tag.get_attribute('name')
         input_type = input_tag.get_attribute('type')
         if input_name:
+            if is_optional_referral_field(input_tag):
+                continue  # left empty; see REFERRAL_FIELD_RE
             if "username" in input_name.lower():
                 predictions[input_name] = predicted_username
             elif input_type.lower() == "password":
@@ -292,6 +294,15 @@ def predict_values(form):
             else:
                 predictions[input_name] = generate_random_string()
     return predictions
+
+# Optional referral-type fields stay empty. A made-up value is checked against real codes:
+# beacondigital.ltd answered POST /api/register with 422 "The selected referral code is invalid."
+# because "referralCode" got a name from names.txt. A required one still gets a value.
+REFERRAL_FIELD_RE = re.compile(r"refer|ref_?by|ref_?code|^ref$|promo|invite|invitation|sponsor|coupon|voucher|upline", re.I)
+
+def is_optional_referral_field(input_tag):
+    hints = ' '.join((input_tag.get_attribute(a) or '') for a in ('name', 'id', 'placeholder'))
+    return bool(REFERRAL_FIELD_RE.search(hints)) and not input_tag.get_attribute('required')
 
 # Phone fields used to get a name from names.txt, which forms with phone
 # validation refuse (swifttradinginc.live: name="phone", type="tel").
@@ -329,7 +340,11 @@ def pick_signup_form(driver):
                        if e.get_attribute('type') != 'hidden' and e.is_displayed()]
             passwords = [e for e in visible if e.get_attribute('type') == 'password']
             if not passwords:
-                continue
+                # A multi-step form shows its password fields only after "Next"
+                # (account.securenovatrade.com/register: step 1 is username, name, email, phone).
+                if not (visible and form.find_elements(By.CSS_SELECTOR, 'input[type="password"]') and next_step_buttons(form)):
+                    continue
+                passwords = form.find_elements(By.CSS_SELECTOR, 'input[type="password"]')
             words = ' '.join((form.get_attribute(a) or '') for a in ('action', 'id', 'class', 'name')).lower()
             words += ' ' + ' '.join(b.text.lower() for b in form.find_elements(By.CSS_SELECTOR, 'button,input[type="submit"]'))
             signup_word = any(k in words for k in ('register', 'signup', 'sign-up', 'sign up', 'create', 'join'))
@@ -344,11 +359,43 @@ def pick_signup_form(driver):
             continue
     return best
 
+# Multi-step sign-up forms: visible buttons that move to the next step. Submit buttons are left
+# out so this never sends the form early.
+NEXT_STEP_RE = re.compile(r"^\s*(next|continue|next step|proceed)\b", re.I)
+
+def next_step_buttons(form):
+    return [b for b in form.find_elements(By.CSS_SELECTOR, 'button, input[type="button"], [role="button"]')
+            if (b.get_attribute('type') or '').lower() != 'submit' and b.is_displayed()
+            and NEXT_STEP_RE.match(b.text or b.get_attribute('value') or '')]
+
+def advance_form_steps(driver, form, predictions, max_steps=3):
+    """While the chosen form still hides its password fields or its submit button, click its
+    Next button and fill the fields the new step shows. securenovatrade.com has three steps:
+    contact details, passwords, then country and the submit button."""
+    for step in range(2, max_steps + 2):
+        hidden_passwords = [e for e in form.find_elements(By.CSS_SELECTOR, 'input[type="password"]') if not e.is_displayed()]
+        submit_shown = any(b.is_displayed() for b in form.find_elements(By.CSS_SELECTOR, 'button[type="submit"], input[type="submit"]'))
+        if not hidden_passwords and (submit_shown or not next_step_buttons(form)):
+            return
+        buttons = next_step_buttons(form)
+        if not buttons:
+            logging.info("Multi-step sign-up form: password fields still hidden and no Next button")
+            return
+        label = (buttons[0].text or buttons[0].get_attribute('value') or '').strip()
+        driver.execute_script("arguments[0].click();", buttons[0])
+        logging.info(f"Multi-step sign-up form: clicked {label!r} for step {step}")
+        time.sleep(1.5)
+        fill_form(form, predictions, only_empty=True)
+        handle_dropdowns(form, driver)
+
 # Fill form. Fields are looked up inside the chosen form; a page-wide lookup by name found
-# the hidden login form's "email" and "password" first on pages with two forms.
-def fill_form(form, predictions):
+# the hidden login form's "email" and "password" first on pages with two forms. only_empty is
+# for later steps of a multi-step form, so fields filled in an earlier step are not typed twice.
+def fill_form(form, predictions, only_empty=False):
     for input_name, prediction in predictions.items():
         input_field = form.find_element(By.NAME, input_name)
+        if only_empty and (not input_field.is_displayed() or (input_field.get_attribute('value') or '')):
+            continue
         try:
             if input_field.is_displayed() and input_field.is_enabled() and (input_field.get_attribute('type') or '').lower() in DATE_INPUT_FORMATS:
                 driver.execute_script("arguments[0].value = arguments[1];"
@@ -641,6 +688,7 @@ def fill_sign_up_form(driver, start_url):
 
                         handle_dropdowns(form, driver)
                         time.sleep(1)
+                        advance_form_steps(driver, form, predictions)
 
                         if not should_continue:
                             return False
@@ -918,7 +966,11 @@ def crawl_if_already_logged_in(driver, where):
 #Validate links to avoid clicking on logout/signout buttons
 # Language switchers lead back to the same page in another language; on swantradecapital.com
 # 16 of the login search's 25 pages were /locale/fr, /locale/es, ...
-LANGUAGE_LINK_RE = re.compile(r"/(locale|lang|language)/[a-z]{2}([_-][a-z]{2})?/?$|[?&](lang|locale|hl|language)=", re.I)
+# Bare language paths too (aziminer.com/de, /it, /es, /fr), by known language code only, so a
+# two-letter page such as /fx is still followed.
+LANGUAGE_LINK_RE = re.compile(r"/(locale|lang|language)/[a-z]{2}([_-][a-z]{2})?/?$|[?&](lang|locale|hl|language)="
+                              r"|^https?://[^/]+/(en|de|fr|es|it|pt|ru|ar|zh|ja|ko|tr|nl|pl|hi|id|vi|th|fa|ur|bn|sv|no|da|fi"
+                              r"|cs|sk|ro|hu|el|bg|uk|he|ms|tl|sw)([_-][a-z]{2})?/?$", re.I)
 
 def validate_link(href, processed_links, base_domain):
     return (href is not None and href not in processed_links and "logout" not in href.lower() and "signout" not in href.lower()
@@ -1040,16 +1092,26 @@ def process_link(driver, href, directory_name, original_window):
 # the log: iocs_searcher.sh still does the real extraction. Script and style blocks are
 # dropped first so tokens inside them are not reported.
 # addr1... is a Cardano (Shelley) address, as on swantradecapital.com's Cardano payment page.
+# XRP (r...) and Dogecoin (D...) as on digital4xtrade.com, whose deposit passes showed
+# rJn2zAPdFA193sixJwuFixRkYDUtx3apQh and DDHZqHFipkxPXxTS8MryJNfrUjeQNh9jCD that the log missed.
+# Solana's bare base58 is left out: it cannot be told apart from other long tokens.
 WALLET_LIKE_RE = re.compile(r"\b(bc1[02-9ac-hj-np-z]{25,60}|[13][1-9A-HJ-NP-Za-km-z]{25,34}|0x[0-9a-fA-F]{40}|T[1-9A-HJ-NP-Za-km-z]{33}"
-                            r"|addr1[02-9ac-hj-np-z]{50,110})\b")
+                            r"|addr1[02-9ac-hj-np-z]{50,110}|r[1-9A-HJ-NP-Za-km-z]{24,34}|D[5-9A-HJ-NP-U][1-9A-HJ-NP-Za-km-z]{32})\b")
 
 # Hidden inputs are dropped too, and all-hex strings are skipped: bitvestwise.net's hidden
 # form_token 388d8db1cc6a514b9dafc5a8bb51c484 (an MD5) fits the legacy Bitcoin pattern.
 def wallet_like(html_content):
     visible = re.sub(r"<(script|style)\b.*?</\1>", " ", html_content, flags=re.S | re.I)
     visible = re.sub(r"<input\b[^>]*\btype=[\"']?hidden\b[^>]*>", " ", visible, flags=re.I)
+    # Embedded data: URIs (base64 images) hold random letter runs; opextrade.com's pages gave
+    # "rH1t9WP7Y1JjsfP9nnuHTUS9MxAAA" and similar r... strings out of them.
+    visible = re.sub(r"data:[\w.+-]+/[\w.+-]+;base64,[A-Za-z0-9+/=]+", " ", visible)
+    # An r.../D... match must mix digits, upper and lower case, as real addresses do, so long
+    # lower-case words starting with r are not taken for XRP addresses.
+    mixed = lambda w: re.search(r"\d", w) and re.search(r"[A-Z]", w) and re.search(r"[a-z]", w)
     return sorted({w for w in WALLET_LIKE_RE.findall(visible)
-                   if w.startswith('0x') or not re.fullmatch(r"[0-9a-fA-F]+", w)})
+                   if (w.startswith('0x') or not re.fullmatch(r"[0-9a-fA-F]+", w))
+                   and (w[0] not in 'rD' or mixed(w))})
 
 def process_links(driver, links, processed_links, base_domain, directory_name, original_window, max_links=25):
     if len(processed_links) >= max_links:
@@ -1438,7 +1500,15 @@ return Array.from(document.querySelectorAll('a[href]')).map(a => a.href.split('#
 });
 """
 
+# Deposit pages already run through the deposit step for the current site. aziminer.com's
+# /deposits/create was run twice: once as a link from /deposits, once as a dashboard link.
+deposit_pages_opened = set()
+
 def process_deposit_page(driver, href, directory_name, original_window, depth=0):
+    if href in deposit_pages_opened:
+        logging.info(f"Deposit page {href}: already run for this site, skipped")
+        return
+    deposit_pages_opened.add(href)
     safe_href = windows_safe(href.replace('://', '_').replace('/', '_').replace('?', '_'))
 
     def capture(counter):
@@ -1571,6 +1641,7 @@ def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=300):
     form_filled = False
     logged_in = False
     email_used = None  # else a previous site's address leaked into this site's result
+    deposit_pages_opened.clear()
 
     def target():
         global form_filled
@@ -1583,7 +1654,9 @@ def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=300):
         logging.warning(f"Timeout exceeded for {url}")
         should_continue = False
         thread.join()
-        return False
+        # The account's address, not False: digital4xtrade.com ran past the limit after logging in
+        # and the result line read "Success: ... (logged in as False)".
+        return email_used
     return email_used if form_filled else None
 
 # Find login URL with a single password field
