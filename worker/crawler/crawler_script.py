@@ -49,8 +49,8 @@ CRAWLED_URLS_FILE = os.path.join(HERE, 'crawled_urls.txt')   # single-URL resume
 # Mailinator email-confirmation is optional; set these env vars to enable it.
 # On the Crimson VMs they come from ~/.crimson_env.systemd via the unit's
 # EnvironmentFile, so the API token never lives in this file or the repo.
-EMAIL_DOMAIN = os.environ.get('MAILINATOR_DOMAIN', 'your-email-domain.com')
-MAILINATOR_API_KEY = os.environ.get('MAILINATOR_API_KEY', 'YOUR_API_KEY')
+EMAIL_DOMAIN = "<MAILINATOR_DOMAIN>"
+MAILINATOR_API_KEY =  "<MAILINATOR_API_KEY>"
 # "private" addresses the account's private domain (EMAIL_DOMAIN) in the v2 API.
 MAILINATOR_API = 'https://api.mailinator.com/api/v2/domains/private'
 MAILINATOR_WAIT_SECONDS = 60   # how long to poll the sign-up inbox for a confirmation email
