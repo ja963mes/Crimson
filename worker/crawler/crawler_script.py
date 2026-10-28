@@ -49,8 +49,8 @@ CRAWLED_URLS_FILE = os.path.join(HERE, 'crawled_urls.txt')   # single-URL resume
 # Mailinator email-confirmation is optional; set these env vars to enable it.
 # On the Crimson VMs they come from ~/.crimson_env.systemd via the unit's
 # EnvironmentFile, so the API token never lives in this file or the repo.
-EMAIL_DOMAIN = "<MAILINATOR_DOMAIN>"
-MAILINATOR_API_KEY =  "<MAILINATOR_API_KEY>" 
+EMAIL_DOMAIN = os.environ.get('MAILINATOR_DOMAIN', 'your-email-domain.com')
+MAILINATOR_API_KEY = os.environ.get('MAILINATOR_API_KEY', 'YOUR_API_KEY')
 # "private" addresses the account's private domain (EMAIL_DOMAIN) in the v2 API.
 MAILINATOR_API = 'https://api.mailinator.com/api/v2/domains/private'
 MAILINATOR_WAIT_SECONDS = 60   # how long to poll the sign-up inbox for a confirmation email
@@ -479,10 +479,21 @@ def signup_box(driver):
 # out so this never sends the form early.
 NEXT_STEP_RE = re.compile(r"^\s*(next|continue|next step|proceed)\b", re.I)
 
+# In a box without a <form> (signup_box) a button with no type attribute submits nothing, so it can
+# be a step button: aegisinvestmentgroup.com's "Continue" has no type, Selenium reports the default
+# "submit" for it, and it was skipped. Only an explicit type="submit" is left out there.
 def next_step_buttons(form):
+    is_box = form.tag_name.lower() != 'form'
+    def submits(b):
+        return ((b.get_dom_attribute('type') or '').lower() == 'submit') if is_box else ((b.get_attribute('type') or '').lower() == 'submit')
     return [b for b in form_controls(form, 'button, input[type="button"]') + form.find_elements(By.CSS_SELECTOR, '[role="button"]')
-            if (b.get_attribute('type') or '').lower() != 'submit' and b.is_displayed()
+            if not submits(b) and b.is_displayed()
             and NEXT_STEP_RE.match(b.text or b.get_attribute('value') or '')]
+
+# A hidden password field of a login form in the same box (aegisinvestmentgroup.com's #loginPassword)
+# is not a sign-up step still to come.
+def is_login_field(e):
+    return bool(re.search(r"log-?in|sign-?in", ' '.join((e.get_attribute(a) or '') for a in ('name', 'id')), re.I))
 
 def advance_form_steps(driver, form, predictions, max_steps=3):
     """While the chosen form still hides its password fields or its submit button, click its
@@ -490,7 +501,7 @@ def advance_form_steps(driver, form, predictions, max_steps=3):
     contact details, passwords, then country and the submit button. Returns the steps clicked."""
     clicked = 0
     for step in range(2, max_steps + 2):
-        hidden_passwords = [e for e in form_controls(form, 'input[type="password"]') if not e.is_displayed()]
+        hidden_passwords = [e for e in form_controls(form, 'input[type="password"]') if not e.is_displayed() and not is_login_field(e)]
         submit_shown = any(b.is_displayed() for b in form_controls(form, 'button[type="submit"], input[type="submit"]'))
         if not hidden_passwords and (submit_shown or not next_step_buttons(form)):
             return clicked
@@ -1089,12 +1100,7 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
         password_input.send_keys(predicted_password)
 
         before_submit = page_state(driver)
-        try:
-            submit_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit'],input[type='submit']")))
-            submit_button.click()
-        except TimeoutException:
-            submit_button = driver.find_element(By.CSS_SELECTOR, "form button, form input[type='button']")
-            driver.execute_script("arguments[0].click();", submit_button)
+        click_login_submit(driver, password_input)
 
         # Judged from the page, not from a URL change: a failed login that redirects to
         # ?a=login&say=invalid_login changes the URL too.
@@ -1118,6 +1124,74 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
     finally:
         if original_window and original_window in driver.window_handles:
             driver.switch_to.window(original_window)
+
+# The login form's own send button: a submit button, or one without a type, of the form that holds
+# the password field. duduinvest.com's "Log in" has no type attribute; the old search for
+# button[type=submit] found none and fell back to the first button in a form, the "Show password"
+# toggle, so the login was never sent.
+def click_login_submit(driver, password_input):
+    login_form = driver.execute_script("return arguments[0].form;", password_input)
+    if login_form is not None:
+        own = [b for b in form_controls(login_form, 'button[type="submit"], input[type="submit"], button:not([type])')
+               if b.is_displayed() and b.is_enabled()]
+        if own:
+            driver.execute_script("arguments[0].click();", own[0])
+            return
+    try:
+        submit_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit'],input[type='submit']")))
+        submit_button.click()
+    except TimeoutException:
+        submit_button = driver.find_element(By.CSS_SELECTOR, "form button, form input[type='button']")
+        driver.execute_script("arguments[0].click();", submit_button)
+
+# Session lost during the crawl. fxtastytrades.com logged the crawler out between deposit pass 5
+# and 6 (the cause is not visible); passes 6-8 and all 26 pages saved afterwards were its "Sign In"
+# page. A page that shows a password field and no Logout link, on a login URL or titled like a
+# login page, means the session is gone: log in again on that page with the account's address and
+# password (up to MAX_RELOGINS times per site), else stop saving pages for the site.
+MAX_RELOGINS = 2
+relogins_done = 0
+session_lost = False
+
+def looks_logged_out(driver):
+    state = page_state(driver)
+    return (state["passwords"] >= 1 and not state["logout"]
+            and bool(LOGIN_URL_RE.search(state["url"]) or re.search(r"sign ?in|log ?in", driver.title or "", re.I)))
+
+def relogin_here(driver):
+    """Log in again on the login page the browser is showing. True when it worked."""
+    global relogins_done, session_lost
+    if session_lost or relogins_done >= MAX_RELOGINS or not email_used:
+        session_lost = True
+        return False
+    relogins_done += 1
+    logging.info(f"Session lost (now at {driver.current_url}); logging in again as {email_used} (attempt {relogins_done})")
+    try:
+        passwords = [e for e in driver.find_elements(By.CSS_SELECTOR, 'input[type="password"]') if e.is_displayed()]
+        login_form = driver.execute_script("return arguments[0].form;", passwords[0])
+        boxes = [e for e in (form_controls(login_form, 'input[type="email"], input[type="text"], input:not([type])') if login_form is not None
+                             else driver.find_elements(By.CSS_SELECTOR, 'input[type="email"], input[type="text"]')) if e.is_displayed()]
+        if boxes:
+            box = boxes[0]
+            email_box = re.search(r"mail", ' '.join((box.get_attribute(a) or '') for a in ('name', 'id', 'placeholder', 'autocomplete')), re.I)
+            user_box = re.search(r"user", ' '.join((box.get_attribute(a) or '') for a in ('name', 'id')), re.I)
+            box.clear()
+            box.send_keys(re.sub(r'\d+', '', email_used).replace(f"@{EMAIL_DOMAIN}", "")
+                          if box.get_attribute('type') == 'text' and (user_box or not email_box) else email_used)
+        passwords[0].clear()
+        passwords[0].send_keys(password_used)
+        before = page_state(driver)
+        click_login_submit(driver, passwords[0])
+        outcome, evidence = assess_login(before, wait_for_outcome(driver, before))
+        logging.info(f"Logging in again: {outcome} - {evidence}")
+        if outcome == "failed":
+            session_lost = True
+            return False
+        return True
+    except Exception as e:
+        logging.info(f"Logging in again failed: {e}")
+        session_lost = True
+        return False
 
 # Save and crawl the site from the current, logged-in page. The folder is named after
 # folder_url: the login page, or the page that was already logged in when no login was needed.
@@ -1254,10 +1328,21 @@ def page_links(driver):
 # from the post-login page the crawler had switched back to, so it never went deeper than the
 # first layer: swifttradinginc.live's /plans page and its Invest links were never looked at.
 def process_link(driver, href, directory_name, original_window):
+    if session_lost:
+        return [], []  # logged out and could not log in again: the pages would all be the login page
     driver.execute_script("window.open(arguments[0]);", href)
     driver.switch_to.window(driver.window_handles[-1])
     WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
     time.sleep(3)
+    if looks_logged_out(driver) and not SESSION_END_RE.search(href) and not LOGIN_URL_RE.search(href):
+        if not relogin_here(driver):
+            logging.info(f"Not saving {href}: the session is lost; no further pages are saved for this site")
+            driver.close()
+            driver.switch_to.window(original_window)
+            return [], []
+        driver.get(href)
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+        time.sleep(3)
     dismiss_blocking_popups(driver)
 
     html_content = driver.page_source
@@ -1711,7 +1796,9 @@ let form = described.filter(d => d.amount).sort(byControls)[0]
 if (!form) {
   const box = depositBox();
   const d = box ? describe(box, -1) : null;
-  if (d && d.amount && d.controls.length) form = d;
+  // An amount and a send button are enough: aiblockchainmining.com's "New Investment" dialog has a
+  // disabled "Cryptocurrency" select (fixed BTC per plan), so it had no choice control and was refused.
+  if (d && d.amount && (d.controls.length || d.submit)) form = d;
 }
 if (!form) return {forms: described.length};
 const plan = form.controls.find(c => c.plan) || null;
@@ -1905,6 +1992,14 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                 if counter > 1:
                     driver.get(href)
                     wait_for_page()
+                    # The reloaded deposit page can be the login page (fxtastytrades.com after pass 5);
+                    # submitting it as a deposit form clicked its "Access Dashboard" login button.
+                    if looks_logged_out(driver):
+                        if not relogin_here(driver):
+                            logging.info(f"Deposit page {href}: the session is lost, stopping the passes")
+                            break
+                        driver.get(href)
+                        wait_for_page()
                 by_button = bool(payment) and payment['kind'] == 'button'
                 if by_button:
                     clicked = driver.execute_script(METHOD_CLICK_JS, form['index'], option['value'])
@@ -1960,12 +2055,13 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
 
 # Sign-up form with timeout
 def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=300):
-    global should_continue, form_filled, logged_in, email_used, password_used
+    global should_continue, form_filled, logged_in, email_used, password_used, relogins_done, session_lost
     should_continue = True
     form_filled = False
     logged_in = False
     email_used = None  # else a previous site's address leaked into this site's result
     password_used = ACCOUNT_PASSWORD
+    relogins_done, session_lost = 0, False
     deposit_pages_opened.clear()
 
     def target():

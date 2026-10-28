@@ -959,9 +959,15 @@ def mkdirs():
     if SYSNO not in os.listdir('logs/'):
         ensure_directory_exists(f"logs/{SYSNO}")
 
+class WorkerTimeout(BaseException):
+    """The 300s per-domain alarm. A BaseException, like KeyboardInterrupt, so no
+    'except Exception' can swallow it. It used to be a TimeoutError, which since
+    Python 3.10 is also socket.timeout: urllib3 caught it mid-read as a socket
+    timeout, and screenshots ran up to 933s on VM2 with no Worker_Timeout (Oct 27)."""
+
 def main():
     def timeout_handler(signum, frame):
-        raise TimeoutError("Function execution timed out")
+        raise WorkerTimeout("Function execution timed out")
     def callback(ch, method, properties, body):
         global visited_cache
         url_name = body.decode('utf-8')
@@ -985,7 +991,7 @@ def main():
             try:
                 result = check(url_name, curr_date)
                 sys.stdout.flush()
-            except TimeoutError as e:
+            except (WorkerTimeout, TimeoutError) as e:
                 log(f"{url_name},[x] Timeout occurred,{e}", curr_date, 'errors.txt', 'a')
                 log(f"{url_name}\tWorker_Timeout", curr_date, 'needs_retry.txt', 'a')
                 result = "Timeout"
