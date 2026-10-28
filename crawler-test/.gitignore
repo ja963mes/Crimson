@@ -1,0 +1,5 @@
+# Crawl output (scam-site pages, screenshots, logs with Mailinator inboxes) stays local.
+runs/
+# Backups predate the env-var change and contain the Mailinator API key.
+*.bak*
+__pycache__/

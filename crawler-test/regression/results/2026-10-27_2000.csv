@@ -1,0 +1,5 @@
+name,url,level,wallet_count,wallets,reason,seconds
+duduinvest,https://www.duduinvest.com,LOGGED_IN,0,,no wallet-like strings on the deposit pages,52
+fxtastytrades,https://www.online.fxtastytrades.com,WALLET,1,bc1qgtwmjnqql9g4kx03u7v2d7zndths6c64fmkgvg,hit the 5-minute limit,336
+aiblockchainmining,https://aiblockchainmining.com,LOGGED_IN,0,,no wallet-like strings on the deposit pages,100
+aegisinvestmentgroup,https://aegisinvestmentgroup.com,SIGNUP_FOUND,0,,sign-up result unclear; not logged in,95

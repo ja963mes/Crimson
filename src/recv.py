@@ -4,11 +4,7 @@ from datetime import datetime, timezone, timedelta, date
 import time
 import utils.keyword_utils as kw_utils
 import utils.screenshot
-import requests
-import urllib3
-# is_domain_available() fetches with verify=False (see its docstring). Without
-# this, every scam site with a bad certificate logs an InsecureRequestWarning.
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from curl_cffi import requests as curl_requests
 import html2text
 import pytesseract
 import whois
@@ -16,6 +12,7 @@ import re
 from PIL import Image
 import signal
 import json
+import math
 import subprocess
 import socket
 import logging
@@ -39,9 +36,6 @@ os.environ['OMP_THREAD_LIMIT'] = '1'
 SYSNO = sys.argv[1]
 SCREENNO = sys.argv[2]
 newYorkTz = pytz.timezone("America/New_York")
-text_converter = html2text.HTML2Text()
-text_converter.ignore_links = True
-text_converter.ignore_images = True
 unavailable_domains = 0
 domains_checked = 0
 less_words_domains = 0
@@ -70,9 +64,12 @@ def sync(url_name, curr_date, local_file_path, remote_file_path):
     abs_key_path = "/home/ubuntu/.ssh/id_ed25519"
 
     try:
+        # --mkpath: a new instance's collected_results/data/<SYSNO>/check/ is two
+        # levels deep, and rsync otherwise creates only the last one. The timeouts
+        # stop an unreachable broker from blocking the worker (no alarm covers sync).
         subprocess.run([
-            'rsync', '-avz',
-            '-e', f'ssh -i {abs_key_path} -o StrictHostKeyChecking=no',
+            'rsync', '-avz', '--mkpath', '--timeout=60',
+            '-e', f'ssh -i {abs_key_path} -o StrictHostKeyChecking=no -o ConnectTimeout=20',
             abs_local_path,
             f'{REMOTE_USER}@{REMOTE_IP}:{abs_remote_path}'
         ], check=True, stdout=subprocess.DEVNULL)
@@ -203,18 +200,40 @@ context_words = ["deposit", "withdraw", "reward", "growth", "gain", "capital",
 # plan(s)" 43% vs 0%; daily/weekly/hourly profit, return, roi, interest or
 # earning 28% vs 0%; "N% daily/weekly/..." 20% vs 2%; "principal" 10% vs 1%;
 # "total deposits/withdrawn" 5% vs 0%. A page with one passes without an invest
-# word, and no exclusion word drops it.
+# word.
+#
+# "principal" was narrowed on Oct 8 to principal locked/returned/included: bare,
+# it matched Catalan "contingut principal" (main content) on a private bank, and
+# 3 of its 7 HYIP matches were generic ("loss of principal").
 hyip_phrases = [re.compile(p) for p in (
     r'\binvestment plans?\b',
     r'\b(daily|weekly|hourly) (profit|return|roi|interest|earning)',
     r'\d+(\.\d+)? ?% ?(daily|weekly|monthly|hourly|per day|per week|per month|a day|every day|each day|after)',
-    r'\bprincipal\b',
+    r'\bprincipal (is |will be )?(locked|returned|return|included|back)\b',
     r'\btotal (deposits?|withdrawn|withdrawals)\b',
 )]
 
+# HYIP markers (added Oct 8): min/max deposit, plan tiers, referral commission, and
+# % over a stated period. Weaker than the phrases: casinos and presales also show
+# minimum deposits, VIP plans and referral bonuses, so a marker counts only on a
+# page with no exclusion word, and it does not stand in for the invest word.
+#
+# Since Oct 8 a page needs a phrase or a marker to reach the LLM (content_filter()).
+# On the hand-labelled pages that pass the rest of the filter, llama3.2:3b could not
+# tell HYIPs from look-alikes under any prompt tried (AUC 0.39-0.49, eval_prompt.py),
+# while these could: with the exclusion words, they pass 44 of the 67 labelled
+# HYIPs and 4 of the 87 non-HYIPs, against 66 and 35 when neither was required.
+hyip_markers = [re.compile(p) for p in (
+    r'(min(imum)?\.? ?(deposit|investment|invest)|max(imum)?\.? ?(deposit|investment))',
+    r'\b(basic|starter|silver|gold|premium|vip|diamond|platinum) plan\b',
+    r'\breferral (commission|bonus|program)',
+    r'\d+(\.\d+)? ?% ?(per hour|roi|for \d+ days|in \d+ (hours|days))',
+)]
+
 # Exclusion words mark meme coins and presales, parked domains, QFS pages and
-# casinos. None appears on any of the 63 HYIPs; together they drop 44 of the 79
-# non-HYIPs above. Gambling words count only when two different ones appear:
+# casinos. None appears on any of the 67 labelled HYIPs, so since Oct 8 they drop
+# a page even when it has an HYIP phrase (a gambling app passed on "daily
+# earnings"). Gambling words count only when two different ones appear:
 # one HYIP describes a resort "casino" project, another says trading is not
 # "blind gambling", and HYIPs advertise "limited slots".
 exclusion_phrases = {name: re.compile(p) for name, p in (
@@ -241,6 +260,10 @@ gambling_words = {name: re.compile(p) for name, p in (
 
 def has_hyip_phrase(clean_text):
     return any(rx.search(clean_text) for rx in hyip_phrases)
+
+
+def has_hyip_marker(clean_text):
+    return any(rx.search(clean_text) for rx in hyip_markers)
 
 
 def content_exclusions(clean_text):
@@ -277,10 +300,11 @@ def table11_filter(clean_text):
 
 
 def content_filter(clean_text):
-    """True if the page should go to the LLM: it passes table11_filter() and
-    either has an HYIP phrase or has no exclusion words."""
-    return table11_filter(clean_text) and (
-        has_hyip_phrase(clean_text) or not content_exclusions(clean_text))
+    """True if the page should go to the LLM: it passes table11_filter(), has an
+    HYIP phrase or marker, and has no exclusion words."""
+    return (table11_filter(clean_text)
+            and (has_hyip_phrase(clean_text) or has_hyip_marker(clean_text))
+            and not content_exclusions(clean_text))
 
 # --- OLLAMA LOCAL EVALUATOR (primary verdict; escalates the unsure cases to OpenAI) ---
 
@@ -312,76 +336,103 @@ OLLAMA_MAX_TEXT_CHARS = 8000
 SCAM_CONFIDENCE_BAR = 80  # must match the threshold check() compares against
 OLLAMA_MIN_CONFIDENCE = SCAM_CONFIDENCE_BAR + 1
 
-# Both prompts target HYIPs only: sites that take deposits into their own
-# investment plans and promise high returns on them. Other crypto scams (drainers,
-# fake airdrops and giveaways, meme coins and presales, recovery scams) are "no",
-# like every other kind of site. "yes" / is_scam therefore means "is an HYIP".
+# Both engines use the paper's classification prompt verbatim: Appendix B of "The
+# Poorest Man in Babylon" (WWW '25), the prompt of the original Crimson run. It is
+# the baseline. Additions go in PROMPT_ADDITIONS, after it; its text and its output
+# structure ('answer' yes/no and a one-word 'reason') stay as they are.
 #
-# They merge the paper's classification prompt (Appendix B of "The Poorest Man in
-# Babylon", WWW '25) with this pipeline's needs. From the paper: "Be sure of your
-# answer", "characterized by promises of high returns", its four "respond no"
-# conditions, and the HYIP traits it describes in sections 2.3 and 3.2 (plans
-# with minimum/maximum deposits, implausible short-term returns, fake
-# certificates and reviews). Its sign-up and contact conditions are merged into
-# one, because 13 of the 63 HYIPs in the Oct 1-6 hand-labelled sample have no
-# English sign-up or login wording.
-#
-# The previous prompts asked for crypto scams of any kind. Of the 173 domains
-# confirmed Oct 1-6, 86 were hand-labelled as not HYIPs: casinos, meme coins and
-# presales, parked domains, recovery services, agencies, courses, real exchanges.
-#
-# The examples are input -> output pairs. The old prompt gave bare outputs, and
-# llama3.2:3b copied them: 525 of its 1,091 "no" verdicts were exactly
-# {"no", 90, "news"}, and 9 of its 36 "yes" verdicts were {"yes", 95, "airdrop"}.
-OLLAMA_SYSTEM_PROMPT = (
-    "You are a financial advisor who screens websites for HYIP scams. An HYIP "
-    "(high-yield investment program) is a Ponzi-style scheme: visitors open an account, "
-    "deposit money (usually cryptocurrency) into the site's investment plans, and are "
-    "promised high or guaranteed returns over short periods, such as 2% daily or 50% per "
-    "week. HYIP sites typically list plans with minimum and maximum deposits, pay referral "
-    "commissions, and show account balances, earnings and withdrawals. They often claim the "
-    "profits come from trading, mining or an AI bot. "
-    "You will be given text scraped from a website. Be sure of your answer. Determine if the "
-    "text likely originates from an HYIP scam website, characterized by promises of high "
-    "returns on money deposited with the site. "
-    'Answer "no" if the text suggests a low probability of being an HYIP, seems like a news '
-    "site, blog, review or guide, or does not invite visitors to sign up, log in, deposit or "
-    'contact the site to invest. Answer "no" for every other kind of site, including other '
-    "cryptocurrency scams: wallet drainers and seed-phrase phishing, fake airdrops and "
-    "giveaways, meme coins and token presales, fund-recovery services, casinos and betting, "
-    "domains for sale, marketing agencies, trading courses, real exchanges and banks, and "
-    "startup fundraising. "
-    'Answer "unsure" only if the text is too short, garbled or unreadable to judge. '
-    'Respond ONLY with a JSON object with exactly three keys: "answer" ("yes", "no" or '
-    '"unsure"), "confidence" (an integer 0-100 for how certain you are of the answer) and '
-    '"reason" (one word).\n'
-    "Examples:\n"
-    'Text: "Invest now for a guaranteed return of 10 percent in one month." -> '
-    '{"answer": "yes", "confidence": 95, "reason": "promises"}\n'
-    'Text: "Silver plan: 3% daily for 30 days. Minimum deposit $100, maximum $5,000. 10% '
-    'referral commission. Register to start earning." -> '
-    '{"answer": "yes", "confidence": 100, "reason": "plans"}\n'
-    'Text: "Our AI bot trades for you. Deposit from $250 and earn up to 40% per week." -> '
-    '{"answer": "yes", "confidence": 90, "reason": "returns"}\n'
-    'Text: "Connect your wallet to claim 5,000 free tokens in our airdrop." -> '
-    '{"answer": "no", "confidence": 95, "reason": "airdrop"}\n'
-    'Text: "Play slots and poker with Bitcoin. 100 free spins on your first deposit." -> '
-    '{"answer": "no", "confidence": 95, "reason": "casino"}\n'
-    'Text: "Bitcoin slips 3% as investors await the Federal Reserve decision." -> '
-    '{"answer": "no", "confidence": 85, "reason": "news"}\n'
-    'Text: "lgn ae7 ; wlc0me btc dpst ##" -> '
-    '{"answer": "unsure", "confidence": 10, "reason": "garbled"}'
+# It replaced an HYIP-only rewrite (Oct 7) with worked examples that llama3.2:3b
+# copied: on VM2, 43 of its 50 "yes" verdicts were exactly {"yes", 100, "plans"},
+# the second example's output, and they included a private bank, a gambling app and
+# trading courses. It copied the self-reported confidence too (always 90-100), so no
+# page fell under OLLAMA_MIN_CONFIDENCE and none went to OpenAI. Confidence now comes
+# from the probability the model gives its answer; see answer_confidence().
+PAPER_PROMPT = (
+    "You are a financial advisor programmed to respond in JSON format. Your responses are "
+    "limited to ‘yes’ or ‘no’, represented by the ‘answer’ key, and you must provide a "
+    "one-word reasoning for your decision under the ‘reason’ key. Be sure of your answer. "
+    "Determine if the provided text likely originates from a cryptocurrency investment "
+    "scam website, characterized by promises of high returns from cryptocurrency "
+    "investments. If the text suggests a low probability of being a scam, does not prompt "
+    "users to log in/sign up, seems like a news site, or does not solicit users to contact "
+    "the site for investing in cryptocurrency, respond ‘no’"
 )
 
-OLLAMA_ANSWERS = {"yes", "no", "unsure"}
+# E1 and E2 from eval_prompt.py, after a blank line so the paper's text is left
+# exactly as it is. On the labelled pages content_filter() passes (44 HYIPs, 4 not),
+# llama3.2:3b with these additions files 38 HYIPs and 4 non-HYIPs, and sends 16 of
+# 101 pages to OpenAI. With the paper's prompt alone it filed 1 HYIP and sent 73 of
+# 113 (measured before "principal" was narrowed).
+PROMPT_ADDITIONS = (
+    "\n\n"
+    "A cryptocurrency investment scam here means a high-yield investment program "
+    "(HYIP): a site where visitors open an account and deposit cryptocurrency or "
+    "money into the site's own investment plans, in return for promised high returns. "
+    "Other cryptocurrency scams, such as wallet drainers, airdrops and giveaways, "
+    "token presales, fund recovery services and casinos, are not HYIPs; respond ‘no’ "
+    "for them."
+    "\n\n"
+    "Respond ‘yes’ only if the text itself promises returns on deposits, such as a "
+    "percentage or multiple over a period (2% daily, 150% after 7 days), or lists "
+    "investment plans with deposit amounts. A trading platform, broker, bank, "
+    "prop-trading firm, course or software product that does not promise such "
+    "returns is ‘no’."
+)
+OLLAMA_SYSTEM_PROMPT = PAPER_PROMPT + PROMPT_ADDITIONS
+
+# The paper's output structure, enforced: Ollama's `format` and OpenAI's strict
+# json_schema both constrain decoding to it, so the reply always parses.
+VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string", "enum": ["yes", "no"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["answer", "reason"],
+    "additionalProperties": False,
+}
+
+OLLAMA_ANSWERS = {"yes", "no"}
+
+
+def answer_confidence(content, tokens):
+    """Confidence 0-100 in the 'answer' value of content, from token probabilities.
+
+    tokens is [(token, [(candidate, logprob), ...]), ...] in order, covering content.
+    The token that starts the answer value is located by offset, and the probability
+    its candidates give to "yes" and to "no" (any case, spacing or quoting) is
+    compared. The candidates are the model's own distribution, before the schema
+    constrains it. When the losing answer is not among them, the least likely
+    candidate's probability stands in for it, which errs low. Returns 0 if the answer
+    token can't be found, so the page escalates instead of being trusted.
+    """
+    m = re.search(r'"answer"\s*:\s*"', content)
+    if not m or not tokens:
+        return 0
+    pos = 0
+    for token, candidates in tokens:
+        pos += len(token)
+        if pos > m.end():
+            break
+    else:
+        return 0
+    mass = {"yes": 0.0, "no": 0.0}
+    for candidate, logprob in candidates:
+        word = candidate.strip().strip('"').lower()
+        if word in mass:
+            mass[word] += math.exp(logprob)
+    chosen = content[m.end():].split('"', 1)[0].strip().lower()
+    if chosen not in mass or mass[chosen] == 0:
+        return 0
+    other = "no" if chosen == "yes" else "yes"
+    if mass[other] == 0:
+        mass[other] = math.exp(min(logprob for _, logprob in candidates))
+    return round(100 * mass[chosen] / (mass["yes"] + mass["no"]))
 
 def validate_ollama_response(response):
-    """Shape check for the local verdict, normalising in place.
-
-    'confidence' is coerced rather than required: a 3b model drops or stringifies
-    it often enough that rejecting the whole verdict over a missing int would push
-    a large share of pages to OpenAI for no good reason. A missing/unparseable
-    confidence becomes 0, which routes to OpenAI via the threshold instead.
+    """Shape check for the local verdict ('answer' yes/no and 'reason'),
+    normalising the answer in place. Confidence is not part of the reply; it is
+    computed from token probabilities by answer_confidence().
     """
     if not (
         isinstance(response, dict)
@@ -395,36 +446,39 @@ def validate_ollama_response(response):
     if answer not in OLLAMA_ANSWERS:
         return False
     response['answer'] = answer
-    try:
-        response['confidence'] = max(0, min(100, int(response.get('confidence', 0))))
-    except (TypeError, ValueError):
-        response['confidence'] = 0
     return True
 
-def evaluate_ocr_with_ollama(clean_text, domain_name, curr_date):
+def evaluate_ocr_with_ollama(clean_text, domain_name, curr_date, system_prompt=None):
     """
     Primary verdict, computed locally by Ollama (OLLAMA_MODEL). Returns
-    {"answer": "yes"|"no"|"unsure", "confidence": 0-100, "reason": str}.
+    {"answer": "yes"|"no", "confidence": 0-100, "reason": str}, or
+    {"answer": "unsure", "confidence": 0, ...} if Ollama failed.
 
-    Only the cases this step cannot settle -- 'unsure', or a yes/no below
-    OLLAMA_MIN_CONFIDENCE -- are escalated to the paid OpenAI call by
-    evaluate_hybrid(). Everything else is decided here at no API cost.
+    Only the cases this step cannot settle -- a failure, or an answer the model
+    gives less than OLLAMA_MIN_CONFIDENCE probability -- are escalated to the paid
+    OpenAI call by evaluate_hybrid(). Everything else is decided here at no API cost.
+
+    system_prompt overrides OLLAMA_SYSTEM_PROMPT, for scoring prompt variants
+    offline (eval_prompt.py).
 
     Uses /api/chat with a proper role-structured messages array so llama3's chat
     template is applied correctly, rather than concatenating roles into a single
     raw /api/generate prompt string (which the base model may not interpret as
     an instruction to follow).
     """
+    # The page text alone, as the original Crimson artifact sent it. A "Domain:"
+    # line used to precede it, and names with invest/trade/capital in them biased
+    # the 3b model towards "yes".
     messages = [
-        {"role": "system", "content": OLLAMA_SYSTEM_PROMPT},
-        {"role": "user", "content": f"Domain: {domain_name}\nText Content: {clean_text[:OLLAMA_MAX_TEXT_CHARS]}"}
+        {"role": "system", "content": system_prompt or OLLAMA_SYSTEM_PROMPT},
+        {"role": "user", "content": clean_text[:OLLAMA_MAX_TEXT_CHARS]}
     ]
 
     attempt = 0
     while attempt < OLLAMA_MAX_ATTEMPTS:
         attempt += 1
         try:
-            resp = requests.post(
+            resp = curl_requests.post(
                 OLLAMA_URL,
                 json={
                     "model": OLLAMA_MODEL,
@@ -434,17 +488,19 @@ def evaluate_ocr_with_ollama(clean_text, domain_name, curr_date):
                     # temperature 0: without it Ollama's default (0.8) made this
                     # return both 'yes' and 'no' for identical input across runs,
                     # which is not acceptable for the primary verdict.
-                    # num_predict raised from 64 to fit the added confidence field.
-                    "options": {"num_predict": 96, "temperature": 0},
+                    "options": {"num_predict": 64, "temperature": 0},
+                    "format": VERDICT_SCHEMA,
+                    "logprobs": True,
+                    "top_logprobs": 5,
                 },
                 timeout=OLLAMA_TIMEOUT,
             )
             resp.raise_for_status()
-            raw_output = resp.json().get("message", {}).get("content", "")
+            body = resp.json()
+            raw_output = body.get("message", {}).get("content", "")
 
-            # Without 'format: json' the model reliably returns JSON, but may occasionally
-            # wrap it in prose or markdown fences. Try a direct parse first, then fall back
-            # to extracting the first {...} object from the text.
+            # 'format' constrains the reply to VERDICT_SCHEMA, so a direct parse
+            # should succeed; the {...} extraction is kept as a fallback.
             try:
                 parsed = json.loads(raw_output)
             except json.JSONDecodeError:
@@ -454,13 +510,18 @@ def evaluate_ocr_with_ollama(clean_text, domain_name, curr_date):
                 parsed = json.loads(match.group(0))
 
             if validate_ollama_response(parsed):
+                tokens = [(t.get("token", ""),
+                           [(c.get("token", ""), c.get("logprob", 0.0)) for c in t.get("top_logprobs") or []]
+                           or [(t.get("token", ""), t.get("logprob", 0.0))])
+                          for t in body.get("logprobs") or []]
+                parsed["confidence"] = answer_confidence(raw_output, tokens)
                 return parsed
             else:
                 log(f"{domain_name},Ollama malformed response attempt {attempt},{raw_output}", curr_date, 'errors.txt', 'a')
                 continue
         except TimeoutError:
             raise
-        except requests.exceptions.RequestException as e:
+        except curl_requests.exceptions.RequestException as e:
             log(f"{domain_name},Ollama connection error attempt {attempt},{e}", curr_date, 'errors.txt', 'a')
             continue
         except json.JSONDecodeError as e:
@@ -488,71 +549,15 @@ def _get_openai_client():
             max_retries=OPENAI_MAX_RETRIES,
         )
     return _openai_client
-# HYIPs only, as in OLLAMA_SYSTEM_PROMPT above; see the note there. The old prompt
-# also counted wallet drainers and seed-phrase phishing, which are now "false".
-OPENAI_SYSTEM_PROMPT = (
-    "You are a financial advisor and threat-intelligence analyst. Be sure of your answer. "
-    "Determine if text scraped from a newly registered domain likely originates from an "
-    "HYIP scam website, characterized by promises of high returns on money deposited with "
-    "the site. An HYIP (high-yield investment program) is a Ponzi-style scheme: visitors "
-    "open an account, deposit money (usually cryptocurrency) into the site's investment "
-    "plans, and are promised high or guaranteed returns over short periods. The site often "
-    "claims the profits come from trading (crypto, forex, or CFD), mining, staking, or an "
-    "AI bot. Only HYIPs count; other cryptocurrency scams do not.\n\n"
-    "### HYIP INDICATORS (is_scam = true):\n"
-    "- Investment plans or packages with minimum and maximum deposit amounts.\n"
-    "- Unrealistically high, fixed, or guaranteed returns over short time frames "
-    "(e.g. 2% daily, 50% profit per week, 10% after 24 hours).\n"
-    "- Requests to sign up, log in, deposit, or contact an account manager to start "
-    "investing; referral commissions.\n"
-    "- Account dashboards with balances, earnings, deposits, and withdrawals.\n"
-    "- Props for fake legitimacy: certificates of incorporation, fake reviews or testimonials, "
-    "payout statistics (total deposits, total withdrawals, days online), unverifiable phone "
-    "numbers or addresses.\n\n"
-    "### NOT AN HYIP (is_scam = false):\n"
-    "- The text suggests a low probability of being an HYIP.\n"
-    "- The site does not invite visitors to sign up, log in, deposit, or contact it to invest.\n"
-    "- News site, blog, review, guide, or educational resource.\n"
-    "- Other cryptocurrency scams that do not promise returns on deposited money: wallet "
-    "drainers and seed-phrase phishing; fake airdrops and giveaways, including 'send crypto, "
-    "get double back'; meme coins, token presales, and rug pulls; NFT mints; fake wallets; "
-    "fund-recovery services.\n"
-    "- Other kinds of sites: casinos and betting; domains for sale; marketing agencies, "
-    "trading courses, coaching, or newsletters; legitimate exchanges, brokers, banks, "
-    "portfolio trackers, block explorers, or node infrastructure; startup or venture "
-    "fundraising.\n"
-    "- Standard login portals with no solicitation for investing.\n"
-    "- Text is garbage, broken, or has no actionable investment context.\n\n"
-    "### TEXT QUALITY:\n"
-    "The text may be OCR output, and may be garbled or transliterated from a non-Latin "
-    "script. If you cannot read it well enough to identify concrete scam content, set "
-    "reason to 'unreadable'.\n\n"
-    "Set confidence 0-100. Set reason to a single word."
-)
 
+# The same prompt as Ollama's (see the note above PAPER_PROMPT), and the same
+# output structure, enforced by a strict schema.
+OPENAI_SYSTEM_PROMPT = OLLAMA_SYSTEM_PROMPT
 
 OPENAI_SCAM_SCHEMA = {
     "name": "scam_verdict",
     "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "is_scam": {
-                "type": "boolean",
-                "description": "True only if this is an HYIP (high-yield investment program) scam.",
-            },
-            "confidence": {
-                "type": "integer",
-                "description": "Confidence score from 0 to 100.",
-            },
-            "reason": {
-                "type": "string",
-                "description": "A single word summarizing the primary reason.",
-            },
-        },
-        "required": ["is_scam", "confidence", "reason"],
-        "additionalProperties": False,
-    },
+    "schema": VERDICT_SCHEMA,
 }
 
 
@@ -580,6 +585,8 @@ def evaluate_ocr_with_openai(clean_text, domain_name, curr_date):
                 {"role": "user", "content": f"Text Content: {clean_text}"},
             ],
             response_format={"type": "json_schema", "json_schema": OPENAI_SCAM_SCHEMA},
+            logprobs=True,
+            top_logprobs=5,
         )
 
         msg = resp.choices[0].message
@@ -595,9 +602,16 @@ def evaluate_ocr_with_openai(clean_text, domain_name, curr_date):
         log(f"{domain_name},{OPENAI_MODEL},{u.prompt_tokens},{u.completion_tokens}",
             curr_date, 'openai_usage.txt', 'a')
 
-        verdict = json.loads(msg.content)
-        verdict["model"] = OPENAI_MODEL
-        return verdict
+        reply = json.loads(msg.content)
+        logprobs = resp.choices[0].logprobs
+        tokens = [(t.token, [(c.token, c.logprob) for c in t.top_logprobs] or [(t.token, t.logprob)])
+                  for t in (logprobs.content if logprobs and logprobs.content else [])]
+        return {
+            "is_scam": reply["answer"] == "yes",
+            "confidence": answer_confidence(msg.content, tokens),
+            "reason": reply["reason"],
+            "model": OPENAI_MODEL,
+        }
     except TimeoutError:
         raise
 
@@ -621,7 +635,8 @@ def evaluate_hybrid(clean_text, domain_name, curr_date):
     "confidence": int, "reason": str, "model": str}, or {"error": True, ...} -- so
     check() needs no special-casing for which engine produced the answer.
 
-    Escalates when Ollama says 'unsure', or answers yes/no below OLLAMA_MIN_CONFIDENCE.
+    Escalates when Ollama fails ('unsure'), or gives its yes/no less than
+    OLLAMA_MIN_CONFIDENCE probability.
     That threshold is not arbitrary: check() files a confirmed scam only above
     confidence 80, so a 'yes' closed out locally beneath that bar would be written to
     llm_rejected.txt as a rejection despite being a positive.
@@ -674,7 +689,7 @@ def getIPInfo(url_name):
     curr_date = str(datetime.now(newYorkTz)).split(' ')[0].replace('-', '')[2:]
     def IPAPI(ip_address):
         try:
-            response = requests.get(f'http://ip-api.com/json/{ip_address}?fields=status,message,countryCode,region,city,lat,lon,isp,org,query')
+            response = curl_requests.get(f'http://ip-api.com/json/{ip_address}?fields=status,message,countryCode,region,city,lat,lon,isp,org,query')
             return response.json()
         except Exception as e:
             log(f"{url_name},IPAPI (),{e}", curr_date, 'errors.txt', 'a')
@@ -704,23 +719,25 @@ def get_website_title(html_content):
         if title_tag is not None:
             return title_tag.get_text()
         return "No Title."
-    except requests.exceptions.RequestException:
+    except curl_requests.exceptions.RequestException:
         return "No Title."
 
 derive_schemes = ('https://', 'http://')
 
-# requests announces itself as "python-requests/x.y.z", which Cloudflare's default
-# bot rules reject outright. Measured on elementex.tech (server=cloudflare): the
-# identical HTTPS request returns 403 / 5,426 bytes with the library's own header
-# and 200 / 168,969 bytes with this one. The only variable is the User-Agent, and
-# the site was being filed as 'unavailable.' despite being live and fetchable.
-FETCH_HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
-               "image/avif,image/webp,*/*;q=0.8"),
-    "Accept-Language": "en-US,en;q=0.9",
-}
+# Pages are fetched with curl_cffi (curl-impersonate), not requests. Its TLS
+# handshake and HTTP/2 settings match a real Chrome's, and it sends Chrome's own
+# default headers for the version it impersonates.
+#
+# requests used to do this fetch with a Chrome User-Agent bolted on, after
+# elementex.tech (Cloudflare) returned 403 to python-requests' own header. That
+# fixed the header only: requests' OpenSSL handshake still fingerprinted it as
+# Python (JA3/JA4, HTTP/2 settings) to any bot rule that checks the connection,
+# and a blocked site was filed as 'unreachable.' and never screenshotted.
+#
+# No headers are passed. A User-Agent that disagrees with the impersonated Chrome
+# version is itself a bot signal. "chrome" tracks the newest Chrome fingerprint
+# the installed curl_cffi ships; `curl-cffi update` refreshes them.
+FETCH_IMPERSONATE = "chrome"
 
 def is_domain_available(url_name, curr_date):
     """Fetch the page. HTTPS first, HTTP only as a fallback.
@@ -734,7 +751,10 @@ def is_domain_available(url_name, curr_date):
     where self-signed and expired certificates are common. We are reading hostile
     pages for classification, not establishing trust with them -- refusing to look
     at a site because its certificate is bad would drop exactly the sites most
-    worth looking at. urllib3's per-request warning is silenced at import.
+    worth looking at.
+
+    timeout=10 is curl's total time for the request, where requests applied it to
+    each connect and read. A page that trickles in for over 10s now fails.
     """
     global less_words_domains
     def extract_js_libraries(html_content):
@@ -745,8 +765,8 @@ def is_domain_available(url_name, curr_date):
     response = None
     for scheme in derive_schemes:
         try:
-            response = requests.get(scheme + url_name, timeout=10, verify=False,
-                                    headers=FETCH_HEADERS)
+            response = curl_requests.get(scheme + url_name, timeout=10, verify=False,
+                                         impersonate=FETCH_IMPERSONATE)
             break
         except Exception:
             continue          # TLS failure, refused, timeout -> try the next scheme
@@ -756,7 +776,15 @@ def is_domain_available(url_name, curr_date):
     try:
         if str(response.status_code)[0] not in ['4', '5']:
             html_content = response.text
-            plain_text = str(text_converter.handle(response.text)).split()
+            # A fresh converter per page. One module-level HTML2Text used to serve
+            # every page, and html2text keeps state between handle() calls: after a
+            # page with an unclosed <abbr>, every later page's text was appended to
+            # abbr_data. On VM3 (Oct 15) that string reached ~195 MB, each page
+            # spent the full 300s alarm copying it, and was filed 'unreachable.'
+            text_converter = html2text.HTML2Text()
+            text_converter.ignore_links = True
+            text_converter.ignore_images = True
+            plain_text = str(text_converter.handle(html_content)).split()
             if len(plain_text) < 20:
                 less_words_domains += 1
                 log(less_words_domains, curr_date, 'less_words_domains.txt', 'w')
@@ -841,67 +869,55 @@ def check(url_name, curr_date):
     sspath = f"data/{SYSNO}/screenshots/{curr_date}/{url_name}/"
     ensure_directory_exists(sspath)
 
-    # Pass 1: Extraction via Lightweight HTML DOM
-    start_eval = time.time()
-    raw_dom_text = extract_dom_text(html_content)
-    clean_text = sanitize_text(raw_dom_text)
-    dom_text = clean_text  # kept for the content filter if OCR replaces clean_text below
-    used_ocr = False
-
-    # Evasion Detection Check: Fall back to visual processing if DOM text is suspiciously thin
-    if len(clean_text) < 150:
-        log(f"{url_name} - DOM text too short ({len(clean_text)} chars). Running OCR Fallback.", curr_date, 'hybrid_fallback.txt', 'a')
-        used_ocr = True
-
-        # Trigger heavy Selenium process
-        try:
-            ss = selenium_obj.take_screenshot(url_name, curr_date, sspath, SYSNO)
-            if not ss:
-                if os.path.exists(sspath): os.system(f'rm -rf {sspath}')
-                end_eval = time.time()
-                log(f"{url_name},{end_eval-start_eval}", curr_date, 'time_screenshot.txt', 'a')
-                return f"screenshot failure."
-        except Exception as e:
-            log(f"{url_name},selenium_obj.take_screenshot (),{e}", curr_date, 'errors.txt', 'a')
-            if os.path.exists(sspath): os.system(f'rm -rf {sspath}')
-            end_eval = time.time()
-            log(f"{url_name},{end_eval-start_eval}", curr_date, 'time_screenshot.txt', 'a')
-            return "screenshot failure"
-
-        # Trigger heavy Tesseract extraction
-        raw_ocr_text = OCR(url_name, curr_date, html_content)
-        if not raw_ocr_text:
-            if os.path.exists(sspath): os.system(f'rm -rf {sspath}')
-            end_eval = time.time()
-            log(f"{url_name},{end_eval-start_eval}", curr_date, 'time_OCR.txt', 'a')
-            return f"OCR failure."
-
-        clean_text = sanitize_text(raw_ocr_text)
-    # Pass 2: Classification Engine Call with Content Filter
-    # content_filter runs first on every page: it is free, and at ~98.7% rejection
-    # it keeps the Ollama call (the expensive step on CPU-only hardware) off most pages.
+    # Every reachable page is screenshotted and OCR'd, as in the paper's artifact.
+    # The LLM judges the OCR text, i.e. what a visitor sees: content drawn by
+    # JavaScript or baked into images counts, and HTML text a visitor never sees
+    # does not. The HTML text is still read, but only for the content filter.
     #
-    # OCR'd pages used to skip it (`if used_ocr or content_filter(...)`). The paper
-    # and the published artifact filter every page, and the artifact's OCR() ran
-    # the filter on OCR text and HTML text combined; that is restored here. Once
-    # screenshots started working (Oct 6) the bypass sent every thin-DOM page to the
-    # LLM: 92% of that day's OpenAI calls came from OCR pages, Ollama called half of
-    # them "garbled", and all 4 OCR-path "scams" were non-crypto pages that fail
-    # this filter. The LLM still gets the OCR text only, as in the artifact.
-    filter_text = f"{clean_text} {dom_text}" if used_ocr else clean_text
+    # Until Oct 9 OCR ran only when the HTML text was under 150 characters, and the
+    # LLM judged the HTML text everywhere else. That was far faster (median 0.03s
+    # against 3.2s per page on VM2, Oct 9) but blind to pitches held in images.
+    # As in the artifact, a page whose screenshot or OCR fails is dropped.
+    dom_text = sanitize_text(extract_dom_text(html_content))
+
+    start = time.time()
+    try:
+        ss = selenium_obj.take_screenshot(url_name, curr_date, sspath, SYSNO)
+    except Exception as e:
+        log(f"{url_name},selenium_obj.take_screenshot (),{e}", curr_date, 'errors.txt', 'a')
+        ss = False
+    log(f"{url_name},{time.time()-start}", curr_date, 'time_screenshot.txt', 'a')
+    if not ss:
+        if os.path.exists(sspath): os.system(f'rm -rf {sspath}')
+        return "screenshot failure."
+
+    start = time.time()
+    raw_ocr_text = OCR(url_name, curr_date, html_content)
+    if not raw_ocr_text:
+        if os.path.exists(sspath): os.system(f'rm -rf {sspath}')
+        log(f"{url_name},{time.time()-start}", curr_date, 'time_OCR.txt', 'a')
+        return "OCR failure."
+    clean_text = sanitize_text(raw_ocr_text)
+
+    # content_filter runs first on every page: it is free, and at ~98.7% rejection
+    # it keeps the Ollama call (the expensive step on CPU-only hardware) off most
+    # pages. As in the artifact's OCR(), it reads the OCR text and the HTML text
+    # combined; the LLM gets the OCR text only.
+    filter_text = f"{clean_text} {dom_text}"
     if content_filter(filter_text):
         evaluation = evaluate_hybrid(clean_text, url_name, curr_date)
     else:
-        # Pages dropped only by an exclusion word are logged with the words that
-        # matched, so an HYIP lost to one of them can be found and the word removed.
+        # Pages that pass Table 11 but are dropped here are logged with the exclusion
+        # words they contain, or 'no_hyip_phrase' if they have neither a phrase nor
+        # a marker, so an HYIP lost here can be found and its wording added.
         if table11_filter(filter_text):
-            log(f"{url_name},{'+'.join(content_exclusions(filter_text))}",
+            log(f"{url_name},{'+'.join(content_exclusions(filter_text)) or 'no_hyip_phrase'}",
                 curr_date, 'content_excluded.txt', 'a')
         evaluation = {"is_scam": False, "confidence": 0, "reason": "Cleared_By_Content_Filter"}
 
     if evaluation.get("error"):
         # FAIL CLOSED. Not classified either way. Screenshots kept for the retry pass.
-        log(f"{url_name}\t{evaluation.get('reason')}\t(OCR Fallback: {used_ocr})",
+        log(f"{url_name}\t{evaluation.get('reason')}",
             curr_date, 'needs_retry.txt', 'a')
         result_msg = "Needs retry (API error)."
     elif (evaluation.get("is_scam")
@@ -910,23 +926,21 @@ def check(url_name, curr_date):
             curr_date, 'needs_retry.txt', 'a')
         result_msg = "Flagged on unreadable text - needs retry."
     elif evaluation.get("is_scam") and evaluation.get("confidence", 0) > SCAM_CONFIDENCE_BAR:
-        log(f"Confirmed Scam [{evaluation.get('model', '?')}] (OCR Fallback: {used_ocr}): "
+        log(f"Confirmed Scam [{evaluation.get('model', '?')}]: "
             f"{url_name} - Reason: {evaluation.get('reason')}",
             curr_date, 'llm_scams.txt', 'a')
         handlePositives(url_name, clean_text, js_libraries, html_content, sspath, curr_date, evaluation)
         result_msg = "Scam Found & Confirmed!"
 
     else:
-        log(f"Rejected [{evaluation.get('model', 'local')}] (OCR Fallback: {used_ocr}): "
+        log(f"Rejected [{evaluation.get('model', 'local')}]: "
             f"{url_name} - Reason: {evaluation.get('reason')}",
             curr_date, 'llm_rejected.txt', 'a')
         if os.path.exists(sspath):
             os.system(f'rm -rf {sspath}')
         result_msg = "Safe / Rejected."
-    end_eval = time.time()
-    # Log execution times back to standard diagnostic endpoints
-    metric_file = 'time_OCR.txt' if used_ocr else 'time_screenshot.txt'
-    log(f"{url_name},{end_eval-start_eval}", curr_date, metric_file, 'a')
+    # OCR, filter and classification time; the screenshot is in time_screenshot.txt
+    log(f"{url_name},{time.time()-start}", curr_date, 'time_OCR.txt', 'a')
     time.sleep(1.0)
     return result_msg
 def log(url_name, curr_date, filename, mode='a'):
@@ -945,9 +959,15 @@ def mkdirs():
     if SYSNO not in os.listdir('logs/'):
         ensure_directory_exists(f"logs/{SYSNO}")
 
+class WorkerTimeout(BaseException):
+    """The 300s per-domain alarm. A BaseException, like KeyboardInterrupt, so no
+    'except Exception' can swallow it. It used to be a TimeoutError, which since
+    Python 3.10 is also socket.timeout: urllib3 caught it mid-read as a socket
+    timeout, and screenshots ran up to 933s on VM2 with no Worker_Timeout (Oct 27)."""
+
 def main():
     def timeout_handler(signum, frame):
-        raise TimeoutError("Function execution timed out")
+        raise WorkerTimeout("Function execution timed out")
     def callback(ch, method, properties, body):
         global visited_cache
         url_name = body.decode('utf-8')
@@ -960,23 +980,29 @@ def main():
             visited_cache[url_name] = True
             signal.signal(signal.SIGALRM, timeout_handler)
             # Budget for the worst-case path, which is now BOTH engines in series:
-            #   fetch 10s + Selenium 2x20s + Ollama 90s (OLLAMA_TIMEOUT)
-            #   + OpenAI 30s x3 (OPENAI_TIMEOUT x 1+OPENAI_MAX_RETRIES)  ~= 230s
+            #   fetch 2x10s + Selenium 2x20s + OCR of a tall page ~30s
+            #   + Ollama 90s (OLLAMA_TIMEOUT)
+            #   + OpenAI 30s x3 (OPENAI_TIMEOUT x 1+OPENAI_MAX_RETRIES)  ~= 270s
             # At the old 120s an escalated page on the OCR path tripped this and was
             # filed as Worker_Timeout even though both engines answered correctly.
+            # Raised from 240 when every page started going through OCR (Oct 9).
             # Lower this once the workers have AVX2 and Ollama returns in <10s.
-            signal.alarm(240)
+            signal.alarm(300)
             try:
                 result = check(url_name, curr_date)
                 sys.stdout.flush()
-            except TimeoutError as e:
+            except (WorkerTimeout, TimeoutError) as e:
                 log(f"{url_name},[x] Timeout occurred,{e}", curr_date, 'errors.txt', 'a')
                 log(f"{url_name}\tWorker_Timeout", curr_date, 'needs_retry.txt', 'a')
                 result = "Timeout"
             signal.alarm(0)
             log(f"[x] Done {url_name} {result}", curr_date, 'worker.txt', 'a')
-            sync(url_name, curr_date, f"results/{SYSNO}/", "/home/ubuntu/crimson/collected_results/")
-            sync(url_name, curr_date, f"data/{SYSNO}/check/", "/home/ubuntu/crimson/collected_results/")
+            # results/ and data/check/ only change in handlePositives(), so syncing
+            # after every domain sent ~2 ssh logins/s to the 2-core broker for nothing.
+            # rsync copies the whole folder, so a failed sync is caught up by the next one.
+            if result == "Scam Found & Confirmed!":
+                sync(url_name, curr_date, f"results/{SYSNO}/", "/home/ubuntu/crimson/collected_results/")
+                sync(url_name, curr_date, f"data/{SYSNO}/check/", "/home/ubuntu/crimson/collected_results/")
             ch.basic_ack(delivery_tag=method.delivery_tag)
 
     while True:

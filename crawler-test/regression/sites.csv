@@ -1,0 +1,58 @@
+name,url,group,best_known,note
+bitvestwise,https://www.bitvestwise.net,reachable,WALLET,HYIP Manager template
+xcelholdingsltd,https://xcelholdingsltd.org,reachable,WALLET,HYIP Manager template
+minnercoinex,https://minnercoinex.org,reachable,WALLET,BTC address on fund.php / wallet.php
+swifttradinginc,https://swifttradinginc.live,reachable,WALLET,Supabase e-mail confirm; terms popup; Deposit button
+swantradecapital,https://swantradecapital.com,reachable,WALLET,e-mailed 6-digit code; method buttons (submitpaymentform)
+opextrade,https://opextrade.com,reachable,WALLET,logout form; deposit method links
+cryptocoinprop,https://www.cryptocoinprop.com,reachable,LOGGED_IN,prop-firm checkout "Confirm & pay" -> NOWPayments; 21/25 pages were checkout variants
+hubguardfxz,https://hubguardfxz.com,reachable,WALLET,label holds a link; username login
+aziminer,https://aziminer.com,reachable,WALLET,lowercase e-mail; math captcha
+beacondigital,https://www.beacondigital.ltd,reachable,WALLET,referral field empty; deposit box without a form
+digital4xtrade,https://digital4xtrade.com,reachable,WALLET,deposit fields keyed by id
+elitecoin-investors,https://elitecoin-investors.com,reachable,WALLET,HYIP Manager template
+securenovatrade,https://securenovatrade.com,reachable,WALLET,account. subdomain; 4-step form; method buttons in form
+duduinvest,https://www.duduinvest.com,reachable,LOGGED_IN,USDT-TRC20 address on the dashboard itself (not scanned); login fixed by H
+expacraftcapitals,https://www.expacraftcapitals.org,reachable,LOGGED_IN,deposit gateway buttons not handled (held)
+tradevistavelocity,https://tradevistavelocityinvestmentmark.com,reachable,LOGGED_IN,letters+digits password; deposit form comes back
+elitesterlingglobal,https://elitesterlingglobal.com,reachable,SIGNUP_FOUND,captcha gate passes; sign-up then rejected (reason unknown)
+spotchaindigitals,https://spotchaindigitals.com,reachable,SIGNUP_FOUND,email-first step form
+fxtastytrades,https://www.online.fxtastytrades.com,reachable,WALLET,captcha after steps; session dropped mid-deposit (fix I)
+paramounttrades,https://paramounttrades.com,reachable,LOGGED_IN,deposit needs KYC
+evergreenprotrades,https://www.evergreenprotrades.com,reachable,LOGGED_IN,e-mail code; icon-only dashboard
+ultrabitfx,https://ultrabitfx.com,reachable,LOGGED_IN,dashboard returns 500 (site side)
+amvinvestmentltd,https://amvinvestmentltd.com,reachable,SIGNED_UP,broken form HTML; login after sign-up failed
+securegrowthassets,https://mail.securegrowthassets.com,reachable,WALLET,method buttons (submitpaymentform)
+glotechboost,https://glotechboostlimited.com,reachable,WALLET,slow site; HYIP Manager
+coinmtz,https://mail.coinmtz.com,reachable,WALLET,math captcha after steps
+aiblockchainmining,https://aiblockchainmining.com,reachable,LOGGED_IN,Invest Now dialog -> NOWPayments invoice (fix F)
+aegisinvestmentgroup,https://aegisinvestmentgroup.com,reachable,SIGNUP_FOUND,sign-up without a form; Continue steps (fix G)
+maticglobal-az,https://maticglobal-az.com,reachable,WALLET,HYIP Manager template
+dynamicbrokers,https://www.dynamicbrokersinvestment.com,reachable,LOGGED_IN,wallet form comes back without an address
+stratostraders,https://stratostraders.com,reachable,SIGNED_UP,logged in after sign-up but not recognised
+sgfx,https://sgfx.com,reachable,SIGNUP_FOUND,phone widget not filled
+nexgencrypto,https://nexgencrypto.live,reachable,SIGNUP_FOUND,country not filled
+stock3financetrade,https://stock3financetrade.co,reachable,SIGNUP_FOUND,username needs 6+ characters
+goldbulltrades,https://www.goldbulltrades.com.dynastyfxmarkets.com,reachable,SIGNUP_FOUND,form not found within 5 s
+miner-7j4,https://miner-7j4.pages.dev,reachable,NO_SIGNUP,not looked at yet
+raseedinvest,https://www.raseedinvest.com,reachable,NO_SIGNUP,not looked at yet
+tradeglobalast,https://tradeglobalast.com.dbxubite87.world,unreachable,SIGNED_UP,recaptcha.cloud bot wall after login
+alphagainvest,https://alphagainvest.com,unreachable,BLOCKED,reCAPTCHA v2
+westprocapitals,https://westprocapitals.com,unreachable,ERROR,/register returns 500
+digitalcurrencysolutions,https://digitalcurrencysolutions.net,unreachable,ERROR,ASP.NET postback; MLM sponsor
+globusfxtrade,https://globusfxtrade.com,unreachable,BLOCKED,Cloudflare Suspected Phishing
+ruifxm,https://ruifxm.online,unreachable,BLOCKED,Cloudflare Suspected Phishing
+gains-limited,https://www.gains-limited.com,unreachable,BLOCKED,Cloudflare bot check
+umoney,https://umoney.asia,unreachable,NO_SIGNUP,sponsor ID; text-type password fields
+ai-xtrade,https://ai-xtrade.com,unreachable,NO_SIGNUP,static WordPress copy
+bitaipros,https://bitaipros.com,unreachable,BLOCKED,reCAPTCHA v2
+connercoin,https://connercoin.com,unreachable,BLOCKED,reCAPTCHA v2
+onyxfxcapital,https://onyxfxcapital.com,unreachable,BLOCKED,Cloudflare Turnstile
+stable-wealth,https://stable-wealth.org,unreachable,BLOCKED,unreadable captcha
+investpilot,https://investpilot.vip,unreachable,SIGNUP_FOUND,UsersWP anti-bot check
+247potentialprime,https://247potentialprime.com,unreachable,ERROR,connection refused
+profitswise,https://profitswise.org,unreachable,ERROR,connection refused
+oakonlinevest,https://oakonlinevest.xyz.westprimeonline.com,unreachable,ERROR,connection refused
+ofpfunding,https://rebranding.ofpfunding.com,unreachable,BLOCKED,Cloudflare bot check
+polychaincapital,https://www.polychaincapital.site,unreachable,NO_SIGNUP,/register bounces to /login; Turnstile
+investrovacapital,https://www.account.investrovacapital.com,unreachable,BLOCKED,reCAPTCHA v2

@@ -1,12 +1,11 @@
 
 import base64
 import html
-import itertools
 import logging
 import os
 import random
 import re
-import requests
+from curl_cffi import requests as curl_requests
 import string
 import sys
 import threading
@@ -36,7 +35,6 @@ logs_directory = 'logs'
 os.makedirs(logs_directory, exist_ok=True)
 log_file_path = os.path.join(logs_directory, 'logfile.log')
 email_used = None
-start_url = ''
 blacklisted_urls = ["facebook.com", "example.com","linkedin.com","paypal.com"]
 
 # --- Paths & credentials --------------------------------------------------
@@ -124,6 +122,11 @@ def initialize_driver():
     return driver
 
 driver = None  # created in main(); fill_form() and the URL loop use this global
+# The urls.txt line being crawled. login_and_take_screenshot() writes it to
+# source_url.txt in the site's folder, because the folder is named after the login
+# URL, which can be on another host than the site feeder.py gave the crawler.
+# build_wallets.py reads it to tie each wallet to its domain.
+current_site_url = None
 
 # Generate random strings and emails for filling forms
 def generate_random_string(length=8, names_file=NAMES_FILE): #names.txt contains a dictionary of common names
@@ -157,18 +160,100 @@ def generate_xmr_address():
 def generate_ada_address():
     return 'addr1' + ''.join(random.choices(string.digits + string.ascii_letters, k=58))
 
-# Captcha detection, log error if detected and move to next URL
-def has_captcha(html_content, driver):
-    if "captcha" in html_content.lower():
-        logging.info(f"Captcha detected on {driver.current_url}.")
-        recaptcha_elements = driver.find_elements(By.XPATH, "//iframe[contains(@src, 'recaptcha')]") + \
-                             driver.find_elements(By.CLASS_NAME, "g-recaptcha")
-        if recaptcha_elements:
-            logging.info(f"Google reCAPTCHA detected on {driver.current_url}.")
-        else:
-            logging.info(f"Non-Google captcha detected on {driver.current_url}.")
-        return True
-    return False
+# --- Captcha check -----------------------------------------------------------------------
+# has_captcha() used to give up on a site whenever the word "captcha" appeared anywhere in the
+# HTML. Re-checking the 93 sites it stopped between Oct 17 and Oct 20 (87 loaded): 28 showed no
+# captcha at all (the word sat in comments, CSS, config strings or class names), 14 had a
+# site-built text or math captcha whose answer is on the page ("8 × 8 = ?", "Enter Captcha:
+# B730FF"), 30 had a math captcha in a hidden later step of a multi-step form, 6 had an image
+# captcha and 9 a third-party widget. Every real one sat inside the sign-up form. So now only
+# what the sign-up form shows counts, and text and math captchas are answered. Image captchas
+# (OCR) and multi-step forms are left for later; both are logged when seen.
+CAPTCHA_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+const forms = Array.from(document.forms);
+const scope = forms.find(f => f.querySelectorAll('input[type=password]').length >= 2)
+           || forms.find(f => f.querySelector('input[type=password]')) || document;
+const q = s => Array.from(scope.querySelectorAll(s));
+const widgets = [];
+if (q('iframe[src*="recaptcha/api2/anchor"],iframe[src*="recaptcha/enterprise/anchor"]').some(e => vis(e) && !/size=invisible/.test(e.src))
+    || q('.g-recaptcha[data-sitekey]').some(e => vis(e) && e.getAttribute('data-size') !== 'invisible')) widgets.push('reCAPTCHA v2');
+if (q('.h-captcha,iframe[src*="hcaptcha.com"]').some(vis)) widgets.push('hCaptcha');
+if (q('.cf-turnstile,iframe[src*="challenges.cloudflare.com"]').some(vis)) widgets.push('Cloudflare Turnstile');
+if (q('altcha-widget').some(vis)) widgets.push('ALTCHA');
+const invisible = !!document.querySelector('.grecaptcha-badge,iframe[src*="size=invisible"]')
+               || /recaptcha\/(api|enterprise)\.js\?[^"']*render=(?!explicit)/i.test(document.documentElement.innerHTML);
+const images = q('img').filter(e => vis(e) && /captcha|turing|validation_image|securimage|antibot/i.test(
+    (e.getAttribute('src') || '') + ' ' + e.id + ' ' + String(e.className) + ' ' + (e.alt || '')));
+const texts = e => {
+    const out = [e.placeholder || ''];
+    if (e.id) { const l = document.querySelector('label[for="' + CSS.escape(e.id) + '"]'); if (l) out.push(l.innerText || l.textContent); }
+    for (let p = e.parentElement, i = 0; p && i < 4; p = p.parentElement, i++) out.push(p.innerText || p.textContent || '');
+    return out.map(t => t.replace(/\s+/g, ' ').trim().slice(0, 300)).filter(Boolean);
+};
+const inputs = q('input').filter(e => e.type !== 'hidden'
+    && /captcha|validation_number|turing|security.?code|verif\w*.?code|antibot|math/i.test((e.name || '') + ' ' + e.id + ' ' + (e.placeholder || '')));
+return {widgets: widgets, invisible: invisible, images: images.length,
+        inputs: inputs.map(e => ({name: e.name, id: e.id, visible: vis(e), texts: texts(e)}))};
+"""
+CAPTCHA_MATH_RE = re.compile(r"(\d{1,3})\s*(\+|-|−|x|×|\*|÷|/|plus|minus|times)\s*(\d{1,3})\s*(?:=|\?)", re.I)
+CAPTCHA_SPACED_RE = re.compile(r"(?<!\w)\d(?: \d){3,7}(?!\w)")                    # "8 9 5 7 1 3"
+CAPTCHA_CODE_RE = re.compile(r"\b(?=[A-Z0-9]*\d)[A-Z0-9]{4,8}\b")                 # "B730FF", "0EAAB3"
+CAPTCHA_OPS = {"+": lambda a, b: a + b, "plus": lambda a, b: a + b, "-": lambda a, b: a - b, "−": lambda a, b: a - b,
+               "minus": lambda a, b: a - b, "x": lambda a, b: a * b, "×": lambda a, b: a * b, "*": lambda a, b: a * b,
+               "times": lambda a, b: a * b, "÷": lambda a, b: a // b, "/": lambda a, b: a // b}
+
+def solve_text_captcha(texts):
+    """(answer, challenge) for a text or math captcha, read from the texts around its input
+    (placeholder, label, then up to four parent elements, nearest first), or (None, None)."""
+    for t in texts:
+        m = CAPTCHA_MATH_RE.search(t)
+        if m and not (m.group(2) in ("÷", "/") and int(m.group(3)) == 0):
+            return str(CAPTCHA_OPS[m.group(2).lower()](int(m.group(1)), int(m.group(3)))), m.group(0)
+        m = CAPTCHA_SPACED_RE.search(t)
+        if m:
+            return m.group(0).replace(" ", ""), m.group(0)
+        m = CAPTCHA_CODE_RE.search(t)
+        if m:
+            return m.group(0), m.group(0)
+    return None, None
+
+def check_captcha(driver):
+    """What captcha the sign-up form shows. Returns (blocking, summary, answer, target): blocking
+    means the site is skipped; answer and target ((By, value) of the input) are set when a text or
+    math captcha was read, and the answer is typed in just before the form is submitted."""
+    time.sleep(2)  # third-party widgets render after load
+    try:
+        c = driver.execute_script(CAPTCHA_JS)
+    except Exception as e:
+        return False, f"could not inspect the page ({e}), trying anyway", None, None
+    if c["widgets"]:
+        return True, f"{' and '.join(c['widgets'])} on the sign-up form, skipping the site", None, None
+    visible = [i for i in c["inputs"] if i["visible"]]
+    if visible:
+        i = visible[0]
+        answer, challenge = solve_text_captcha(i["texts"])
+        if answer is not None:
+            target = (By.ID, i["id"]) if i["id"] else (By.NAME, i["name"])
+            return False, f"text captcha {challenge!r}, answering {answer!r}", answer, target
+        if c["images"]:
+            return True, "image captcha on the sign-up form (OCR not implemented), skipping the site", None, None
+        return True, f"captcha input {i['name'] or i['id']!r} whose challenge could not be read {i['texts'][:2]}, skipping the site", None, None
+    if c["images"]:
+        return True, "image captcha on the sign-up form (OCR not implemented), skipping the site", None, None
+    notes = (["a captcha input in a hidden part of the form (multi-step form?)"] if c["inputs"] else []) + \
+            (["an invisible reCAPTCHA"] if c["invisible"] else [])
+    return False, (f"none visible ({' and '.join(notes)}), trying anyway" if notes else "none"), None, None
+
+def answer_captcha(driver, answer, target):
+    """Type the captcha answer, replacing whatever predict_values() put in the field."""
+    try:
+        field = driver.find_element(*target)
+        field.clear()
+        field.send_keys(answer)
+        logging.info(f"Captcha answer {answer!r} entered")
+    except Exception as e:
+        logging.info(f"Could not enter the captcha answer: {e}")
 
 # Predict form values
 def predict_values(form):
@@ -262,15 +347,111 @@ def handle_dropdowns(form, driver):
             except WebDriverException as e:
                 logging.error(f"Failed to select dropdown option using JavaScript: {e}")
 
+# --- Sign-up and login outcome checks --------------------------------------------------
+# Until Oct 20 a sign-up counted as successful whenever a button was clicked (the URL was
+# compared with a module-level start_url that was always ''), and a login whenever the URL
+# changed. Over Oct 6-20, 149 of 288 "successful" sign-ups never left the sign-up page (140 of
+# them then failed to log in), and 9 of 53 "logged-in" sites were not logged in; 3 of those
+# had been redirected to the site's own ?a=login&say=invalid_login page. The outcome is now
+# read from the page. Only messages that appear after the submit count, so a notice that was
+# already on the form ("Please enter your details") is not mistaken for an error.
+
+PAGE_STATE_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+const errSel = '[class*="error" i],[class*="alert" i],[class*="invalid" i],[class*="warning" i],[class*="danger" i],' +
+               '[role="alert"],.help-block,font[color="red" i],font[color="#ff0000" i],[style*="color:red" i],[style*="color: red" i]';
+const errors = Array.from(document.querySelectorAll(errSel))
+    .filter(e => vis(e) && !/success|info/i.test(String(e.className || '')))
+    .map(e => (e.innerText || '').trim().replace(/\s+/g, ' ')).filter(t => t && t.length < 300);
+const invalid = Array.from(document.querySelectorAll('input,select,textarea'))
+    .filter(e => vis(e) && e.willValidate && !e.checkValidity())
+    .map(e => (e.name || e.id || e.type) + ': ' + e.validationMessage);
+const logout = Array.from(document.querySelectorAll('a,button')).filter(vis).some(e =>
+    /log-?out|sign-?out|logoff|a=logout/i.test(e.getAttribute('href') || '') ||
+    /^\s*(log ?out|sign ?out|log off)\s*$/i.test(e.innerText || ''));
+return {url: location.href, errors: [...new Set(errors)].slice(0, 8), invalid: invalid.slice(0, 5), logout: logout,
+        passwords: Array.from(document.querySelectorAll('input[type=password]')).filter(vis).length,
+        text: (document.body ? document.body.innerText : '').slice(0, 20000)};
+"""
+SIGNUP_OK_RE = re.compile(r"registration (was |is )?(complete|completed|successful)|successfully (registered|signed up|created)|registered successfully|"
+                          r"account (has been |was )?(created|registered)|thank you for (registering|signing up|joining|your registration)|"
+                          r"check your (e-?mail|inbox)|(confirmation|verification|activation) (link|e-?mail|code) (has been |was )?sent|verify your e-?mail", re.I)
+FORM_ERROR_RE = re.compile(r"already (exists|registered|in use|taken)|required|invalid|incorrect|do(es)? not match|must (be|contain|have)|"
+                           r"please (enter|fill|provide|select|check|agree|type|correct|choose)|captcha|not valid|too (short|long)|wrong|error|failed", re.I)
+LOGIN_FAILED_URL_RE = re.compile(r"say=invalid|invalid_login|login_?error|[?&]error=", re.I)
+
+def page_state(driver):
+    """Logout link, visible password fields, visible error messages, invalid form fields and body text of the current page."""
+    try:
+        return driver.execute_script(PAGE_STATE_JS)
+    except Exception as e:
+        logging.info(f"Could not read the page state: {e}")
+        return {"url": "", "errors": [], "invalid": [], "logout": False, "passwords": 0, "text": ""}
+
+def new_errors(before, after):
+    """Error-like messages on the page after a submit that were not on it before."""
+    return [t for t in after["errors"] if t not in before["errors"] and FORM_ERROR_RE.search(t)]
+
+def wait_for_outcome(driver, before, seconds=10):
+    """After a submit, poll until the page shows something decisive (a new URL, a Logout link, a
+    new message, invalid fields, the password fields gone) or `seconds` pass, and return the page
+    state. A read that fails mid-navigation (empty url) is never taken as the outcome."""
+    state = page_state(driver)
+    for _ in range(seconds):
+        new_ok = SIGNUP_OK_RE.search(state["text"]) and not SIGNUP_OK_RE.search(before["text"])
+        if state["url"] and (state["url"] != before["url"] or state["logout"] or new_errors(before, state)
+                             or state["invalid"] or not state["passwords"] or new_ok):
+            time.sleep(1)  # let a redirect or an AJAX update finish
+            settled = page_state(driver)
+            return settled if settled["url"] else state
+        time.sleep(1)
+        state = page_state(driver)
+    return state
+
+def assess_signup(before, after, form_url):
+    """('success' | 'rejected' | 'unclear', evidence) for the page shown after a sign-up submit.
+    Only 'rejected' changes what the crawler does next (no e-mail wait, no login attempt), so it
+    needs explicit evidence: a new error message or a field the browser refused, on a page that
+    still shows the form. 'unclear' carries on as before: 9 of the 149 sign-ups that never left
+    the sign-up page did end in a login."""
+    errors = new_errors(before, after)
+    ok = SIGNUP_OK_RE.search(after["text"])
+    if after["logout"]:
+        return "success", "a Logout link is on the page"
+    if ok and not SIGNUP_OK_RE.search(before["text"]):
+        return "success", f"success message {ok.group(0)!r}"
+    if after["passwords"] and (errors or after["invalid"]):
+        return "rejected", "; ".join(errors + after["invalid"])[:300]
+    if after["url"] != form_url and not after["passwords"]:
+        return "success", f"moved to {after['url']} and the form is gone"
+    where = "URL unchanged" if after["url"] == form_url else f"now at {after['url']}"
+    return "unclear", f"{where}, {after['passwords']} password field(s) on the page, no message found"
+
+def assess_login(before, after):
+    """('success' | 'failed' | 'unclear', evidence) for the page shown after a login submit.
+    'unclear' (no Logout link, no password field) carries on as logged in, which also covers a
+    login done by JavaScript without a URL change; the old URL-change test missed those."""
+    errors = new_errors(before, after)
+    if LOGIN_FAILED_URL_RE.search(after["url"]):
+        return "failed", f"redirected to {after['url']}"
+    if after["logout"]:
+        return "success", "a Logout link is on the page"
+    if after["passwords"]:
+        return "failed", "; ".join(errors)[:300] or f"still on a page with {after['passwords']} password field(s) and no Logout link"
+    return "unclear", f"no Logout link and no password field at {after['url']}"
+
 # Submit form
 def click_and_submit(driver, button, button_type):
+    # True once the button has been clicked. Whether that worked is decided afterwards from the
+    # page (assess_signup); the URL comparison that used to be here compared with '' and so
+    # reported every click as a successful sign-up.
     try:
+        before = driver.current_url
         driver.execute_script("arguments[0].click();", button)
         time.sleep(3)
-        current_url = driver.current_url
-        if current_url != start_url:
-            logging.info(f"Form submitted - Redirected to: {current_url}")
-            return True
+        after = driver.current_url
+        logging.info(f"Form submitted - URL {'changed to ' + after if after != before else 'unchanged: ' + after}")
+        return True
     except (ElementNotInteractableException, TimeoutException):
         button.send_keys(Keys.RETURN)
     return False
@@ -316,8 +497,9 @@ def fill_sign_up_form(driver, start_url):
             if has_two_or_more_password_fields(driver, current_url) and not form_filled and should_continue:
                 driver = ensure_driver(driver)
                 driver.get(current_url)
-                html_content = driver.page_source
-                if has_captcha(html_content, driver):
+                captcha_blocks, captcha_summary, captcha_answer, captcha_target = check_captcha(driver)
+                logging.info(f"Captcha check on {driver.current_url}: {captcha_summary}")
+                if captcha_blocks:
                     return False
 
                 wait = WebDriverWait(driver, 5)
@@ -339,6 +521,10 @@ def fill_sign_up_form(driver, start_url):
 
                         handle_checkbox(driver)
 
+                        # After the fields are filled, so predict_values() cannot overwrite it.
+                        if captcha_answer is not None:
+                            answer_captcha(driver, captcha_answer, captcha_target)
+
                         selectors = [
                             ('input[type="submit"]', By.CSS_SELECTOR),
                             ('button[type="submit"]', By.CSS_SELECTOR),
@@ -346,7 +532,15 @@ def fill_sign_up_form(driver, start_url):
                             ('input[name="submit"]', By.NAME)
                         ]
 
+                        form_url = driver.current_url
+                        before_submit = page_state(driver)
                         if submit_form(driver, selectors):
+                            outcome, evidence = assess_signup(before_submit, wait_for_outcome(driver, before_submit), form_url)
+                            logging.info(f"Sign-up result: {outcome} - {evidence}")
+                            if outcome == "rejected":
+                                # The site refused the form, so there is no account to confirm
+                                # or log in to; skip the 60 s inbox wait and the login search.
+                                return False
                             # predictions is keyed by input name, so .get("email") only
                             # worked when the field was literally named "email". Take the
                             # generated address from whichever field received it.
@@ -406,6 +600,7 @@ def has_two_or_more_password_fields(driver, url):
 
 # Process URLs from a list
 def fill_sign_up_urls_in_list(urls_file_path, last_processed_file_path):
+    global current_site_url
     if not os.path.exists(urls_file_path):
         logging.info(f"No {urls_file_path} yet (feeder.py has not added any domains); nothing to crawl.")
         return
@@ -417,6 +612,7 @@ def fill_sign_up_urls_in_list(urls_file_path, last_processed_file_path):
             url = line.strip()
             if start_processing:
                 try:
+                    current_site_url = url
                     email_used = fill_sign_up_form_with_timeout(driver, url)
                     if email_used:
                         logging.info(f"Success: {url} ")
@@ -464,10 +660,14 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
     base_domain = get_base_domain(login_url)
     original_window = None  # the finally block below reads it even if driver.get() fails
     try:
+        if not email_used:
+            # The username below is derived from the e-mail, and re.sub() on None used to crash
+            # here ("Unexpected error during login") after every such sign-up.
+            logging.info("Login result: skipped - the sign-up form had no e-mail field, so there is no account e-mail to log in with")
+            return
         driver.get(login_url)
         logging.info(f"Navigating to URL: {login_url}")
         original_window = driver.current_window_handle
-        initial_url = driver.current_url
 
         try:
             username_input = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[name="username"],input[type="email"],input[type="text"]')))
@@ -483,6 +683,7 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
         password_input = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[type="password"]')))
         password_input.send_keys(predicted_password)
 
+        before_submit = page_state(driver)
         try:
             submit_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit'],input[type='submit']")))
             submit_button.click()
@@ -490,11 +691,18 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
             submit_button = driver.find_element(By.CSS_SELECTOR, "form button, form input[type='button']")
             driver.execute_script("arguments[0].click();", submit_button)
 
-        WebDriverWait(driver, 10).until(EC.url_changes(initial_url))
-        logging.info("URL changed, indicating a potential successful login.")
+        # Judged from the page, not from a URL change: a failed login that redirects to
+        # ?a=login&say=invalid_login changes the URL too.
+        outcome, evidence = assess_login(before_submit, wait_for_outcome(driver, before_submit))
+        logging.info(f"Login result: {outcome} - {evidence}")
+        if outcome == "failed":
+            return
 
         directory_name = login_url.replace('://', '_').replace('/', '_')
         os.makedirs(directory_name, exist_ok=True)
+        if current_site_url:
+            with open(os.path.join(directory_name, 'source_url.txt'), 'w') as f:
+                f.write(current_site_url + '\n')
         processed_links = set()
 
         links = driver.find_elements(By.TAG_NAME, 'a')
@@ -534,6 +742,15 @@ def process_link(driver, href, directory_name, original_window):
     driver.close()
     driver.switch_to.window(original_window)
 
+# Wallet-looking strings on a page, for the deposit-stage log lines only. A hint for reading
+# the log: iocs_searcher.sh still does the real extraction. Script and style blocks are
+# dropped first so tokens inside them are not reported.
+WALLET_LIKE_RE = re.compile(r"\b(bc1[02-9ac-hj-np-z]{25,60}|[13][1-9A-HJ-NP-Za-km-z]{25,34}|0x[0-9a-fA-F]{40}|T[1-9A-HJ-NP-Za-km-z]{33})\b")
+
+def wallet_like(html_content):
+    visible = re.sub(r"<(script|style)\b.*?</\1>", " ", html_content, flags=re.S | re.I)
+    return sorted(set(WALLET_LIKE_RE.findall(visible)))
+
 def process_links(driver, links, processed_links, base_domain, directory_name, original_window, max_links=25):
     if len(processed_links) >= max_links:
         logging.info(f"Reached maximum link processing threshold of {max_links}. Stopping further processing.")
@@ -541,14 +758,26 @@ def process_links(driver, links, processed_links, base_domain, directory_name, o
 
     deposit_page_counter = 0
 
+    # Logged so a site whose deposit page was never opened can be told apart from one whose
+    # deposit page was opened but produced nothing (process_deposit_page logs that case).
+    try:
+        deposit_hrefs = sorted({h for h in (l.get_attribute('href') for l in links) if h and re.search(r'\bdeposits?\b', h.lower())})
+        logging.info(f"Post-login page has {len(links)} links; deposit links: {deposit_hrefs or 'none'}")
+    except Exception as e:
+        logging.info(f"Could not list the deposit links on the post-login page: {e}")
+
     for link in links:
         href = link.get_attribute('href')
         if validate_link(href, processed_links, base_domain):
             try:
-                if re.search(r'\bdeposits?\b', href.lower()) and deposit_page_counter < 5: # condition true if either deposit or deposits in url and within limit
+                is_deposit = re.search(r'\bdeposits?\b', href.lower()) # condition true if either deposit or deposits in url
+                if is_deposit and deposit_page_counter < 5: # and within limit
+                    logging.info(f"Opening deposit page {href} (deposit link {deposit_page_counter + 1} of at most 5)")
                     process_deposit_page(driver, href, directory_name, original_window)
                     deposit_page_counter += 1
                 else:
+                    if is_deposit:
+                        logging.info(f"Deposit link {href} handled as an ordinary page: the limit of 5 deposit pages was reached")
                     process_link(driver, href, directory_name, original_window)
                 processed_links.add(href)
 
@@ -556,10 +785,14 @@ def process_links(driver, links, processed_links, base_domain, directory_name, o
                 for second_link in second_layer_links:
                     second_href = second_link.get_attribute('href')
                     if validate_link(second_href, processed_links, base_domain) and len(processed_links) < max_links:
-                        if re.search(r'\bdeposits?\b', second_href.lower()) and deposit_page_counter < 5:
+                        is_deposit = re.search(r'\bdeposits?\b', second_href.lower())
+                        if is_deposit and deposit_page_counter < 5:
+                            logging.info(f"Opening deposit page {second_href} (deposit link {deposit_page_counter + 1} of at most 5)")
                             process_deposit_page(driver, second_href, directory_name, original_window)
                             deposit_page_counter += 1
                         else:
+                            if is_deposit:
+                                logging.info(f"Deposit link {second_href} handled as an ordinary page: the limit of 5 deposit pages was reached")
                             process_link(driver, second_href, directory_name, original_window)
                         processed_links.add(second_href)
                     if len(processed_links) >= max_links:
@@ -578,188 +811,256 @@ def process_links(driver, links, processed_links, base_domain, directory_name, o
                 else:
                     driver.switch_to.window(original_window)
 
+# --- Deposit step ----------------------------------------------------------------------------
+# One pass per payment option that the site's own deposit form lists (dropdown or radios),
+# never a built-in coin list. Each pass picks the option, submits, and saves the page that
+# comes back (on HYIP Manager sites, "Please confirm your deposit" with the wallet address).
+#
+# Until Oct 20 the loop ran over itertools.product(every radio value on the page, each
+# <select>'s option list, ['1000']). On the HYIP Manager form (plan <select name="h_id">,
+# payment radios name="type", amount) that failed three ways, seen in the 186 deposit pages
+# saved on VM1-3 by Oct 20:
+#   - set_dropdown_options() selected one option value character by character, so the plan
+#     stayed on its blank first option. On 6 of the 19 sites every pass came back as the form,
+#     with no wallet (fundamentaltradegroup, metrospacefinance, lotech-global, ...).
+#   - clear_input_fields() clicked every radio, so passes that changed the plan submitted the
+#     last payment radio: bitvestwise spent 4 of its 8 passes on USDT TRC20.
+#   - A form without a radio or without a <select> got zero passes and left no trace.
+# Now the deposit form is the one holding the amount field. The plan control is the choice
+# control whose name or options read like plans (h_id, "plan", %, days, min/max); the payment
+# control is the other one. Each pass reloads the page and sets the controls by name in
+# JavaScript, which also reaches hidden radios and select2-wrapped selects, so nothing goes stale.
+MAX_DEPOSIT_PASSES = 12
+
+DEPOSIT_FORM_JS = r"""
+const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+const PLACEHOLDER = /^(select|choose|please|--|-)/i;
+const PLANLIKE = /%|\bdaily\b|\bhours?\b|\bdays?\b|\bweeks?\b|\bprofit|\bmin(imum)?\b|\bmax(imum)?\b|\bplan\b|\bpackage\b|\blevel\b/i;
+const PLANNAME = /h_id|plan|package|scheme|tariff|level/i;
+const PAYNAME = /type|pay|method|gateway|currency|coin|wallet|processor|system|ps$|ec$/i;
+const AMOUNTNAME = /amount|sum/i;
+function range(s) {
+  const m = (s || '').match(/\$?\s?([\d,]+(?:\.\d+)?)\s*(?:-|–|to)\s*\$?\s?([\d,]+(?:\.\d+)?)/i);
+  if (m) return [parseFloat(m[1].replace(/,/g, '')), parseFloat(m[2].replace(/,/g, ''))];
+  const n = (s || '').match(/min(?:imum)?[^0-9$]{0,15}\$?\s?([\d,]+(?:\.\d+)?)/i);
+  return n ? [parseFloat(n[1].replace(/,/g, '')), null] : null;
+}
+function radioText(r) {
+  // The radio's own row or label, else the text right after it; then the enclosing table
+  // or card, where plan tables put the "$50.00 - $549.00" range.
+  // A row holding several radios belongs to none of them; then the text up to the next
+  // input or <br> is the label.
+  let row = r.closest('tr, li, label');
+  if (row && row.querySelectorAll('input[type=radio]').length > 1) row = null;
+  let label = clean(row ? row.innerText || row.textContent : '');
+  if (label.length < 2) {
+    let n = r.nextSibling, s = '';
+    while (n && s.length < 120 && !(n.nodeType === 1 && (['BR', 'INPUT'].includes(n.tagName) || n.querySelector('input')))) {
+      s += ' ' + (n.textContent || ''); n = n.nextSibling;
+    }
+    label = clean(s);
+  }
+  const box = r.closest('table, .card, .plan, .package, div');
+  return [label.slice(0, 160), clean(box ? box.innerText || box.textContent : '').slice(0, 400)];
+}
+const described = Array.from(document.forms).map((f, index) => {
+  const els = Array.from(f.elements);
+  const amount = els.find(e => e.tagName === 'INPUT'
+      && ['text', 'number', 'tel', ''].includes((e.getAttribute('type') || '').toLowerCase())
+      && AMOUNTNAME.test([e.name, e.id, e.placeholder].join(' ')));
+  const controls = [];
+  els.filter(e => e.tagName === 'SELECT' && !e.disabled && e.name).forEach(s => {
+    const options = Array.from(s.options)
+      .filter(o => !o.disabled && o.value !== '' && !PLACEHOLDER.test(clean(o.text)))
+      .map(o => ({value: o.value, label: clean(o.text).slice(0, 80), range: range(o.text)}));
+    controls.push({kind: 'select', name: s.name, options});
+  });
+  const groups = {};
+  els.filter(e => e.type === 'radio' && !e.disabled && e.name && e.value !== '').forEach(r => {
+    const [label, box] = radioText(r);
+    (groups[r.name] = groups[r.name] || []).push({value: r.value, label: label.slice(0, 80), range: range(label) || range(box)});
+  });
+  Object.entries(groups).forEach(([name, options]) => controls.push({kind: 'radio', name, options}));
+  controls.forEach(c => {
+    c.plan = PLANNAME.test(c.name)
+      || (c.options.length > 0 && 2 * c.options.filter(o => PLANLIKE.test(o.label)).length >= c.options.length);
+  });
+  const submit = els.some(e => (e.tagName === 'BUTTON' && (e.getAttribute('type') || 'submit').toLowerCase() === 'submit')
+      || (e.tagName === 'INPUT' && ['submit', 'image'].includes(e.type)));
+  return {index, name: f.getAttribute('name') || f.id || '', amount: amount ? amount.name : null,
+          controls: controls.filter(c => c.options.length), submit};
+});
+const byControls = (a, b) => b.controls.length - a.controls.length;
+const form = described.filter(d => d.amount).sort(byControls)[0]
+          || described.filter(d => d.controls.length && d.submit).sort(byControls)[0];
+if (!form) return {forms: described.length};
+const plan = form.controls.find(c => c.plan) || null;
+const rest = form.controls.filter(c => c !== plan);
+const payment = rest.find(c => PAYNAME.test(c.name)) || rest.sort((a, b) => b.options.length - a.options.length)[0] || null;
+return {forms: described.length, form, plan, payment};
+"""
+
+# Sets the plan, the amount and one payment option on the reloaded page, and returns what the
+# form holds afterwards. The plan goes first because some sites refill the amount when the plan
+# changes; that amount is kept when it lies inside the plan's range.
+DEPOSIT_FILL_JS = r"""
+const [index, plan, payment, amountName, range] = arguments;
+const f = document.forms[index];
+if (!f) return {error: 'the deposit form is not on the reloaded page'};
+// The crawler's alert/confirm override (handle_alert) only covered the first page; a
+// "Are you sure?" confirm() on submit would otherwise block the pass.
+window.alert = () => {}; window.confirm = () => true;
+const els = Array.from(f.elements);
+function set(c) {
+  if (!c) return null;
+  if (c.kind === 'select') {
+    const s = els.find(e => e.tagName === 'SELECT' && e.name === c.name);
+    if (!s) return 'missing';
+    s.value = c.value;
+    Array.from(s.options).forEach(o => { o.selected = o.value === c.value; });
+    ['input', 'change'].forEach(t => s.dispatchEvent(new Event(t, {bubbles: true})));
+    if (window.jQuery) { try { window.jQuery(s).trigger('change'); } catch (e) {} }
+    return s.value;
+  }
+  const r = els.find(e => e.type === 'radio' && e.name === c.name && e.value === c.value);
+  if (!r) return 'missing';
+  r.click();
+  if (!r.checked) { r.checked = true; r.dispatchEvent(new Event('change', {bubbles: true})); }
+  const now = els.find(e => e.type === 'radio' && e.name === c.name && e.checked);
+  return now ? now.value : '';
+}
+const state = {plan: set(plan)};
+const a = amountName ? els.find(e => e.name === amountName) : null;
+if (a) {
+  const [min, max] = range || [null, null];
+  let v = parseFloat((a.value || '').replace(/[^\d.]/g, ''));
+  if (!(v > 0) || (min && v < min) || (max && v > max)) v = min || 100;
+  a.value = String(v);
+  ['input', 'change', 'keyup', 'blur'].forEach(t => a.dispatchEvent(new Event(t, {bubbles: true})));
+  state.amount = a.value;
+}
+state.payment = set(payment);
+return state;
+"""
+
+# Clicks the form's own submit button (or submits the form) once this script has returned, so
+# the navigation does not cut the WebDriver call short.
+DEPOSIT_SUBMIT_JS = r"""
+const f = document.forms[arguments[0]];
+const b = Array.from(f.elements).find(e => (e.tagName === 'BUTTON' && (e.getAttribute('type') || 'submit').toLowerCase() === 'submit')
+    || (e.tagName === 'INPUT' && ['submit', 'image'].includes(e.type)));
+setTimeout(() => { if (b) b.click(); else if (f.requestSubmit) f.requestSubmit(); else f.submit(); }, 0);
+return b ? 'button ' + JSON.stringify((b.innerText || b.value || '').trim().slice(0, 30)) : 'form.submit()';
+"""
+
+# Whether the page after a submit is the deposit form again (a visible amount field), and any
+# error or alert text it shows. The confirmation page also carries amount/type, but as hidden fields.
+DEPOSIT_RESULT_JS = r"""
+const amountName = arguments[0];
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+const back = !!amountName && Array.from(document.forms).some(f => {
+  const a = f.elements[amountName];
+  return a && a.tagName === 'INPUT' && a.type !== 'hidden' && vis(a);
+});
+const messages = Array.from(document.querySelectorAll('.error, .alert, .alert-danger, .text-danger, .invalid-feedback, [role=alert]'))
+  .filter(vis).map(e => (e.innerText || '').replace(/\s+/g, ' ').trim()).filter(t => t && t.length < 200);
+return {back, messages: Array.from(new Set(messages)).slice(0, 3)};
+"""
+
 def process_deposit_page(driver, href, directory_name, original_window):
-    def safe_find_elements(by, value, retries=3, delay=1):
-        """Safely find elements and handle StaleElementReferenceException."""
-        for attempt in range(retries):
-            try:
-                elements = driver.find_elements(by, value)
-                if elements is not None:
-                    return [el for el in elements if el is not None]  # Filter out None elements
-                else:
-                    return []  # Return empty list if no elements are found
-            except StaleElementReferenceException:
-                if attempt < retries - 1:
-                    time.sleep(delay)  
-                else:
-                    raise
+    safe_href = href.replace('://', '_').replace('/', '_').replace('?', '_')
 
-    def safe_click_element(element, retries=3, delay=1):
-        """Safely click an element and handle StaleElementReferenceException."""
-        for attempt in range(retries):
-            try:
-                if element is not None:  # Check if element is not None
-                    driver.execute_script("arguments[0].scrollIntoView(true);", element)  # Scroll to the element
-                    time.sleep(0.5)  # Small delay to ensure the element is in view
-                    element.click()
-                return
-            except StaleElementReferenceException:
-                if attempt < retries - 1:
-                    time.sleep(delay)
-                else:
-                    raise
-
-    def disable_google_translate_bar():
-        """Disable the Google Translate bar if it appears."""
-        try:
-            driver.execute_script("""
-                var element = document.querySelector('#google_translate_element');
-                if (element) {
-                    element.style.display = 'none';
-                }
-                var translateBar = document.querySelector('.goog-te-banner-frame');
-                if (translateBar) {
-                    translateBar.style.display = 'none';
-                }
-                var body = document.querySelector('body');
-                if (body) {
-                    body.classList.remove('translated-rtl');
-                }
-            """)
-        except Exception as e:
-            logging.error(f"Failed to disable Google Translate bar: {e}")
-
-    def clear_input_fields(input_elements, select_elements, text_fields):
-        """Clear the values in input fields (radio buttons, checkboxes, text fields, and dropdowns)."""
-        for input_element in input_elements:
-            try:
-                if input_element.get_attribute('type') in ['radio', 'checkbox']:
-                    input_element.click()  # Toggle the state of radio buttons and checkboxes
-            except Exception as e:
-                logging.error(f"Failed to clear input element: {e}")
-
-        for text_field in text_fields:
-            try:
-                text_field.clear()
-            except Exception as e:
-                logging.error(f"Failed to clear text field: {e}")
-
-        for select_element in select_elements:
-            try:
-                select = Select(select_element)
-                select.deselect_all()
-            except Exception as e:
-                logging.error(f"Failed to clear dropdown: {e}")
-
-    def set_radio_option(input_elements, radio_option):
-        """Set the value of a radio button option."""
-        for input_element in input_elements:
-            try:
-                if input_element.get_attribute('type') == 'radio' and input_element.get_attribute('value') == radio_option:
-                    safe_click_element(input_element)
-                    break
-            except Exception as e:
-                logging.error(f"Failed to set radio option: {e}")
-
-    def set_dropdown_options(select_elements, dropdown_options, dropdown_values):
-        """Set the values of dropdown options."""
-        for select_element, options in zip(select_elements, dropdown_values):
-            try:
-                select = Select(select_element)
-                for option in options:
-                    select.select_by_value(option)
-            except Exception as e:
-                logging.error(f"Failed to set dropdown option: {e}")
-
-    def set_text_field_values(text_fields, text_field_value):
-        """Set the values of text fields."""
-        for text_field in text_fields:
-            try:
-                text_field.send_keys(text_field_value)
-            except Exception as e:
-                logging.error(f"Failed to set text field value: {e}")
-
-    def find_submit_button(driver):
-        """Find and return the submit button element."""
-        possible_selectors = ["input[type='submit']", "button[type='submit']", "input[type='button']", "button[type='button']"]
-        for selector in possible_selectors:
-            submit_buttons = safe_find_elements(By.CSS_SELECTOR, selector)
-            if submit_buttons:
-                return submit_buttons[0]
-        return None
-
-    def capture_html_and_screenshot(driver, directory_name, href, counter):
-        """Capture the HTML content and screenshot of the current page."""
-        html_content = driver.page_source
-
-        # Create unique file name based on the combination values for captured web pages
-        html_file_path = os.path.join(directory_name, f"deposit_page_{href.replace('://', '_').replace('/', '_').replace('?', '_')}_{counter}.html")
-
-        with open(html_file_path, 'w', encoding='utf-8') as file:
-            file.write(html_content)
-
+    def capture(counter):
+        """Save the current page as deposit_page_<href>_<counter>.html plus a full-page screenshot."""
+        with open(os.path.join(directory_name, f"deposit_page_{safe_href}_{counter}.html"), 'w', encoding='utf-8') as file:
+            file.write(driver.page_source)
         result = driver.execute_cdp_cmd("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True})
-        screenshot_data = base64.b64decode(result['data'])
-        screenshot_path = os.path.join(directory_name, f"deposit_screenshot_{counter}.png")
-        with open(screenshot_path, 'wb') as file:
-            file.write(screenshot_data)
-
+        with open(os.path.join(directory_name, f"deposit_screenshot_{safe_href}_{counter}.png"), 'wb') as file:
+            file.write(base64.b64decode(result['data']))
         logging.info(f"Captured and saved data for deposit page {href} with counter: {counter}")
+
+    def wait_for_page():
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+        time.sleep(3)
+
+    def accept_alert(where):
+        try:
+            alert = driver.switch_to.alert
+            logging.info(f"Deposit page {href}: accepted a dialog {where}: {alert.text[:150]!r}")
+            alert.accept()
+        except NoAlertPresentException:
+            pass
 
     driver.execute_script("window.open(arguments[0]);", href)
     driver.switch_to.window(driver.window_handles[-1])
-    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
-    time.sleep(3)
-
     try:
-        # Disable Google Translate bar if it appears
-        disable_google_translate_bar()
+        wait_for_page()
+        # The page as the site serves it, before anything is filled in. Some sites show their
+        # wallet addresses here already, and it shows what the form offered if the passes fail.
+        capture(0)
+        found = driver.execute_script(DEPOSIT_FORM_JS)
+        form, plan, payment = found.get('form'), found.get('plan'), found.get('payment')
+        if not form:
+            logging.info(f"Deposit page {href}: no deposit form ({found.get('forms', 0)} form(s) on the page, "
+                         f"none with an amount field or a choice control and a submit button); 0 passes planned")
+            return
 
-        # Find input elements
-        select_elements = safe_find_elements(By.TAG_NAME, 'select')
-        input_elements = safe_find_elements(By.CSS_SELECTOR, 'input[type="checkbox"], input[type="radio"]')
-        text_fields = safe_find_elements(By.CSS_SELECTOR, 'input[type="text"], input[type="number"]')
+        plan_choice = plan['options'][0] if plan else None
+        options = payment['options'] if payment else [None]
+        if len(options) > MAX_DEPOSIT_PASSES:
+            logging.info(f"Deposit page {href}: {len(options)} payment options, only the first {MAX_DEPOSIT_PASSES} are tried")
+            options = options[:MAX_DEPOSIT_PASSES]
+        chosen = {c['name'] for c in (plan, payment) if c}
+        others = [f"{c['kind']} {c['name']!r}" for c in form['controls'] if c['name'] not in chosen]
+        logging.info(
+            f"Deposit page {href}: form #{form['index']} {form['name']!r}; "
+            + (f"plan {plan['kind']} {plan['name']!r} ({len(plan['options'])} options), using {plan_choice['label']!r}"
+               + (f" range {plan_choice['range']}" if plan_choice.get('range') else "") if plan else "no plan control")
+            + "; " + (f"payment {payment['kind']} {payment['name']!r} with {len(payment['options'])} options "
+                      f"{[o['label'] for o in payment['options']]}" if payment else "no payment-method control, one pass with the site's default")
+            + f"; amount field {form['amount']!r}"
+            + (f"; left as they are: {others}" if others else "")
+            + f"; {len(options)} passes planned")
 
-        # Store input options in separate lists/dictionaries
-        radio_options = [element.get_attribute('value') for element in input_elements if element.get_attribute('type') == 'radio']
-        dropdown_options = {select.get_attribute('name'): [option.get_attribute('value') for option in select.find_elements(By.TAG_NAME, 'option')] for select in select_elements}
-        text_fields_values = ['1000']  # or any other desired values
-        counter = 1
+        wallets, form_back_in_a_row, passes = set(), 0, 0
+        for counter, option in enumerate(options, start=1):
+            try:
+                if counter > 1:
+                    driver.get(href)
+                    wait_for_page()
+                state = driver.execute_script(
+                    DEPOSIT_FILL_JS, form['index'],
+                    {'kind': plan['kind'], 'name': plan['name'], 'value': plan_choice['value']} if plan else None,
+                    {'kind': payment['kind'], 'name': payment['name'], 'value': option['value']} if option else None,
+                    form['amount'], (plan_choice or {}).get('range'))
+                if state.get('error'):
+                    logging.info(f"Deposit pass {counter} on {href}: {state['error']}, stopping")
+                    break
+                how = driver.execute_script(DEPOSIT_SUBMIT_JS, form['index'])
+                time.sleep(1)
+                accept_alert("after submitting")
+                wait_for_page()
+                capture(counter)
+                passes += 1
+                found_wallets = wallet_like(driver.page_source)
+                wallets.update(found_wallets)
+                result = driver.execute_script(DEPOSIT_RESULT_JS, form['amount'])
+                logging.info(
+                    f"Deposit pass {counter} on {href}: payment {option['label'] if option else 'site default'!r}"
+                    f"{' (' + option['value'] + ')' if option else ''}; submitted with {state} via {how}; "
+                    f"result title {driver.title[:60]!r}, url {driver.current_url}, wallet-like strings {found_wallets or 'none'}"
+                    + (f"; the deposit form came back{': ' + ' | '.join(result['messages']) if result['messages'] else ' with no message'}"
+                       if result['back'] else ""))
+                form_back_in_a_row = form_back_in_a_row + 1 if result['back'] and not found_wallets else 0
+                if form_back_in_a_row >= 2:
+                    logging.info(f"Deposit page {href}: the form came back on two passes in a row, stopping")
+                    break
+            except UnexpectedAlertPresentException:
+                accept_alert(f"during pass {counter}")
+        logging.info(f"Deposit page {href}: {passes} passes run, {len(wallets)} distinct wallet-like strings")
 
-        # Generate all possible combinations of input options
-        all_combinations = itertools.product(radio_options, dropdown_options.values(), text_fields_values)
-
-        # Iterate over each combination
-        for radio_option, dropdown_values, text_field_value in all_combinations:
-            # Clear existing values
-            clear_input_fields(input_elements, select_elements, text_fields)
-
-            # Set values for the current combination
-            set_radio_option(input_elements, radio_option)
-            set_dropdown_options(select_elements, dropdown_options, dropdown_values)
-            set_text_field_values(text_fields, text_field_value)
-
-            # Find and click the submit button
-            submit_button = find_submit_button(driver)
-            if submit_button:
-                safe_click_element(submit_button)
-
-            # Wait for the resulting page to load
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
-            time.sleep(3)
-
-            # Capture HTML and screenshot
-            capture_html_and_screenshot(driver, directory_name, href, counter)
-            counter += 1
-
-            # Navigate back to the original deposit page
-            driver.get(href)
-
-    except UnexpectedAlertPresentException as e:
-        alert = driver.switch_to.alert
-        logging.warning(f"Unexpected alert present while processing deposit page {href}: {alert.text}")
-        alert.accept()
-        logging.info(f"Accepted unexpected alert for deposit page {href}. Moving to next link.")
+    except UnexpectedAlertPresentException:
+        accept_alert("while reading the page")
     except Exception as e:
         logging.error(f"Failed to process deposit page {href}: {e}")
     finally:
@@ -840,11 +1141,11 @@ MAILINATOR_MAX_CLICKS = 3
 
 def _mailinator_links(inbox, msg_id, params):
     base = f"{MAILINATOR_API}/inboxes/{inbox}/messages/{msg_id}"
-    resp = requests.get(f"{base}/links", params=params, timeout=15)
+    resp = curl_requests.get(f"{base}/links", params=params, timeout=15)
     resp.raise_for_status()
     links = resp.json().get('links', [])
     if not links:  # fall back to the hrefs in the message body
-        resp = requests.get(base, params=params, timeout=15)
+        resp = curl_requests.get(base, params=params, timeout=15)
         resp.raise_for_status()
         for part in resp.json().get('parts', []):
             links += [html.unescape(l) for l in re.findall(r'https?://[^\s"\'<>]+', part.get('body', ''))]
@@ -867,7 +1168,7 @@ def check_mailinator_inbox_and_click_links(api_key, driver, email_address, signu
     deadline = time.time() + wait_seconds
     while time.time() < deadline and should_continue and not clicked:
         try:
-            resp = requests.get(f"{MAILINATOR_API}/inboxes/{inbox}",
+            resp = curl_requests.get(f"{MAILINATOR_API}/inboxes/{inbox}",
                                 params={**params, "limit": 10, "sort": "descending"}, timeout=15)
             resp.raise_for_status()
             for msg in resp.json().get('msgs', []):
@@ -879,7 +1180,7 @@ def check_mailinator_inbox_and_click_links(api_key, driver, email_address, signu
                     driver.get(link)
                     clicked += 1
                     logging.info(f"Clicked link in email: {link}")
-        except (requests.RequestException, ValueError, KeyError) as e:
+        except (curl_requests.exceptions.RequestException, ValueError, KeyError) as e:
             logging.error(f"Error checking Mailinator inbox {inbox}: {e}")
         except WebDriverException as e:
             logging.error(f"Error opening a link from the Mailinator inbox {inbox}: {e}")
