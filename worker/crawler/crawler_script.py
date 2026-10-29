@@ -14,8 +14,7 @@ import time
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
+from seleniumbase import Driver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait, Select
@@ -59,11 +58,15 @@ MAILINATOR_WAIT_SECONDS = 60   # how long to poll the sign-up inbox for a confir
 # 'Pass@1234' was refused as too weak by sign-up checks against breached-password
 # lists (swifttradinginc.live, Oct 24); this one is long and not a common password.
 ACCOUNT_PASSWORD = '<CRAWLER_PASSWORD>'
-# Chromium/chromedriver locations. Defaults match the Crimson worker nodes
-# (snap Chromium shim + system chromedriver), the same paths recv.py uses.
-# Override via env for other environments.
-CHROMEDRIVER_PATH = os.environ.get('CHROMEDRIVER_PATH', '/usr/bin/chromedriver')
+# Chromium location. The default matches the Crimson worker nodes (snap Chromium shim), the
+# same path recv.py uses. Override via env for other environments. SeleniumBase downloads a
+# chromedriver that matches the browser, so no chromedriver path is set.
 CHROME_BINARY = os.environ.get('CHROME_BIN', '/usr/bin/chromium-browser')
+# Chrome runs headed, not headless: headless Chrome announces itself as "HeadlessChrome" in its
+# User-Agent, which is what most Cloudflare walls stopped (Oct 20). On Linux the headed window
+# goes to an Xvfb virtual display (see start_virtual_display); --show-browser skips Xvfb.
+WINDOW_SIZE = (1920, 1080)
+use_xvfb = True
 # --------------------------------------------------------------------------
 
 # Configure logging
@@ -72,28 +75,26 @@ sys.stdout = open(log_file_path, 'a', buffering=1)
 sys.stderr = open(log_file_path, 'a', buffering=1)
 logging.info("Script started.")
 
-def setup_chrome_options(headless=True):
-    chrome_options = webdriver.ChromeOptions()
-    if headless:
-        chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--start-maximized")
-    chrome_options.add_argument("--disable-popup-blocking")
-    chrome_options.add_argument("--disable-translate")
-    chrome_options.add_experimental_option("prefs", {
-        "translate_whitelists": {},
-        "translate": {"enabled": False},
-        "intl.accept_languages": "en-US,en"
-    })
-    # Off the VMs (e.g. a local Windows test) these paths don't exist; Selenium then
-    # uses the installed Chrome and fetches a matching chromedriver itself.
-    if os.path.exists(CHROME_BINARY):
-        chrome_options.binary_location = CHROME_BINARY
-    return chrome_options
+# Xvfb virtual display for the headed browser on Linux. SeleniumBase's Driver() does not start
+# one itself (only its pytest and SB() runners do), so it is started here, once per run, before
+# the first browser. Windows has no Xvfb; there the browser window is shown.
+virtual_display = None
 
+def start_virtual_display():
+    global virtual_display
+    if not use_xvfb or not sys.platform.startswith('linux'):
+        return
+    from sbvirtualdisplay import Display
+    virtual_display = Display(visible=False, size=WINDOW_SIZE, backend="xvfb")
+    virtual_display.start()
+    logging.info(f"Xvfb virtual display started ({WINDOW_SIZE[0]}x{WINDOW_SIZE[1]}, DISPLAY={os.environ.get('DISPLAY')})")
 
-chrome_options = setup_chrome_options()
+def stop_virtual_display():
+    if virtual_display is not None:
+        try:
+            virtual_display.stop()
+        except Exception as e:
+            logging.error(f"Failed to stop the Xvfb display: {e}")
 
 # Handle pop ups and alerts
 def handle_alert(driver):
@@ -118,13 +119,18 @@ def handle_alert(driver):
 
 # Initialize driver function
 #
-# Each browser gets its own chromedriver Service. A single module-level Service
-# used to be shared by every webdriver.Chrome() call, and a browser was also
-# opened at import time and never quit: every run leaked a chromedriver plus
-# Chrome, and later starts reused a Service that was already running.
+# A SeleniumBase Driver, headed (headed=True also stops SeleniumBase from switching to headless
+# on Linux). It is a Selenium WebDriver, so the rest of the script uses it unchanged. The flags
+# are the ones the plain Selenium setup used; SeleniumBase sets most of them too.
 def initialize_driver():
-    service = Service(executable_path=CHROMEDRIVER_PATH if os.path.exists(CHROMEDRIVER_PATH) else None)
-    driver = webdriver.Chrome(service=service, options=chrome_options)
+    driver = Driver(
+        browser="chrome",
+        headed=True,
+        binary_location=CHROME_BINARY if os.path.exists(CHROME_BINARY) else None,
+        locale_code="en-US",
+        window_size=f"{WINDOW_SIZE[0]},{WINDOW_SIZE[1]}",
+        chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-popup-blocking,--disable-translate",
+    )
     handle_alert(driver)  # Handle alerts immediately after driver initialization
     return driver
 
@@ -2337,20 +2343,22 @@ def enter_email_code(driver, code, code_page_url):
 
 # Main function
 def main():
-    global driver, chrome_options, current_site_url
+    global driver, current_site_url, use_xvfb
     # --url crawls one site without reading urls.txt or touching the crawled_urls.txt
-    # checkpoint, for testing a single site; --show-browser runs Chrome with a window.
+    # checkpoint, for testing a single site; --show-browser shows the Chrome window on a
+    # Linux desktop instead of drawing it on Xvfb (on Windows the window is always shown).
     parser = argparse.ArgumentParser(description="Crimson authenticated crawler")
     parser.add_argument('--url', help="crawl only this site instead of urls.txt")
-    parser.add_argument('--show-browser', action='store_true', help="run Chrome with a visible window")
+    parser.add_argument('--show-browser', action='store_true', help="on Linux, use the real display instead of Xvfb")
     args = parser.parse_args()
     if args.show_browser:
-        chrome_options = setup_chrome_options(headless=False)
+        use_xvfb = False
     if args.url:  # also print the log to the terminal
         console = logging.StreamHandler(sys.__stdout__)
         console.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logging.getLogger().addHandler(console)
 
+    start_virtual_display()
     driver = initialize_driver()
     handle_alert(driver)  # Handle initial alerts right after the driver is initialized
     try:
@@ -2370,6 +2378,7 @@ def main():
     finally:
         logging.info("Quitting Driver")
         driver.quit()
+        stop_virtual_display()
 
 if __name__ == "__main__":
     main()
