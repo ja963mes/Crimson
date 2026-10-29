@@ -120,19 +120,137 @@ def handle_alert(driver):
 # Initialize driver function
 #
 # A SeleniumBase Driver, headed (headed=True also stops SeleniumBase from switching to headless
-# on Linux). It is a Selenium WebDriver, so the rest of the script uses it unchanged. The flags
-# are the ones the plain Selenium setup used; SeleniumBase sets most of them too.
+# on Linux), in UC mode. It is a Selenium WebDriver, so the rest of the script uses it unchanged.
+# The flags are the ones the plain Selenium setup used; SeleniumBase sets most of them too.
+# On ipfighter.com/bot-detection (Oct 29) plain headed SeleniumBase scored 94%, flagged for
+# navigator.webdriver, domAutomationController and chrome.runtime. UC mode cleared the first two
+# but made document.hasFocus() false; focus emulation (emulate_focus) fixed that: 98%, only
+# chrome.runtime left.
+#
+# UC mode replaces driver.get(): it fetches the URL with Python requests first and, on a
+# redirect, an error status or a captcha, opens the page in a new tab and closes the current
+# one. The crawler tracks its tabs by handle (original_window), so the plain get() is put back;
+# bot walls are handled where pages load instead (pass_bot_wall).
 def initialize_driver():
     driver = Driver(
         browser="chrome",
+        uc=True,
         headed=True,
         binary_location=CHROME_BINARY if os.path.exists(CHROME_BINARY) else None,
         locale_code="en-US",
         window_size=f"{WINDOW_SIZE[0]},{WINDOW_SIZE[1]}",
         chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-popup-blocking,--disable-translate",
     )
+    if hasattr(driver, "default_get"):
+        driver.get = driver.default_get
+    emulate_focus(driver)
     handle_alert(driver)  # Handle alerts immediately after driver initialization
     return driver
+
+# document.hasFocus() is false in UC mode, a sign bot checks look for. Chrome's focus emulation
+# makes the page report focus. It holds per tab, so every new tab gets it too.
+def emulate_focus(driver):
+    try:
+        driver.execute_cdp_cmd("Emulation.setFocusEmulationEnabled", {"enabled": True})
+    except Exception as e:
+        logging.info(f"Could not turn on focus emulation: {e}")
+
+# --- Bot walls and Cloudflare Turnstile -------------------------------------------------------
+# A bot wall is a whole page put in front of the site ("Just a moment...", "Verify you are human",
+# "Performing security verification"); a Turnstile can also sit inside the sign-up form, which
+# check_captcha() used to skip the site for. A wall is passed in up to three steps, stopping as
+# soon as the site shows: wait for it to clear on its own; reload the page with chromedriver
+# disconnected (the UC mode trick: the check runs while no driver is attached); click the
+# Turnstile box with SeleniumBase's uc_gui_click_captcha(), which moves the real mouse (on Linux
+# inside Xvfb; on Windows the desktop mouse). A Cloudflare block page ("Sorry, you have been
+# blocked", error 1020) has nothing to pass and is only logged.
+BOT_WALL_JS = r"""
+const title = (document.title || '').trim();
+const text = (document.body ? document.body.innerText : '').replace(/\s+/g, ' ').trim();
+const html = document.documentElement ? document.documentElement.outerHTML : '';
+const cf = /\/cdn-cgi\/challenge-platform\/|challenges\.cloudflare\.com|cf-chl|cf_chl_opt/i.test(html);
+if (text.length < 3000 && /sorry, you have been blocked|error 1020|you are unable to access/i.test(text) && (cf || /cloudflare|ray id/i.test(text)))
+  return {kind: 'blocked', title: title, text: text.slice(0, 200)};
+if (/^(just a moment|please wait|attention required|one more step|ddos-guard|checking your browser)/i.test(title)
+    || (text.length < 1500 && /verify(ing)? (that )?you are (a )?human|checking (if the site connection is secure|your browser)|enable javascript and cookies to continue|performing security verification/i.test(text)))
+  return {kind: 'challenge', title: title, cf: cf, text: text.slice(0, 200)};
+return null;
+"""
+TURNSTILE_TOKEN_JS = "return Array.from(document.querySelectorAll('input[name=\"cf-turnstile-response\"]')).some(e => e.value);"
+
+def bot_wall(driver):
+    try:
+        return driver.execute_script(BOT_WALL_JS)
+    except Exception:
+        return None  # mid-navigation; the next read decides
+
+def wait_for_js(driver, script, seconds):
+    """True once script returns something truthy, polled every second for up to `seconds`."""
+    for _ in range(seconds):
+        try:
+            if driver.execute_script(script):
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
+
+def wall_cleared(driver, seconds):
+    for _ in range(seconds):
+        time.sleep(1)
+        if bot_wall(driver) is None:
+            return True
+    return False
+
+def reconnect_reload(driver, wait_seconds=6):
+    """Reload the current tab while chromedriver is disconnected, then reconnect to the same tab.
+    Reconnecting starts a new driver session, which drops focus emulation on every tab."""
+    handle = driver.current_window_handle
+    driver.execute_script("setTimeout(() => location.reload(), 50);")
+    driver.reconnect(wait_seconds)
+    for h in driver.window_handles:
+        driver.switch_to.window(h)
+        emulate_focus(driver)
+    driver.switch_to.window(handle)
+
+def pass_bot_wall(driver):
+    """True when the current page is not (or no longer) a bot wall."""
+    wall = bot_wall(driver)
+    if wall is None:
+        return True
+    url = driver.current_url
+    if wall['kind'] == 'blocked':
+        logging.info(f"Bot wall on {url}: blocked page ({wall['title']!r}: {wall['text'][:120]!r}), nothing to pass")
+        return False
+    logging.info(f"Bot wall on {url}: {wall['title']!r}" + (" (Cloudflare)" if wall.get('cf') else "") + f": {wall['text'][:120]!r}")
+    if wall_cleared(driver, 10):
+        logging.info(f"Bot wall on {url}: passed on its own, now at {driver.current_url}")
+        return True
+    try:
+        reconnect_reload(driver)
+        if wall_cleared(driver, 8):
+            logging.info(f"Bot wall on {url}: passed after a reload with chromedriver disconnected, now at {driver.current_url}")
+            return True
+        driver.uc_gui_click_captcha()
+        if wall_cleared(driver, 10):
+            logging.info(f"Bot wall on {url}: passed after clicking its checkbox, now at {driver.current_url}")
+            return True
+    except Exception as e:
+        logging.info(f"Bot wall on {url}: error while passing it: {e}")
+    logging.info(f"Bot wall on {url}: still there, giving up ({bot_wall(driver) or 'page unreadable'})")
+    return False
+
+def solve_turnstile(driver):
+    """(solved, how) for a Turnstile widget on the current page, judged by its response token."""
+    if wait_for_js(driver, TURNSTILE_TOKEN_JS, 6):
+        return True, "passed on its own"
+    try:
+        driver.uc_gui_click_captcha()
+    except Exception as e:
+        return False, f"clicking its checkbox failed ({e})"
+    if wait_for_js(driver, TURNSTILE_TOKEN_JS, 10):
+        return True, "passed after clicking its checkbox"
+    return False, "no token after clicking its checkbox"
 
 driver = None  # created in main(); fill_form() and the URL loop use this global
 # The urls.txt line being crawled. login_and_take_screenshot() writes it to
@@ -249,6 +367,11 @@ def check_captcha(driver):
         c = driver.execute_script(CAPTCHA_JS)
     except Exception as e:
         return False, f"could not inspect the page ({e}), trying anyway", None, None
+    if c["widgets"] == ["Cloudflare Turnstile"]:
+        solved, how = solve_turnstile(driver)
+        if solved:
+            return False, f"Cloudflare Turnstile on the sign-up form, {how}", None, None
+        return True, f"Cloudflare Turnstile on the sign-up form, {how}, skipping the site", None, None
     if c["widgets"]:
         return True, f"{' and '.join(c['widgets'])} on the sign-up form, skipping the site", None, None
     visible = [i for i in c["inputs"] if i["visible"]]
@@ -822,6 +945,7 @@ def fill_sign_up_form(driver, start_url):
             if has_two_or_more_password_fields(driver, current_url) and not form_filled and should_continue:
                 driver = ensure_driver(driver)
                 driver.get(current_url)
+                pass_bot_wall(driver)
                 captcha_blocks, captcha_summary, captcha_answer, captcha_target = check_captcha(driver)
                 logging.info(f"Captcha check on {driver.current_url}: {captcha_summary}")
                 if captcha_blocks:
@@ -993,6 +1117,7 @@ def has_two_or_more_password_fields(driver, url):
         return url
     try:
         driver.get(url)
+        pass_bot_wall(driver)
         password_inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="password"]')
         if len(password_inputs) >= 2:
             return url
@@ -1082,6 +1207,7 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
             return
         driver.get(login_url)
         logging.info(f"Navigating to URL: {login_url}")
+        pass_bot_wall(driver)
         original_window = driver.current_window_handle
 
         try:
@@ -1338,8 +1464,10 @@ def process_link(driver, href, directory_name, original_window):
         return [], []  # logged out and could not log in again: the pages would all be the login page
     driver.execute_script("window.open(arguments[0]);", href)
     driver.switch_to.window(driver.window_handles[-1])
+    emulate_focus(driver)
     WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
     time.sleep(3)
+    pass_bot_wall(driver)
     if looks_logged_out(driver) and not SESSION_END_RE.search(href) and not LOGIN_URL_RE.search(href):
         if not relogin_here(driver):
             logging.info(f"Not saving {href}: the session is lost; no further pages are saved for this site")
@@ -1602,6 +1730,7 @@ def click_deposit_button(driver, directory_name, base_domain, original_window, p
     new_tabs = [h for h in driver.window_handles if h not in handles_before]
     if new_tabs:
         driver.switch_to.window(new_tabs[0])
+        emulate_focus(driver)
 
     stem = windows_safe(f"deposit_button_{label}_" + start_url.replace('://', '_').replace('/', '_').replace('?', '_'))
     save_page(driver, directory_name, stem)
@@ -1940,6 +2069,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
     def wait_for_page():
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
         time.sleep(3)
+        pass_bot_wall(driver)
 
     def accept_alert(where):
         try:
@@ -1951,6 +2081,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
 
     driver.execute_script("window.open(arguments[0]);", href)
     driver.switch_to.window(driver.window_handles[-1])
+    emulate_focus(driver)
     try:
         wait_for_page()
         dismiss_blocking_popups(driver)
@@ -2118,6 +2249,7 @@ def find_login_url_with_single_password_field(driver, start_url, signup_url=None
         visited_urls.add(current_url)
         try:
             driver.get(current_url)
+            pass_bot_wall(driver)
             is_signup_page = current_url in (start_url, signup_url) or any(k in current_url.lower() for k in SIGNUP_URL_KEYWORDS)
             login_url = None if is_signup_page else has_single_password_field(driver, current_url)
             state = page_state(driver)

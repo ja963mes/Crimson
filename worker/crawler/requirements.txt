@@ -1,3 +1,4 @@
-selenium
+seleniumbase
+pyautogui
 bs4
 requests
