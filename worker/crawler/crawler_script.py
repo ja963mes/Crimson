@@ -96,23 +96,30 @@ def stop_virtual_display():
         except Exception as e:
             logging.error(f"Failed to stop the Xvfb display: {e}")
 
-# Handle pop ups and alerts
+# Handle pop ups and alerts. alert/confirm/prompt are replaced so they never block the browser; each
+# message is also kept in sessionStorage (the last 10), which page_state() reads, because some sites
+# report the sign-up result only in an alert: profitpulsecapitals.com (ASP.NET) answered the sign-up
+# with alert("Your Registration was successful."), and the unhandled alert ended the crawl (Oct 29).
+# The override used to be set on the first page only; prepare_tab() installs it for every new page.
+DIALOG_OVERRIDE_JS = r"""
+(() => {
+  const note = (kind, message) => {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem('__crawler_dialogs') || '[]');
+      saved.push(String(message).slice(0, 300));
+      sessionStorage.setItem('__crawler_dialogs', JSON.stringify(saved.slice(-10)));
+    } catch (e) {}
+    console.log(kind + ' called with message: ' + message);
+  };
+  window.alert = message => { note('Alert', message); };
+  window.confirm = message => { note('Confirm', message); return true; };
+  window.prompt = (message, defaultText) => { note('Prompt', message); return defaultText; };
+})();
+"""
+
 def handle_alert(driver):
     try:
-        # Inject JavaScript to override alert, confirm, and prompt functions
-        driver.execute_script("""
-            window.alert = function(message) {
-                console.log("Alert called with message: " + message);
-            };
-            window.confirm = function(message) {
-                console.log("Confirm called with message: " + message);
-                return true;  // Return true to simulate clicking "OK"
-            };
-            window.prompt = function(message, defaultText) {
-                console.log("Prompt called with message: " + message + ", default text: " + defaultText);
-                return defaultText;  // Return the default text to simulate entering text and clicking "OK"
-            };
-        """)
+        driver.execute_script(DIALOG_OVERRIDE_JS)
         logging.info("Alert functions overridden to log messages to the console.")
     except Exception as e:
         logging.error(f"Failed to override alert functions: {e}")
@@ -143,8 +150,7 @@ def initialize_driver():
     )
     if hasattr(driver, "default_get"):
         driver.get = driver.default_get
-    emulate_focus(driver)
-    handle_alert(driver)  # Handle alerts immediately after driver initialization
+    prepare_tab(driver)
     return driver
 
 # document.hasFocus() is false in UC mode, a sign bot checks look for. Chrome's focus emulation
@@ -154,6 +160,18 @@ def emulate_focus(driver):
         driver.execute_cdp_cmd("Emulation.setFocusEmulationEnabled", {"enabled": True})
     except Exception as e:
         logging.info(f"Could not turn on focus emulation: {e}")
+
+# Settings every tab needs: focus emulation, and the dialog override for the page already shown
+# (handle_alert) and for every page loaded in the tab from now on. Both last only as long as the
+# driver session, so reconnect_reload() calls this again on every tab. A tab opened with
+# window.open() gets them once the crawler switches to it, after its first page has started loading.
+def prepare_tab(driver):
+    emulate_focus(driver)
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": DIALOG_OVERRIDE_JS})
+    except Exception as e:
+        logging.info(f"Could not install the dialog override for new pages: {e}")
+    handle_alert(driver)
 
 # --- Bot walls and Cloudflare Turnstile -------------------------------------------------------
 # A bot wall is a whole page put in front of the site ("Just a moment...", "Verify you are human",
@@ -210,7 +228,7 @@ def reconnect_reload(driver, wait_seconds=6):
     driver.reconnect(wait_seconds)
     for h in driver.window_handles:
         driver.switch_to.window(h)
-        emulate_focus(driver)
+        prepare_tab(driver)
     driver.switch_to.window(handle)
 
 def pass_bot_wall(driver):
@@ -782,9 +800,12 @@ const logout = Array.from(document.querySelectorAll('a,button')).filter(vis).som
     /log-?out|sign-?out|logoff|a=logout/i.test(e.getAttribute('href') || '') ||
     /^\s*(log ?out|sign ?out|log off)\s*$/i.test(e.innerText || ''))
   || Array.from(document.forms).some(f => /log-?out|sign-?out|logoff/i.test(f.getAttribute('action') || ''));
-return {url: location.href, errors: [...new Set(errors)].slice(0, 8), invalid: invalid.slice(0, 5), logout: logout,
+// alert()/confirm() messages kept by DIALOG_OVERRIDE_JS count as page messages and page text.
+let dialogs = [];
+try { dialogs = JSON.parse(sessionStorage.getItem('__crawler_dialogs') || '[]'); } catch (e) {}
+return {url: location.href, errors: [...new Set(dialogs.concat(errors))].slice(0, 8), invalid: invalid.slice(0, 5), logout: logout,
         passwords: Array.from(document.querySelectorAll('input[type=password]')).filter(vis).length,
-        text: (document.body ? document.body.innerText : '').slice(0, 20000)};
+        dialogs: dialogs, text: (dialogs.join(' \n') + ' \n' + (document.body ? document.body.innerText : '')).slice(0, 20000)};
 """
 SIGNUP_OK_RE = re.compile(r"registration (was |is )?(complete|completed|successful)|successfully (registered|signed up|created)|registered successfully|"
                           r"account (has been |was )?(created|registered)|thank you for (registering|signing up|joining|your registration)|"
@@ -802,7 +823,7 @@ def page_state(driver):
         return driver.execute_script(PAGE_STATE_JS)
     except Exception as e:
         logging.info(f"Could not read the page state: {e}")
-        return {"url": "", "errors": [], "invalid": [], "logout": False, "passwords": 0, "text": ""}
+        return {"url": "", "errors": [], "invalid": [], "logout": False, "passwords": 0, "dialogs": [], "text": ""}
 
 def new_errors(before, after):
     """Error-like messages on the page after a submit that were not on it before."""
@@ -930,6 +951,7 @@ def fill_sign_up_form(driver, start_url):
     global should_continue, email_used, password_used
     driver = ensure_driver(driver)
     base_domain = get_base_domain(start_url)
+    site_domains = {base_domain}  # plus the domain the start page redirects to, if another one
     visited_urls = set()
     urls_to_check = [start_url]
     form_filled = False
@@ -942,7 +964,18 @@ def fill_sign_up_form(driver, start_url):
             continue
         visited_urls.add(current_url)
         try:
-            if has_two_or_more_password_fields(driver, current_url) and not form_filled and should_continue:
+            found = has_two_or_more_password_fields(driver, current_url)
+            # A site whose first page redirects to another domain (fxcapital3-pro.com -> fxcapital3.com,
+            # arbitragetrading.io -> arbitragescanner.io, Oct 29) had every link on it counted as off-site,
+            # so the search ended on the first page. The domain the start page lands on counts too.
+            landed = driver.current_url
+            if current_url == start_url and landed.startswith('http') and not same_site(landed, base_domain):
+                site_domains.add(get_base_domain(landed))
+                logging.info(f"{start_url} redirected to {landed}; pages on {get_base_domain(landed)} count as the same site")
+            if not found and (gated := agent_gated_signup(driver)):
+                logging.info(f"Agent-gated sign-up: {gated}; stopping the sign-up search")
+                break
+            if found and not form_filled and should_continue:
                 driver = ensure_driver(driver)
                 driver.get(current_url)
                 pass_bot_wall(driver)
@@ -1064,10 +1097,12 @@ def fill_sign_up_form(driver, start_url):
                                         break
                                     after_submit = code_state  # the login search starts where the code step ended
                             if not email_checked and (VERIFY_EMAIL_RE.search(after_submit["text"]) or VERIFY_EMAIL_RE.search(after_submit["url"])):
-                                # cryptocoinprop.com (/verify-email/) and swifttradinginc.live refuse
-                                # login until the address is confirmed, so the search would be wasted.
-                                logging.info("Account created, waiting on e-mail verification (no confirmation link was clicked); skipping the login search")
-                                break
+                                # The login used to be skipped here, since cryptocoinprop.com (/verify-email/)
+                                # and swifttradinginc.live refuse it until the address is confirmed. But
+                                # itrademagnet.com asked for verification, sent no e-mail at all and let the
+                                # account log in without it (Oct 29), so the login is tried; a refusal shows
+                                # up as "Login result: failed".
+                                logging.info("The page asks for e-mail verification and no confirmation link was clicked; trying to log in anyway")
 
                             if crawl_if_already_logged_in(driver, "after sign-up"):
                                 break
@@ -1089,25 +1124,37 @@ def fill_sign_up_form(driver, start_url):
                         else:
                             logging.info("Form submission unsuccessful.")
                     else:
+                        gated = agent_gated_signup(driver)
+                        if gated:
+                            logging.info(f"Agent-gated sign-up: {gated}; stopping the sign-up search")
+                            break
                         logging.info("No sign-up form found on the page (no visible form with a password field that is not a login form).")
                 except Exception as e:
                     logging.error(f"An error occurred: {str(e)}")
 
             if not form_filled:
-                for link in driver.find_elements(By.CSS_SELECTOR, 'a[href]'):
-                    absolute_link = urljoin(current_url, link.get_attribute('href'))
+                # The hrefs are read in one script call. Reading them link by link failed when the page
+                # changed in between: on olymptrade-wid.com and blog.investax.io (Oct 29) the
+                # StaleElementReferenceException was not caught here and ended the site's crawl.
+                hrefs = driver.execute_script("return Array.from(document.querySelectorAll('a[href]')).map(a => a.href);") or []
+                for href in hrefs:
+                    absolute_link = urljoin(current_url, href)
                     # same_site() also takes subdomains: securenovatrade.com's sign-up and login are on
                     # account.securenovatrade.com, which used to count as another site.
-                    if same_site(absolute_link, base_domain) and not is_blacklisted(absolute_link):
+                    if any(same_site(absolute_link, d) for d in site_domains) and not is_blacklisted(absolute_link):
                         if absolute_link not in visited_urls and absolute_link not in urls_to_check and should_continue:
                             urls_to_check.append(absolute_link)
         except TimeoutException:
             logging.info(f"Sign-up unsuccessful for {current_url}. Website not reachable")
+        except Exception as e:
+            # Anything else ends this page, not the site: the next queued page is tried.
+            logging.error(f"An error occurred on {current_url} during the sign-up search: {str(e).splitlines()[0] if str(e) else e!r}")
     if not form_filled:
         logging.info("No page with two or more password fields found.")
     return form_filled
 
-# Check for multiple password fields
+# Check for multiple password fields. Each page loaded is logged with where it ended up, so a site
+# with no sign-up page found shows what the search saw (Oct 29: six such sites logged nothing).
 def has_two_or_more_password_fields(driver, url):
     if url.startswith('javascript:'):
         return None
@@ -1119,10 +1166,62 @@ def has_two_or_more_password_fields(driver, url):
         driver.get(url)
         pass_bot_wall(driver)
         password_inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="password"]')
+        landed = driver.current_url
+        logging.info(f"Sign-up search: {url}" + (f" -> {landed}" if landed != url else "")
+                     + f"; {len(password_inputs)} password field(s)")
         if len(password_inputs) >= 2:
             return url
     except Exception as e:
         logging.error(f"An error occurred while fetching {url}: {str(e)}")
+
+# Agent-gated sign-up: the page the site's sign-up links lead to asks only for name, e-mail and
+# phone, with no password anywhere on the page, so the account (if any) is set up by a sales agent
+# or in a later step the crawler cannot reach. kestrel-fundast.ca/auth (first and last name, e-mail,
+# phone, "Join Now") and coinvektaai.uk/landers/vmpt/auth/ (the same fields, "Open an account")
+# took the whole 5-minute limit while the search walked every other page (Oct 29). These sites can
+# still be HYIPs; this only ends the sign-up search and says why. Checked on sign-up-like URLs only,
+# so a call-back form elsewhere on a site does not count. A form with a message box is a contact form.
+SIGNUP_LIKE_URL_RE = re.compile(r"regist|sign-?up|join|auth|account|open|lander|get-?started|create", re.I)
+LEAD_FORM_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+if (Array.from(document.querySelectorAll('input[type=password]')).some(vis)) return null;
+const hint = e => [e.name, e.id, e.placeholder, e.getAttribute('autocomplete'), e.getAttribute('aria-label')].join(' ').toLowerCase();
+const isEmail = e => e.type === 'email' || /e-?mail/.test(hint(e));
+const isPhone = e => e.type === 'tel' || /phone|mobile|whatsapp|\btel\b/.test(hint(e));
+const isName = e => /first.?name|last.?name|full.?name|fname|lname|surname|\bname\b/.test(hint(e));
+const BUTTON = /join|open|regist|sign ?up|create|get started|start|continue|submit|apply|claim|reserve|account|next|send/i;
+const boxes = new Set(Array.from(document.forms));
+Array.from(document.querySelectorAll('input')).filter(e => vis(e) && isEmail(e) && !e.form).forEach(e => {
+  for (let b = e.parentElement, i = 0; b && i < 6; b = b.parentElement, i++)
+    if (b.querySelector('button, input[type=submit]')) { boxes.add(b); break; }
+});
+for (const box of boxes) {
+  const inputs = Array.from(box.querySelectorAll('input')).filter(e => vis(e) && !['hidden', 'checkbox', 'radio', 'submit', 'button', 'image'].includes(e.type));
+  if (!inputs.length || inputs.length > 8 || Array.from(box.querySelectorAll('textarea')).some(vis)) continue;
+  if (!inputs.some(isEmail) || !(inputs.some(isPhone) || inputs.some(isName))) continue;
+  const buttons = Array.from(box.querySelectorAll('button, input[type=submit]')).filter(vis);
+  const send = buttons.map(b => (b.innerText || b.value || '').trim()).find(t => BUTTON.test(t))
+            || (buttons.some(b => (b.type || '').toLowerCase() === 'submit') ? '(submit)' : undefined);
+  if (send === undefined) continue;
+  return {fields: inputs.map(e => e.name || e.id || e.type), button: send.slice(0, 40)};
+}
+return null;
+"""
+
+def agent_gated_signup(driver):
+    """A log message when the current page is a sign-up-like URL whose only account form is a
+    name/e-mail/phone lead form (see LEAD_FORM_JS), else None."""
+    url = driver.current_url
+    if not SIGNUP_LIKE_URL_RE.search(urlparse(url).path + "?" + urlparse(url).query):
+        return None
+    try:
+        lead = driver.execute_script(LEAD_FORM_JS)
+    except Exception:
+        return None
+    if not lead:
+        return None
+    return (f"{url} has a form with {lead['fields']} and a {lead['button']!r} button but no password field "
+            f"(an agent or a later step sets up the account)")
 
 # "Success" used to be logged whenever a sign-up form was submitted, including sites where
 # the login then failed (swifttradinginc.live). It now needs a login that was not judged failed.
@@ -1464,7 +1563,7 @@ def process_link(driver, href, directory_name, original_window):
         return [], []  # logged out and could not log in again: the pages would all be the login page
     driver.execute_script("window.open(arguments[0]);", href)
     driver.switch_to.window(driver.window_handles[-1])
-    emulate_focus(driver)
+    prepare_tab(driver)
     WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
     time.sleep(3)
     pass_bot_wall(driver)
@@ -1730,7 +1829,7 @@ def click_deposit_button(driver, directory_name, base_domain, original_window, p
     new_tabs = [h for h in driver.window_handles if h not in handles_before]
     if new_tabs:
         driver.switch_to.window(new_tabs[0])
-        emulate_focus(driver)
+        prepare_tab(driver)
 
     stem = windows_safe(f"deposit_button_{label}_" + start_url.replace('://', '_').replace('/', '_').replace('?', '_'))
     save_page(driver, directory_name, stem)
@@ -2046,6 +2145,90 @@ return Array.from(document.querySelectorAll('a[href]')).map(a => a.href.split('#
 });
 """
 
+# Custom dropdowns: a payment choice built from <div>s instead of a <select>, which DEPOSIT_FORM_JS
+# cannot see. lscominer.com's Recharge page (Oct 29) has no <form>: a "Select Deposit Network" box
+# (div.select-selected) that opens a list of 10 <div value=...> networks (BTC, ETH, XRP, USDT Tron,
+# ...), an amount input and a "Deposit" button that posts the order and loads the page with the
+# wallet address. The control is found from the page's shape, not lscominer's class names: a visible
+# amount input, and in the box around it a deposit-like button and a visible element reading
+# "Select ..." / "Choose ..." (the innermost one). The options are the elements that become visible
+# when it is clicked, taken as the largest group sharing one parent; that also covers menus that
+# open elsewhere in the page. The elements found are kept in window.__crawler* between calls.
+CUSTOM_DROPDOWN_HELPERS_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+const press = e => ['mousedown', 'mouseup', 'click'].forEach(t => e.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window})));
+function dropdownParts() {
+  const AMOUNT = /amount|sum|usd|quantity|money|value|invest/i;
+  const BUTTON = /deposit|proceed|pay|continue|submit|fund|confirm|recharge|top ?up|invest/i;
+  const TRIGGER = /^(select|choose|please select|pick)\b/i;
+  const amounts = Array.from(document.querySelectorAll('input')).filter(e => vis(e)
+      && ['number', 'text', 'tel', ''].includes((e.getAttribute('type') || '').toLowerCase())
+      && AMOUNT.test([e.name, e.id, e.placeholder].join(' ')));
+  for (const amount of amounts) {
+    for (let box = amount.parentElement, i = 0; box && i < 6; box = box.parentElement, i++) {
+      const button = Array.from(box.querySelectorAll('button, [role=button], input[type=button], input[type=submit]'))
+          .find(b => vis(b) && BUTTON.test(clean(b.innerText || b.value)));
+      if (!button) continue;
+      const trigger = Array.from(box.querySelectorAll('div, span, button, a, p, label')).find(e => vis(e) && !e.closest('select')
+          && TRIGGER.test(clean(e.innerText)) && clean(e.innerText).length < 60
+          && !Array.from(e.children).some(c => TRIGGER.test(clean(c.innerText))));
+      if (trigger) return {amount, button, trigger};
+    }
+  }
+  return null;
+}
+"""
+# Finds the control, notes what is visible, and clicks the "Select ..." element.
+CUSTOM_DROPDOWN_OPEN_JS = CUSTOM_DROPDOWN_HELPERS_JS + r"""
+const p = dropdownParts();
+if (!p) return null;
+window.__crawlerParts = p;
+window.__crawlerBefore = new Set(Array.from(document.querySelectorAll('body *')).filter(vis));
+press(p.trigger);
+return {trigger: clean(p.trigger.innerText), amount: p.amount.name || p.amount.id || p.amount.placeholder || '',
+        button: clean(p.button.innerText || p.button.value)};
+"""
+# The labels of the options the click revealed.
+CUSTOM_DROPDOWN_OPTIONS_JS = CUSTOM_DROPDOWN_HELPERS_JS + r"""
+const before = window.__crawlerBefore || new Set();
+const groups = new Map();
+Array.from(document.querySelectorAll('body *')).filter(e => vis(e) && !before.has(e)).forEach(e => {
+  const t = clean(e.innerText);
+  if (!t || t.length > 80) return;
+  if (!groups.has(e.parentElement)) groups.set(e.parentElement, []);
+  groups.get(e.parentElement).push(e);
+});
+let best = [];
+groups.forEach(v => { if (v.length > best.length) best = v; });
+window.__crawlerOptions = best;
+return best.map(e => clean(e.innerText).slice(0, 60));
+"""
+# Clicks option arguments[0], sets the amount to arguments[1], and returns what the control shows.
+CUSTOM_DROPDOWN_PICK_JS = CUSTOM_DROPDOWN_HELPERS_JS + r"""
+const p = window.__crawlerParts, o = (window.__crawlerOptions || [])[arguments[0]];
+if (!p || !o) return {error: 'the option is not on the page'};
+window.alert = () => {}; window.confirm = () => true;
+press(o);
+Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(p.amount, String(arguments[1]));
+['input', 'change', 'keyup', 'blur'].forEach(t => p.amount.dispatchEvent(new Event(t, {bubbles: true})));
+return {shown: clean(p.trigger.innerText).slice(0, 60), amount: p.amount.value};
+"""
+# Clicks the deposit button once this script has returned (see DEPOSIT_SUBMIT_JS).
+CUSTOM_DROPDOWN_SUBMIT_JS = r"""
+const p = window.__crawlerParts;
+if (p) setTimeout(() => p.button.click(), 0);
+return !!p;
+"""
+# Visible input and textarea values: a wallet shown in a read-only input set by script is not in
+# page_source.
+INPUT_VALUES_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+return Array.from(document.querySelectorAll('input, textarea')).filter(e => vis(e) && e.type !== 'hidden' && e.type !== 'password')
+  .map(e => e.value || '').join(' ');
+"""
+CUSTOM_DROPDOWN_AMOUNT = 100
+
 # Deposit pages already run through the deposit step for the current site. aziminer.com's
 # /deposits/create was run twice: once as a link from /deposits, once as a dashboard link.
 deposit_pages_opened = set()
@@ -2079,9 +2262,64 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
         except NoAlertPresentException:
             pass
 
+    def custom_dropdown_passes():
+        """One pass per option of a custom (non-<select>) payment dropdown; see CUSTOM_DROPDOWN_HELPERS_JS.
+        False when the page has no such control, so the caller tries its other routes."""
+        opened = driver.execute_script(CUSTOM_DROPDOWN_OPEN_JS)
+        if not opened:
+            return False
+        time.sleep(1)  # menus slide open
+        labels = (driver.execute_script(CUSTOM_DROPDOWN_OPTIONS_JS) or [])[:MAX_DEPOSIT_PASSES]
+        if not labels:
+            logging.info(f"Deposit page {href}: clicking {opened['trigger']!r} showed no options")
+            return False
+        logging.info(f"Deposit page {href}: no deposit form, but a custom dropdown {opened['trigger']!r} with {len(labels)} "
+                     f"options {labels}; amount field {opened['amount']!r}, button {opened['button']!r}; {len(labels)} passes planned")
+        wallets, passes = set(), 0
+        for counter, label in enumerate(labels, start=1):
+            try:
+                index = counter - 1
+                if counter > 1:
+                    driver.get(href)
+                    wait_for_page()
+                    if looks_logged_out(driver):
+                        if not relogin_here(driver):
+                            logging.info(f"Deposit page {href}: the session is lost, stopping the passes")
+                            break
+                        driver.get(href)
+                        wait_for_page()
+                    if not driver.execute_script(CUSTOM_DROPDOWN_OPEN_JS):
+                        logging.info(f"Deposit pass {counter} on {href}: the dropdown is not on the reloaded page, stopping")
+                        break
+                    time.sleep(1)
+                    now = driver.execute_script(CUSTOM_DROPDOWN_OPTIONS_JS) or []
+                    if label not in now:
+                        logging.info(f"Deposit pass {counter} on {href}: option {label!r} is not in the reopened list, skipped")
+                        continue
+                    index = now.index(label)
+                state = driver.execute_script(CUSTOM_DROPDOWN_PICK_JS, index, CUSTOM_DROPDOWN_AMOUNT)
+                if state.get('error'):
+                    logging.info(f"Deposit pass {counter} on {href}: {state['error']}, stopping")
+                    break
+                time.sleep(0.5)
+                driver.execute_script(CUSTOM_DROPDOWN_SUBMIT_JS)
+                time.sleep(1)
+                accept_alert("after submitting")
+                wait_for_page()
+                capture(counter)
+                passes += 1
+                found_wallets = wallet_like(driver.page_source + " " + (driver.execute_script(INPUT_VALUES_JS) or ""))
+                wallets.update(found_wallets)
+                logging.info(f"Deposit pass {counter} on {href}: option {label!r}; set {state}; "
+                             f"result title {driver.title[:60]!r}, url {driver.current_url}, wallet-like strings {found_wallets or 'none'}")
+            except UnexpectedAlertPresentException:
+                accept_alert(f"during pass {counter}")
+        logging.info(f"Deposit page {href}: {passes} passes run, {len(wallets)} distinct wallet-like strings")
+        return True
+
     driver.execute_script("window.open(arguments[0]);", href)
     driver.switch_to.window(driver.window_handles[-1])
-    emulate_focus(driver)
+    prepare_tab(driver)
     try:
         wait_for_page()
         dismiss_blocking_popups(driver)
@@ -2094,6 +2332,8 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
         found = driver.execute_script(DEPOSIT_FORM_JS)
         form, plan, payment = found.get('form'), found.get('plan'), found.get('payment')
         if not form:
+            if custom_dropdown_passes():
+                return
             logging.info(f"Deposit page {href}: no deposit form ({found.get('forms', 0)} form(s) on the page, "
                          f"none with an amount field or a choice control and a submit button); 0 passes planned")
             # One level down only, so a method page that links back to the list is not reopened.
@@ -2272,8 +2512,11 @@ def find_login_url_with_single_password_field(driver, start_url, signup_url=None
                 logging.info(f"Login search: {current_url} sends a logged-in browser on to {state['url']}")
                 return None, state['url']
             login_like = []
-            for link in driver.find_elements(By.TAG_NAME, 'a'):
-                href = link.get_attribute('href')
+            # Hrefs and link texts in one script call, so a page that changes mid-loop cannot leave
+            # stale link elements (see the sign-up search).
+            links = driver.execute_script("return Array.from(document.querySelectorAll('a'))"
+                                          ".map(a => [a.getAttribute('href') ? a.href : '', (a.innerText || '').trim()]);") or []
+            for href, link_text in links:
                 if not href or href.startswith(('javascript:', 'mailto:', 'tel:')):
                     continue
                 absolute_link = urljoin(current_url, href)
@@ -2281,7 +2524,7 @@ def find_login_url_with_single_password_field(driver, start_url, signup_url=None
                         or SESSION_END_RE.search(absolute_link)
                         or absolute_link in urls_to_check or is_blacklisted(absolute_link)):
                     continue
-                if LOGIN_URL_RE.search(absolute_link) or LOGIN_TEXT_RE.match(link.text or ''):
+                if LOGIN_URL_RE.search(absolute_link) or LOGIN_TEXT_RE.match(link_text):
                     login_like.append(absolute_link)
                 else:
                     urls_to_check.append(absolute_link)
