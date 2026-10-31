@@ -77,6 +77,12 @@ def outcome(lines):
         reason = last(r"ERROR - An error occurred while fetching \S+: Message: (.*)") or 'no sign-up page found'
     else:
         level, reason = 'ERROR', last(r"ERROR - (.*)") or 'no result line'
+    gated = last(r"Agent-gated sign-up: (\S+) has a form")
+    if gated and level in ('NO_SIGNUP', 'SIGNUP_FOUND'):
+        reason = f"agent-gated sign-up (name/e-mail/phone, no password) at {gated}"
+    redirect = last(r"redirected to (\S+); pages on")
+    if redirect:
+        reason = (reason + '; ' if reason else '') + f"start page redirected to {redirect}"
     if processor:
         reason = (reason + '; ' if reason else '') + f"processor {processor.group(1)}" + (f" id {processor.group(2)}" if processor.group(2) else '')
     if 'Timeout exceeded for' in text:
@@ -87,9 +93,9 @@ def outcome(lines):
     return level, wallets, (reason or '')[:160]
 
 
-def run_site(name, url, show_browser):
-    """Run the crawler on one site, echoing its output; return (output lines, seconds)."""
-    folder = os.path.join(RUNS, name)
+def run_site(name, url, show_browser, runs=RUNS):
+    """Run the crawler on one site in <runs>/<name>/, echoing its output; return (output lines, seconds)."""
+    folder = os.path.join(runs, name)
     os.makedirs(folder, exist_ok=True)
     cmd = [sys.executable, os.path.abspath(CRAWLER), '--url', url] + (['--show-browser'] if show_browser else [])
     env = dict(os.environ, PYTHONIOENCODING='utf-8')
