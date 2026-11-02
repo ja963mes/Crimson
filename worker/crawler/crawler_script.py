@@ -2,6 +2,7 @@
 import argparse
 import base64
 import html
+import json
 import logging
 import os
 import random
@@ -24,6 +25,7 @@ from selenium.common.exceptions import (
     TimeoutException, WebDriverException, NoAlertPresentException,
     UnexpectedAlertPresentException, StaleElementReferenceException
 )
+from hyip_classifier import MAX_PAGES, SiteEvidence, classify, clear_b, verdict_line
 
 
 # Global variables
@@ -279,6 +281,42 @@ current_site_url = None
 # Set by login_and_take_screenshot() when the login is not judged failed, so the
 # per-site "Success" line means logged in, not merely that a form was filled.
 logged_in = False
+
+# HYIP (A) or other scam (B), decided in hyip_classifier.py from what the crawl sees. The crawl
+# hands it each page it loads and what it finds (sign-up form fields, lead forms, off-site sign-up,
+# login, back-office links, deposit plan controls, wallets); log_site_result() writes the verdict.
+# A site with hard evidence of another product or a hand-off (lead form, prop-firm challenge,
+# subscription, hash rate) is stopped before an account is made. --classify-only stops every site
+# there, so a labelled CSV can be checked without making accounts.
+site_evidence = SiteEvidence('')
+classify_only = False
+single_site = False  # --url: the evidence file goes in the run folder as hyip_evidence.json
+
+def read_page(driver, kind=None):
+    """Give the page the browser is on to the HYIP evidence (the first MAX_PAGES pages of the site)."""
+    url = driver.current_url
+    if url.startswith('chrome-error') and not site_evidence.read:
+        site_evidence.unreachable = site_evidence.unreachable or "the browser showed its own error page"
+    if not url.startswith('http') or not site_evidence.wants_page(url):
+        return
+    try:
+        site_evidence.add_page(driver.page_source, url, kind or ('home' if not site_evidence.pages else 'page'))
+    except Exception as e:
+        logging.info(f"HYIP check: could not read {url}: {str(e).splitlines()[0] if str(e) else e!r}")
+
+def stop_if_clearly_b(where, at_form=False):
+    """True (and logged) when the evidence so far says B for sure. At a sign-up form (at_form), a
+    classify-only run stops too."""
+    why = clear_b(site_evidence)
+    if why:
+        site_evidence.stopped_early = why
+        logging.info(f"HYIP check: clearly B ({'; '.join(why)}); not signing up ({where})")
+        return True
+    if classify_only and at_form:
+        site_evidence.stopped_early = ['classify-only run']
+        logging.info(f"HYIP check: classify-only run; not signing up ({where})")
+        return True
+    return False
 
 # Generate random strings and emails for filling forms
 def generate_random_string(length=8, names_file=NAMES_FILE): #names.txt contains a dictionary of common names
@@ -1049,6 +1087,9 @@ def fill_sign_up_form(driver, start_url):
     # Stops once an account is made. After an error past that point (swantradecapital.com, Oct 26)
     # the loop carried on and loaded every queued page again, about 55 s of page loads for nothing.
     while should_continue and not form_filled:
+        if classify_only and len(site_evidence.pages) >= MAX_PAGES:
+            logging.info(f"HYIP check: classify-only run; {MAX_PAGES} pages read, ending the sign-up search")
+            break
         if not urls_to_check:
             # Every sign-up link of the site leads to another domain: investings24.com's "Register" /
             # "Create Live Account" go to track.dmx.tradecore.io/?t=YXrfy49758UT, which redirects to
@@ -1069,6 +1110,7 @@ def fill_sign_up_form(driver, start_url):
             if not landed.startswith('http'):
                 break
             site_domains.add(get_base_domain(landed))
+            site_evidence.add('crawl_offsite_signup', landed)
             logging.info(f"Off-site sign-up: {start_url}'s sign-up link {link} leads to {landed}; "
                          f"pages on {get_base_domain(landed)} count as the same site")
             urls_to_check.append(landed)
@@ -1085,6 +1127,9 @@ def fill_sign_up_form(driver, start_url):
             if current_url == start_url and landed.startswith('http') and not same_site(landed, base_domain):
                 site_domains.add(get_base_domain(landed))
                 logging.info(f"{start_url} redirected to {landed}; pages on {get_base_domain(landed)} count as the same site")
+            # A lead form or another product on the start page ends the site before any sign-up.
+            if current_url == start_url and stop_if_clearly_b("start page"):
+                return False
             if not found and (gated := agent_gated_signup(driver)):
                 logging.info(f"Agent-gated sign-up: {gated}; stopping the sign-up search")
                 break
@@ -1098,6 +1143,7 @@ def fill_sign_up_form(driver, start_url):
                 driver = ensure_driver(driver)
                 driver.get(current_url)
                 pass_bot_wall(driver)
+                read_page(driver, 'register')
                 captcha_blocks, captcha_summary, captcha_answer, captcha_target = check_captcha(driver)
                 logging.info(f"Captcha check on {driver.current_url}: {captcha_summary}")
                 if captcha_blocks:
@@ -1123,6 +1169,12 @@ def fill_sign_up_form(driver, start_url):
                         form = pick_signup_form(driver)
                     if form and should_continue:
                         logging.info(f"Sign-up form chosen: action={form.get_attribute('action')!r}")
+                        try:
+                            site_evidence.add_signup_form(form.parent.execute_script(FIELD_HINTS_JS, form) or [], driver.current_url)
+                        except Exception as e:
+                            logging.info(f"HYIP check: could not read the sign-up form's fields: {str(e).splitlines()[0] if str(e) else e!r}")
+                        if stop_if_clearly_b("sign-up form", at_form=True):
+                            return False
                         predictions = predict_values(form)
                         password_used = next((v for v in predictions.values() if v in (ACCOUNT_PASSWORD, ACCOUNT_PASSWORD_ALT)), ACCOUNT_PASSWORD)
                         if password_used == ACCOUNT_PASSWORD_ALT:
@@ -1304,10 +1356,13 @@ def has_two_or_more_password_fields(driver, url):
         landed = driver.current_url
         logging.info(f"Sign-up search: {url}" + (f" -> {landed}" if landed != url else "")
                      + f"; {len(password_inputs)} password field(s)")
+        read_page(driver)
         if len(password_inputs) >= 2:
             return url
     except Exception as e:
         logging.error(f"An error occurred while fetching {url}: {str(e)}")
+        if not site_evidence.pages:  # the start page itself did not load
+            site_evidence.unreachable = site_evidence.unreachable or (str(e).splitlines()[0] if str(e) else repr(e))[:200]
 
 # Agent-gated sign-up: the page the site's sign-up links lead to asks only for name, e-mail and
 # phone, with no password anywhere on the page, so the account (if any) is set up by a sales agent
@@ -1355,6 +1410,7 @@ def agent_gated_signup(driver):
         return None
     if not lead:
         return None
+    site_evidence.add('crawl_lead_form', url, site_evidence.is_onsite(url))
     return (f"{url} has a form with {lead['fields']} and a {lead['button']!r} button but no password field "
             f"(an agent or a later step sets up the account)")
 
@@ -1367,6 +1423,19 @@ def log_site_result(url, email):
         logging.info(f"Signed up but not logged in: {url} ({email})")
     else:
         logging.info(f"Timeout or failure: {url}")
+    log_hyip_verdict(url)
+
+# The HYIP verdict line (run_regression.py reads it) and every feature behind it, with the page it
+# was seen on, in hyip_evidence.json (hyip_evidence_<domain>.json when crawling urls.txt).
+def log_hyip_verdict(url):
+    try:
+        verdict = classify(site_evidence)
+        logging.info(verdict_line(verdict))
+        name = 'hyip_evidence.json' if single_site else f"hyip_evidence_{windows_safe(site_evidence.domain)}.json"
+        with open(name, 'w', encoding='utf-8') as f:
+            json.dump(site_evidence.to_json(verdict), f, indent=1, ensure_ascii=False)
+    except Exception as e:
+        logging.error(f"HYIP check failed for {url}: {e}")
 
 # Process URLs from a list
 def fill_sign_up_urls_in_list(urls_file_path, last_processed_file_path):
@@ -1571,6 +1640,14 @@ def crawl_logged_in(driver, folder_url, base_domain, original_window):
     global logged_in
     logged_in = True
     dismiss_blocking_popups(driver)  # before the links are read: an overlay can hide or replace them
+    site_evidence.add('crawl_logged_in', folder_url, site_evidence.is_onsite(folder_url))
+    try:  # the page after login and the back-office pages it links to (deposit, withdraw, referral, plans)
+        site_evidence.add_page(driver.page_source, driver.current_url, 'account', count=False)
+        site_evidence.add_backoffice(driver.execute_script(
+            "return Array.from(document.querySelectorAll('a[href]')).map(a => [a.href, (a.innerText || '').trim()]);") or [],
+            driver.current_url)
+    except Exception as e:
+        logging.info(f"HYIP check: could not read the page after login: {str(e).splitlines()[0] if str(e) else e!r}")
 
     directory_name = windows_safe(folder_url.replace('://', '_').replace('/', '_'))
     os.makedirs(directory_name, exist_ok=True)
@@ -2588,6 +2665,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                 passes += 1
                 found_wallets = wallet_like(driver.page_source + " " + (driver.execute_script(INPUT_VALUES_JS) or ""))
                 wallets.update(found_wallets)
+                site_evidence.add_wallets(found_wallets, href)
                 logging.info(f"Deposit pass {counter} on {href}: option {label!r}; set {state}; "
                              f"result title {driver.title[:60]!r}, url {driver.current_url}, wallet-like strings {found_wallets or 'none'}")
             except UnexpectedAlertPresentException:
@@ -2625,6 +2703,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                 capture(counter)
                 found_wallets = wallet_like(driver.page_source + " " + (driver.execute_script(INPUT_VALUES_JS) or ""))
                 wallets.update(found_wallets)
+                site_evidence.add_wallets(found_wallets, href)
                 logging.info(f"Deposit pick {counter} on {href}: option {label!r} (picked {picked.get('picked')!r}); "
                              f"url {driver.current_url}, wallet-like strings {found_wallets or 'none'}")
             except UnexpectedAlertPresentException:
@@ -2644,8 +2723,15 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
         shown = wallet_like(driver.page_source)
         if shown:
             logging.info(f"Deposit page {href}: wallet-like strings on the page as served: {shown}")
+        try:
+            site_evidence.add_page(driver.page_source, driver.current_url, 'deposit', count=False)
+        except Exception as e:
+            logging.info(f"HYIP check: could not read deposit page {href}: {str(e).splitlines()[0] if str(e) else e!r}")
+        site_evidence.add_wallets(shown, href)
         found = driver.execute_script(DEPOSIT_FORM_JS)
         form, plan, payment = found.get('form'), found.get('plan'), found.get('payment')
+        if form:
+            site_evidence.add_deposit(href, plan, payment)
         if not form:
             if custom_dropdown_passes() or coin_select_passes():
                 return
@@ -2722,6 +2808,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                 passes += 1
                 found_wallets = wallet_like(driver.page_source)
                 wallets.update(found_wallets)
+                site_evidence.add_wallets(found_wallets, href)
                 result = driver.execute_script(DEPOSIT_RESULT_JS, form['amount'], form['index'])
                 logging.info(
                     f"Deposit pass {counter} on {href}: payment {option['label'] if option else 'site default'!r}"
@@ -2747,7 +2834,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
 
 # Sign-up form with timeout
 def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=300):
-    global should_continue, form_filled, logged_in, email_used, password_used, relogins_done, session_lost
+    global should_continue, form_filled, logged_in, email_used, password_used, relogins_done, session_lost, site_evidence
     should_continue = True
     form_filled = False
     logged_in = False
@@ -2755,6 +2842,7 @@ def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=300):
     password_used = ACCOUNT_PASSWORD
     relogins_done, session_lost = 0, False
     deposit_pages_opened.clear()
+    site_evidence = SiteEvidence(url)
 
     def target():
         global form_filled
@@ -3036,16 +3124,19 @@ def enter_email_code(driver, code, code_page_url):
 
 # Main function
 def main():
-    global driver, current_site_url, use_xvfb
+    global driver, current_site_url, use_xvfb, classify_only, single_site
     # --url crawls one site without reading urls.txt or touching the crawled_urls.txt
     # checkpoint, for testing a single site; --show-browser shows the Chrome window on a
     # Linux desktop instead of drawing it on Xvfb (on Windows the window is always shown).
     parser = argparse.ArgumentParser(description="Crimson authenticated crawler")
     parser.add_argument('--url', help="crawl only this site instead of urls.txt")
     parser.add_argument('--show-browser', action='store_true', help="on Linux, use the real display instead of Xvfb")
+    parser.add_argument('--classify-only', action='store_true',
+                        help="read the start page and the sign-up search's pages for the HYIP verdict; never sign up")
     args = parser.parse_args()
     if args.show_browser:
         use_xvfb = False
+    classify_only, single_site = args.classify_only, bool(args.url)
     if args.url:  # also print the log to the terminal
         console = logging.StreamHandler(sys.__stdout__)
         console.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
