@@ -80,6 +80,9 @@ def outcome(lines):
     gated = last(r"Agent-gated sign-up: (\S+) has a form")
     if gated and level in ('NO_SIGNUP', 'SIGNUP_FOUND'):
         reason = f"agent-gated sign-up (name/e-mail/phone, no password) at {gated}"
+    offsite = last(r"Off-site sign-up: \S+ sign-up link \S+ leads to (\S+);")
+    if offsite:
+        reason = (reason + '; ' if reason else '') + f"off-site sign-up at {offsite}"
     redirect = last(r"redirected to (\S+); pages on")
     if redirect:
         reason = (reason + '; ' if reason else '') + f"start page redirected to {redirect}"
