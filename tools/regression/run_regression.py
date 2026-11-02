@@ -14,7 +14,12 @@ and against the previous run. Each run is saved as results/<YYYY-MM-DD_HHMM>.csv
 Outcome levels, best first: WALLET (logged in and wallet-like strings seen), LOGGED_IN,
 SIGNED_UP (account made, not logged in), SIGNUP_FOUND (sign-up page found, sign-up failed),
 BLOCKED (captcha or bot check on the sign-up page), NO_SIGNUP (no sign-up page found),
+CLASSIFIED_B (stopped before sign-up: the HYIP check found another product or a hand-off),
 ERROR (crawler crashed, site unreachable, or run cut off).
+
+Each site also gets the crawler's HYIP verdict (A, B or none) with its family and reasons. Every
+site in sites.csv is an HYIP, so a B there is a disagreement, and CLASSIFIED_B counts as worse
+than any level a site reached before.
 """
 import argparse
 import ast
@@ -27,6 +32,12 @@ import sys
 import threading
 import time
 
+# Output sent to a file is written in the Windows code page (cp1252): nexahashcapital.com's "☾"
+# button label in a crawler log line made print() raise and ended a batch run at site 36 (Nov 1).
+# Characters the output cannot take are written as "?" instead.
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(errors='replace')
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CRAWLER = os.path.join(HERE, '..', 'authentication_crawling', 'crawler_script.py')
 RUNS = os.path.join(HERE, '..', 'runs')
@@ -34,8 +45,19 @@ RESULTS = os.path.join(HERE, 'results')
 SITES = os.path.join(HERE, 'sites.csv')
 SITE_TIMEOUT = 15 * 60  # hard cap per site on top of the crawler's own limit
 
-LEVELS = ['ERROR', 'NO_SIGNUP', 'BLOCKED', 'SIGNUP_FOUND', 'SIGNED_UP', 'LOGGED_IN', 'WALLET']
+LEVELS = ['ERROR', 'CLASSIFIED_B', 'NO_SIGNUP', 'BLOCKED', 'SIGNUP_FOUND', 'SIGNED_UP', 'LOGGED_IN', 'WALLET']
 WALLET_LIST_RE = re.compile(r"wallet-like strings (?:on the page as served: )?(\[[^\]]*\])")
+VERDICT_RE = re.compile(r"HYIP verdict: (A|B|none) \((.*?)\)(?: \| family [^|]*)? \| reasons: (.*)$", re.M)
+
+
+def verdict(lines):
+    """(verdict, family, reasons) from the crawler's "HYIP verdict:" line; ('', '', '') without one."""
+    found = VERDICT_RE.findall('\n'.join(lines))
+    if not found:
+        return '', '', ''
+    v, family, reasons = found[-1]
+    family = family.removeprefix('other scam: ') if v == 'B' else ('HYIP' if v == 'A' else '')
+    return v, family, reasons.strip()
 
 
 def outcome(lines):
@@ -56,6 +78,8 @@ def outcome(lines):
     if re.search(r" - INFO - Success: ", text):
         level = 'WALLET' if wallets else 'LOGGED_IN'
         reason = '' if wallets else 'no wallet-like strings on the deposit pages'
+    elif 'HYIP check: clearly B' in text:
+        level, reason = 'CLASSIFIED_B', 'stopped before sign-up: ' + (last(r"HYIP check: clearly B \((.*)\); not signing up") or '')
     elif 'Sign-up succeeded with' in text:
         # "Sign-up submitted ... no sign of success" (result unclear) does not count: on
         # aegisinvestmentgroup.com and nexgencrypto.live nothing was created.
@@ -93,14 +117,16 @@ def outcome(lines):
     relogins = len(re.findall(r"logging in again as", text))
     if relogins:
         reason = (reason + '; ' if reason else '') + f"re-logged in {relogins}x"
+    if 'HYIP check: classify-only run' in text:
+        reason = 'classify-only run, no sign-up' + ('; ' + reason if reason else '')
     return level, wallets, (reason or '')[:160]
 
 
-def run_site(name, url, show_browser, runs=RUNS):
+def run_site(name, url, show_browser, runs=RUNS, extra_args=()):
     """Run the crawler on one site in <runs>/<name>/, echoing its output; return (output lines, seconds)."""
     folder = os.path.join(runs, name)
     os.makedirs(folder, exist_ok=True)
-    cmd = [sys.executable, os.path.abspath(CRAWLER), '--url', url] + (['--show-browser'] if show_browser else [])
+    cmd = [sys.executable, os.path.abspath(CRAWLER), '--url', url] + (['--show-browser'] if show_browser else []) + list(extra_args)
     env = dict(os.environ, PYTHONIOENCODING='utf-8')
     start = time.time()
     proc = subprocess.Popen(cmd, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -168,8 +194,15 @@ def report(rows, sites, results_file):
     print('-' * 100)
     print(f"wallets: {counts['WALLET']}   logged in (incl. wallets): {logged}   signed up only: {counts['SIGNED_UP']}   "
           f"sign-up failed: {counts['SIGNUP_FOUND']}   blocked: {counts['BLOCKED']}   no sign-up page: {counts['NO_SIGNUP']}   "
-          f"error: {counts['ERROR']}")
+          f"stopped as B: {counts['CLASSIFIED_B']}   error: {counts['ERROR']}")
     print(f"total wallet-like strings: {sum(int(r['wallet_count']) for r in rows)}")
+    verdicts = [r.get('verdict') or '' for r in rows]
+    if any(verdicts):
+        print(f"HYIP verdicts: A {verdicts.count('A')}   B {verdicts.count('B')}   none {verdicts.count('none')}"
+              + (f"   no verdict line {verdicts.count('')}" if verdicts.count('') else ''))
+        for r in rows:
+            if r.get('verdict') == 'B':
+                print(f"  B: {r['name']} ({r.get('family', '')}): {(r.get('verdict_reasons') or '')[:150]}")
     if better:
         print("NEW BEST:", ', '.join(better))
     if worse:
@@ -212,15 +245,19 @@ def main():
             print(f"\n===== [{i}/{len(chosen)}] {s['name']} ({s['url']}) =====", flush=True)
             lines, seconds = run_site(s['name'], s['url'], args.show_browser)
             level, wallets, reason = outcome(lines)
+            v, family, why = verdict(lines)
             rows.append({'name': s['name'], 'url': s['url'], 'level': level, 'wallet_count': len(wallets),
-                         'wallets': ' '.join(wallets), 'reason': reason, 'seconds': int(seconds)})
-            print(f"----- {s['name']}: {level}, {len(wallets)} wallet-like strings, {int(seconds)} s" + (f" ({reason})" if reason else ''))
+                         'wallets': ' '.join(wallets), 'reason': reason, 'seconds': int(seconds),
+                         'verdict': v, 'family': family, 'verdict_reasons': why})
+            print(f"----- {s['name']}: {level}, {len(wallets)} wallet-like strings, {int(seconds)} s" + (f" ({reason})" if reason else '')
+                  + (f"; HYIP verdict {v}" + (f" ({family})" if v == 'B' else '') if v else ''))
     except KeyboardInterrupt:
         print("\nStopped; saving the sites finished so far.")
     finally:
         if rows:
             with open(results_file, 'w', newline='', encoding='utf-8') as f:
-                w = csv.DictWriter(f, fieldnames=['name', 'url', 'level', 'wallet_count', 'wallets', 'reason', 'seconds'])
+                w = csv.DictWriter(f, fieldnames=['name', 'url', 'level', 'wallet_count', 'wallets', 'reason', 'seconds',
+                                                  'verdict', 'family', 'verdict_reasons'])
                 w.writeheader()
                 w.writerows(rows)
             report(rows, sites, results_file)
