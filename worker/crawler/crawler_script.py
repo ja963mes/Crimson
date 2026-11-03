@@ -554,9 +554,28 @@ def predict_values(form):
             predictions[key] = generate_phone_number()
         elif input_type in DATE_INPUT_FORMATS:
             predictions[key] = generate_date_value(input_type)
+        elif (place := place_value(hints)) is not None:
+            predictions[key] = place
         else:
             predictions[key] = generate_random_string()
     return predictions
+
+# Postal-address fields get a US address that matches the US phone numbers, not a name from
+# names.txt: uphilltradex.com refused a sign-up with "The zip field is required." (Nov 1), and the
+# profile form mail.nexarioncapitalventure.com puts in front of its back office asks for address,
+# state, zip and city (see PROFILE_GATE_JS). A field about a wallet or payment account ("Bitcoin
+# address") is not a postal address.
+PAYMENT_ACCOUNT_HINT_RE = re.compile(r"wallet|btc|bitcoin|usdt|eth|tron|trx|ltc|crypto|perfect|payeer|account", re.I)
+
+def place_value(hints):
+    if PAYMENT_ACCOUNT_HINT_RE.search(hints):
+        return None
+    for pattern, value in ((r"zip|postal|post.?code", "62704"), (r"country|nationality", "United States"),
+                           (r"\bcity\b|\btown\b", "Springfield"), (r"\bstate\b|province", "IL"),
+                           (r"address|street|addr\b", "1458 Maple Avenue")):
+        if re.search(pattern, hints):
+            return value
+    return None
 
 # Passwords. ACCOUNT_PASSWORD has symbols and is 14 characters long. Sites that allow only
 # letters and digits, 8-12 characters, get ACCOUNT_PASSWORD_ALT: tradevistavelocityinvestmentmark.com
@@ -897,6 +916,64 @@ def handle_dropdowns(form, driver):
             except WebDriverException as e:
                 logging.error(f"Failed to select dropdown option using JavaScript: {e}")
 
+# Dropdowns drawn by a script over a hidden text box. coinrulefx.com/register (ARMember) keeps the
+# country in <input type="text" name="country" required value="0">, hidden, and shows a <dl> whose
+# <li data-value="..."> items set it when clicked; the first item, value 0, is "Country/Region". The
+# crawler could not type into the hidden box ("Element country is not interactable") and the site
+# refused the form: "Country/Region Please select atleast one option." (Nov 1). Done the way a
+# person does it: open the widget beside the box and click an item, preferring United States for a
+# country (the phone numbers are US ones), else the first real item; the item's data-value is set
+# directly only if the click did not change the box. Only a hidden text box whose own field wrapper
+# is visible and holds a list of items counts, so hidden steps of a multi-step form and honeypot
+# fields are left alone. Native <select>s are handle_dropdowns()'s.
+CUSTOM_CHOICES_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+// Hidden the way Selenium sees it: coinrulefx's box is full size but has opacity 0.
+const shown = e => vis(e) && getComputedStyle(e).opacity !== '0' && getComputedStyle(e).visibility !== 'hidden';
+const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+const PLACEHOLDER = /^(-+.*|select\b.*|choose\b.*|please (select|choose)\b.*|\.\.\.|…)?$/i;
+const f = arguments[0];
+const els = f.elements ? Array.from(f.elements) : Array.from(f.querySelectorAll('input, select, textarea'));
+const done = [];
+for (const e of els) {
+  if (e.tagName !== 'INPUT' || !['text', ''].includes((e.getAttribute('type') || '').toLowerCase()) || shown(e) || e.disabled) continue;
+  let wrap = e.parentElement;
+  for (let i = 0; wrap && wrap !== f && !vis(wrap) && i < 3; i++) wrap = wrap.parentElement;
+  if (!wrap || wrap === f || !vis(wrap)) continue;
+  if (wrap.querySelectorAll('input:not([type=hidden]), select, textarea').length > 3) continue;
+  const items = Array.from(wrap.querySelectorAll('li, [role=option], [data-value]'))
+      .filter(x => !x.contains(e) && x.closest('ul, ol, dl, [role=listbox], [class*=dropdown], [class*=options]')
+              && clean(x.textContent) && !x.querySelector('li, [role=option]'));
+  const hint = [e.name, e.id, e.getAttribute('aria-label'), e.getAttribute('placeholder')].join(' ');
+  const usable = items.filter(x => !PLACEHOLDER.test(clean(x.textContent)) && (x.getAttribute('data-value') ?? clean(x.textContent)) !== e.value
+                               && clean(x.textContent).toLowerCase() !== clean(e.getAttribute('aria-label')).toLowerCase());
+  if (!usable.length) continue;
+  const us = /country|nation|region/i.test(hint) && usable.find(x => /^(united states( of america)?|usa|us)$/i.test(clean(x.textContent)));
+  const pick = us || usable[0];
+  const before = e.value;
+  const head = wrap.querySelector('dt, [role=combobox], [class*=selection], [class*=head], [class*=toggle], [class*=selected]');
+  if (head && vis(head)) head.click();
+  pick.click();
+  if (e.value === before && pick.getAttribute('data-value') !== null) {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(e, pick.getAttribute('data-value'));
+    ['input', 'change'].forEach(t => e.dispatchEvent(new Event(t, {bubbles: true})));
+    if (window.jQuery) { try { window.jQuery(e).trigger('change'); } catch (x) {} }
+  }
+  if (head && vis(head) && wrap.querySelector('ul, [role=listbox]') && vis(wrap.querySelector('ul, [role=listbox]'))) head.click();
+  done.push({field: e.name || e.id || '(unnamed)', picked: clean(pick.textContent).slice(0, 40), value: e.value, was: before});
+}
+return done;
+"""
+
+def handle_custom_choices(driver, form):
+    """Pick an item in script-drawn dropdowns whose hidden text box could not be typed into (see CUSTOM_CHOICES_JS)."""
+    try:
+        for choice in driver.execute_script(CUSTOM_CHOICES_JS, form) or []:
+            logging.info(f"Custom dropdown {choice['field']!r}: picked {choice['picked']!r} "
+                         f"(the field went from {choice['was']!r} to {choice['value']!r})")
+    except Exception as e:
+        logging.info(f"Custom dropdowns could not be set: {str(e).splitlines()[0] if str(e) else e!r}")
+
 # --- Sign-up and login outcome checks --------------------------------------------------
 # Until Oct 20 a sign-up counted as successful whenever a button was clicked (the URL was
 # compared with a module-level start_url that was always ''), and a login whenever the URL
@@ -1187,6 +1264,7 @@ def fill_sign_up_form(driver, start_url):
                             return False
 
                         handle_dropdowns(form, driver)
+                        handle_custom_choices(driver, form)
                         time.sleep(1)
                         # A captcha in a later step was hidden when the page was first checked:
                         # fxtastytrades.com's step 3 is "Enter the code below: X7DPDX". Check again.
@@ -1236,6 +1314,8 @@ def fill_sign_up_form(driver, start_url):
                             after_submit = wait_for_outcome(driver, before_submit)
                             outcome, evidence = assess_signup(before_submit, after_submit, form_url)
                             logging.info(f"Sign-up result: {outcome} - {evidence}")
+                            if outcome in ("rejected", "unclear"):
+                                save_failed_page(driver, f"signup_{outcome}")
                             if outcome == "rejected":
                                 # The site refused the form, so there is no account to confirm
                                 # or log in to; skip the 60 s inbox wait and the login search.
@@ -1554,6 +1634,7 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
             outcome, evidence = "failed", f"landed on the password-recovery page {after_login['url'][:150]}"
         logging.info(f"Login result: {outcome} - {evidence}")
         if outcome == "failed":
+            save_failed_page(driver, "login_failed")
             return
         crawl_logged_in(driver, login_url, base_domain, original_window)
     except NoSuchElementException as e:
@@ -1634,12 +1715,70 @@ def relogin_here(driver):
         session_lost = True
         return False
 
+# "Complete your profile" gates after sign-up. mail.nexarioncapitalventure.com (HyipLab template)
+# sends every back-office page (/user/dashboard, /user/invest/statistics) to /user/user-data, a form
+# for first and last name, address, state, zip and city, until it is filled in; the crawler never
+# filled it and found no deposit link (Nov 1); its address, state, zip and city boxes are inside an
+# HTML comment, so the live form is first and last name only. A visible form on the page after login
+# counts as such a gate when the page has no password field, 2 or more of the form's visible fields
+# and 60% of them are name/address/contact fields, none is an amount, search or message box, and the
+# URL or the form's action reads like a set-up step or the page has 8 links or fewer. "Profile" and
+# "settings" do not count as a set-up step: the back-office settings forms of trade-earnerxsenergy.com
+# (21 links) and assetgain.org (20) have the same fields.
+PROFILE_GATE_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+if (Array.from(document.querySelectorAll('input[type=password]')).some(vis)) return null;
+const PROFILE = /first.?name|last.?name|full.?name|surname|\bname\b|address|street|city|state|province|zip|postal|post.?code|country|phone|mobile|birth|dob|gender/i;
+const STEP = /user-?data|complete|onboard|setup|kyc/i;
+const hint = e => [e.name, e.id, e.placeholder, e.getAttribute('aria-label'), e.labels && e.labels.length ? e.labels[0].innerText : ''].join(' ');
+const links = Array.from(document.querySelectorAll('a[href]')).filter(vis).length;
+for (let i = 0; i < document.forms.length; i++) {
+  const f = document.forms[i];
+  if (!vis(f)) continue;
+  const fields = Array.from(f.elements).filter(e => vis(e) && ['INPUT', 'SELECT', 'TEXTAREA'].includes(e.tagName)
+      && !['hidden', 'submit', 'button', 'checkbox', 'radio', 'file', 'image', 'reset'].includes((e.type || '').toLowerCase()));
+  if (fields.length < 2 || fields.some(e => /amount|\bsum\b|search|message|subject|comment/i.test(hint(e)))) continue;
+  const profile = fields.filter(e => PROFILE.test(hint(e)));
+  if (profile.length < 2 || profile.length < 0.6 * fields.length) continue;
+  const action = f.getAttribute('action') || '';
+  if (!(STEP.test(location.pathname) || STEP.test(action) || links <= 8)) continue;
+  return {index: i, fields: profile.map(e => e.name || e.id || e.type).slice(0, 10), action: action, links: links};
+}
+return null;
+"""
+
+def pass_profile_gate(driver):
+    """Fill in and submit a profile form that stands in front of the back office (see PROFILE_GATE_JS)."""
+    try:
+        gate = driver.execute_script(PROFILE_GATE_JS)
+        if not gate:
+            return
+        start = driver.current_url
+        form = driver.execute_script("return document.forms[arguments[0]];", gate['index'])
+        fill_form(form, predict_values(form), only_empty=True)
+        fill_textareas(form)
+        handle_dropdowns(form, driver)
+        handle_custom_choices(driver, form)
+        handle_checkbox(driver, form)
+        before = page_state(driver)
+        driver.execute_script("const f = arguments[0];"
+                              "const b = Array.from(f.querySelectorAll('button, input[type=submit]')).find(x => (x.getAttribute('type') || 'submit').toLowerCase() === 'submit');"
+                              "setTimeout(() => { if (b) b.click(); else if (f.requestSubmit) f.requestSubmit(); else f.submit(); }, 0);", form)
+        after = wait_for_outcome(driver, before)
+        still = driver.execute_script(PROFILE_GATE_JS)
+        logging.info(f"Profile gate on {start}: fields {gate['fields']}, {gate['links']} links on the page; filled in and submitted; "
+                     f"now at {after['url']}" + (f"; messages {new_errors(before, after)}" if new_errors(before, after) else "")
+                     + ("; the profile form is still there" if still and after['url'] == start else ""))
+    except Exception as e:
+        logging.info(f"Profile gate could not be passed: {str(e).splitlines()[0] if str(e) else e!r}")
+
 # Save and crawl the site from the current, logged-in page. The folder is named after
 # folder_url: the login page, or the page that was already logged in when no login was needed.
 def crawl_logged_in(driver, folder_url, base_domain, original_window):
     global logged_in
     logged_in = True
     dismiss_blocking_popups(driver)  # before the links are read: an overlay can hide or replace them
+    pass_profile_gate(driver)
     site_evidence.add('crawl_logged_in', folder_url, site_evidence.is_onsite(folder_url))
     try:  # the page after login and the back-office pages it links to (deposit, withdraw, referral, plans)
         site_evidence.add_page(driver.page_source, driver.current_url, 'account', count=False)
@@ -2033,6 +2172,20 @@ def save_page(driver, directory_name, stem):
     with open(os.path.join(directory_name, f"{stem}.png"), 'wb') as file:
         file.write(base64.b64decode(result['data']))
 
+# The page after a sign-up the site refused or gave no sign of success to, and after a failed login,
+# is saved in failed_pages/ (HTML and screenshot). On the Nov 1 blind run the cause of four failures
+# could not be read from the log: oneexclusivecapitalbitfx.com's and brightpathwealthassets.com's
+# GoldCoders sign-ups came back with no message, uphilltradex.com's zip and answer fields stayed
+# empty, and tradecoineasily.com's login failed after a sign-up that looked successful.
+def save_failed_page(driver, what):
+    try:
+        os.makedirs('failed_pages', exist_ok=True)
+        stem = windows_safe(f"{what}_{urlparse(driver.current_url).netloc}_{datetime.now().strftime('%H%M%S')}")
+        save_page(driver, 'failed_pages', stem)
+        logging.info(f"Saved the page after the {what.replace('_', ' ')} as failed_pages/{stem}.html and .png")
+    except Exception as e:
+        logging.info(f"Could not save the page after the {what.replace('_', ' ')}: {str(e).splitlines()[0] if str(e) else e!r}")
+
 def deposit_passes_in_dialog(driver, start_url, label, directory_name, stem):
     """Run the deposit passes on a dialog that the deposit/invest button opened on start_url: fill
     and submit the form in it, save where that lands (on another site too), and reopen the dialog
@@ -2066,6 +2219,13 @@ def deposit_passes_in_dialog(driver, start_url, label, directory_name, stem):
         if state.get('error'):
             logging.info(f"Deposit button {label!r} pass {counter}: {state['error']}, stopping")
             break
+        time.sleep(CHOICE_WAIT)  # the address may show once the option is chosen (see CHOICE_WAIT)
+        before = wallet_like(driver.page_source + " " + (driver.execute_script(INPUT_VALUES_JS) or ""))
+        if before:
+            save_page(driver, directory_name, f"{stem}_{counter}_chosen")
+            site_evidence.add_wallets(before, start_url)
+            logging.info(f"Deposit button {label!r} pass {counter}: after choosing {(option or {}).get('label', 'site default')!r}, "
+                         f"before submitting: wallet-like strings {before}")
         how = driver.execute_script(DEPOSIT_SUBMIT_JS, form['index'])
         found_wallets = []
         for _ in range(6):  # a hosted invoice renders its address a few seconds after loading
@@ -2176,6 +2336,11 @@ def click_deposit_button(driver, directory_name, base_domain, original_window, p
 # control is the other one. Each pass reloads the page and sets the controls by name in
 # JavaScript, which also reaches hidden radios and select2-wrapped selects, so nothing goes stale.
 MAX_DEPOSIT_PASSES = 12
+# Seconds to wait after choosing a payment option before reading the page and submitting. Some
+# sites fetch the method's details when it is chosen: trade-earnerxsenergy.com's gateway dropdown
+# loads /user/deposit/gateway/<code> and inserts its "credentials" into the form, and the crawler
+# submitted at once; the form came back twice with no message and nothing was read in between (Nov 1).
+CHOICE_WAIT = 2
 
 # Shared by the deposit-step scripts below. formAt(i) is document.forms[i], or for i = -1 the
 # deposit box of a page without a deposit <form>: beacondigital.ltd's "Add Funds" page is a React
@@ -2288,12 +2453,80 @@ const e = els.find(x => keyOf(x, els) === arguments[1]);
 return e ? e.value : null;
 """
 
-DEPOSIT_FORM_JS = DEPOSIT_HELPERS_JS + METHOD_BUTTONS_JS + r"""
+# Deposit forms that sit in a hidden dialog until a button outside it opens them. assetgain.org's
+# /deposit lists 4 gateways, each with a ".paynow" button (data-href="/paynow/34", data-id="34");
+# the page's script copies those into the dialog form's empty action and hidden id and shows it.
+# Submitting the form without that click posted to /deposit and got "405 Method Not Allowed" (Nov 1),
+# as trillionssystemslimited.pro's ".paynow" did (Nov 1). The openers are the visible buttons that
+# point at the dialog (data-bs-target / data-target / href="#id"), else the largest group of
+# visible buttons of one class that each carry their own data-href/-id/-method/... value. Each gets
+# the label of its card or row. One pass per opener: click it, wait for the form to show, fill, submit.
+OPENERS_JS = r"""
+function openers(f) {
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+  const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  const box = f.closest('.modal, [role=dialog], [class*=modal], [id*=modal], [class*=popup]') || f;
+  const outside = b => !b.closest('nav, header, aside, footer, [class*=sidebar], [class*=menu], [class*=navbar]');
+  const cands = Array.from(document.querySelectorAll('button, a, [role=button], input[type=button]'))
+      .filter(b => vis(b) && !box.contains(b) && outside(b));
+  let found = [];
+  if (box.id) {
+    found = cands.filter(b => ['data-bs-target', 'data-target', 'href'].some(a => (b.getAttribute(a) || '') === '#' + box.id));
+  }
+  if (!found.length) {
+    const groups = {};
+    cands.forEach(b => {
+      const data = Array.from(b.attributes).map(a => a.name)
+          .filter(n => /^data-(href|id|method|gateway|currency|coin|code|url|action|value|name)$/i.test(n)).sort().join(',');
+      if (!data) return;
+      const key = String(b.className || b.tagName) + '|' + data;
+      (groups[key] = groups[key] || []).push(b);
+    });
+    found = Object.values(groups).sort((a, b) => b.length - a.length)[0] || [];
+  }
+  return found.map(b => {
+    const row = b.closest('tr, li, [class*=card], [class*=method], [class*=gateway], [class*=item]') || b.parentElement;
+    let label = '';
+    const img = row && row.querySelector('img[alt]');
+    if (img && clean(img.alt)) label = clean(img.alt);
+    if (!label) label = clean((row ? row.innerText : '').replace(b.innerText || '', '')) || clean(b.innerText || b.value);
+    return {el: b, label: label.slice(0, 60), text: clean(row ? row.innerText : '').slice(0, 300)};
+  });
+}
+"""
+
+# Clicks opener number arguments[1] (in openers() order) of the hidden form arguments[0].
+OPENER_CLICK_JS = DEPOSIT_HELPERS_JS + OPENERS_JS + r"""
+const f = formAt(arguments[0]);
+if (!f) return {error: 'the deposit form is not on the reloaded page'};
+const o = openers(f)[parseInt(arguments[1])];
+if (!o) return {error: 'opener ' + arguments[1] + ' is not on the reloaded page'};
+window.alert = () => {}; window.confirm = () => true;
+if (o.el.tagName === 'A' && /^(#.*|javascript:.*|)$/i.test((o.el.getAttribute('href') || '').trim())) {
+  o.el.addEventListener('click', e => e.preventDefault(), {once: true});
+}
+o.el.click();
+return {label: o.label};
+"""
+
+# Whether the deposit form arguments[0] is visible (its dialog has opened).
+FORM_SHOWN_JS = DEPOSIT_HELPERS_JS + r"""
+const f = formAt(arguments[0]);
+return !!f && vis(f);
+"""
+
+DEPOSIT_FORM_JS = DEPOSIT_HELPERS_JS + METHOD_BUTTONS_JS + OPENERS_JS + r"""
 const PLACEHOLDER = /^(select|choose|please|--|-)/i;
 const PLANLIKE = /%|\bdaily\b|\bhours?\b|\bdays?\b|\bweeks?\b|\bprofit|\bmin(imum)?\b|\bmax(imum)?\b|\bplan\b|\bpackage\b|\blevel\b/i;
 const PLANNAME = /h_id|plan|package|scheme|tariff|level/i;
 const PAYNAME = /type|pay|method|gateway|currency|coin|wallet|processor|system|ps$|ec$/i;
 const AMOUNTNAME = /amount|sum/i;
+// An option naming a coin or an e-currency ("BTC", "USDT (TRC20)", "Perfect Money"); a trading pair
+// ("USDT/BTC" in a trade panel) is not one.
+const COIN_OPTION = /^\s*(bitcoin|btc|ethereum|eth|usdt|tether|usdc|bnb|binance|tron|trx|litecoin|ltc|dogecoin|doge|xrp|ripple|solana|sol|xlm|stellar|bch|bitcoin cash|cardano|ada|dash|ton|matic|polygon|busd|dai|shib|perfect ?money|payeer|advcash|epaycore)\b/i;
+const PAIR = /^\s*[a-z]{2,6}\s*\/\s*[a-z]{2,6}\s*$/i;
+const DEPOSIT_WORD = /deposit|fund|\bpay|recharge|top.?up|add.?money|checkout|invest/i;
+const OTHER_FORM = /withdraw|transfer|exchange|swap|convert|send.?money|logout|log.?out|search|subscribe|newsletter|\blog ?in\b|sign ?in/i;
 function range(s) {
   const m = (s || '').match(/\$?\s?([\d,]+(?:\.\d+)?)\s*(?:-|–|to)\s*\$?\s?([\d,]+(?:\.\d+)?)/i);
   if (m) return [parseFloat(m[1].replace(/,/g, '')), parseFloat(m[2].replace(/,/g, ''))];
@@ -2344,15 +2577,31 @@ function describe(f, index) {
     c.plan = PLANNAME.test(c.name)
       || (c.options.length > 0 && 2 * c.options.filter(o => PLANLIKE.test(o.label)).length >= c.options.length);
   });
-  const submit = els.some(e => (e.tagName === 'BUTTON' && (e.getAttribute('type') || 'submit').toLowerCase() === 'submit')
+  const submits = els.filter(e => (e.tagName === 'BUTTON' && (e.getAttribute('type') || 'submit').toLowerCase() === 'submit')
       || (e.tagName === 'INPUT' && ['submit', 'image'].includes(e.type)));
-  return {index, name: index < 0 ? 'deposit box without a form' : (f.getAttribute('name') || f.id || ''),
-          amount: amount ? keyOf(amount, els) : null, controls: controls.filter(c => c.options.length), submit};
+  // What the form says about itself: its action, id, name, class and submit labels. (getAttribute,
+  // not f.id: a field named "id" shadows the form's id, and assetgain.org's form name came out as a
+  // WebElement in the log.)
+  const own = [f.getAttribute('action'), f.getAttribute('id'), f.getAttribute('name'), f.getAttribute('class')]
+      .concat(submits.map(b => b.innerText || b.value)).join(' ');
+  const labels = submits.map(b => clean(b.innerText || b.value).toLowerCase());
+  const coins = controls.some(c => PAYNAME.test(c.name) || c.options.filter(o => COIN_OPTION.test(o.label) && !PAIR.test(o.label)).length >= 2);
+  return {index, name: index < 0 ? 'deposit box without a form' : (f.getAttribute('name') || f.getAttribute('id') || ''),
+          amount: amount ? keyOf(amount, els) : null, controls: controls.filter(c => c.options.length), submit: submits.length > 0,
+          coins, depositWord: DEPOSIT_WORD.test(own),
+          other: OTHER_FORM.test(own) || (labels.includes('buy') && labels.includes('sell'))};
 }
+// The page's own deposit form, not the form with the most controls. vintageprofessionaloptions.com's
+// deposit page also carries the "New Trade" side panel that is on every page of its back office
+// (trade_amount, six dropdowns, Buy/Sell); it won on control count, and the pass clicked "Sell"
+// (Nov 1). mail.keystonescapital.com's withdraw form #transferCrypto beat its #deposit form the same
+// way (Nov 1). A form whose choices are coins or payment methods, or that calls itself a deposit,
+// ranks first; a withdraw, transfer, exchange or Buy/Sell trade form is only used when nothing else is there.
 const described = Array.from(document.forms).map((f, index) => describe(f, index));
-const byControls = (a, b) => b.controls.length - a.controls.length;
-let form = described.filter(d => d.amount).sort(byControls)[0]
-        || described.filter(d => d.controls.length && d.submit).sort(byControls)[0];
+const rank = d => (d.amount ? 4 : 0) + (d.coins ? 6 : 0) + (d.depositWord ? 3 : 0) - (d.other && !d.depositWord ? 12 : 0)
+    + 0.5 * d.controls.length;
+const candidates = described.filter(d => d.amount || (d.controls.length && d.submit)).sort((a, b) => rank(b) - rank(a));
+let form = candidates.find(d => !(d.other && !d.depositWord)) || candidates[0];
 if (!form) {
   const box = depositBox();
   const d = box ? describe(box, -1) : null;
@@ -2375,7 +2624,12 @@ if (!payment) {
                options: buttons.map((b, i) => ({value: String(i), label: b.label, range: range(b.text)}))};
   }
 }
-return {forms: described.length, form, plan, payment};
+// A form that is not shown is opened by its buttons (see OPENERS_JS); those become the passes.
+let opener = [];
+if (form.index >= 0 && !vis(formAt(form.index))) {
+  opener = openers(formAt(form.index)).map((o, i) => ({value: String(i), label: o.label, range: range(o.text)}));
+}
+return {forms: described.length, form, plan, payment, openers: opener};
 """
 
 # Sets the plan, the amount and one payment option on the reloaded page, and returns what the
@@ -2609,6 +2863,17 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
         time.sleep(3)
         pass_bot_wall(driver)
 
+    def wallets_before_submit(counter, what):
+        """Wallet-like strings the page shows once a payment option is chosen, before the submit
+        (see CHOICE_WAIT); the page is saved as deposit_page_<href>_<counter>_chosen when there are any."""
+        time.sleep(CHOICE_WAIT)
+        found_now = wallet_like(driver.page_source + " " + (driver.execute_script(INPUT_VALUES_JS) or ""))
+        if found_now:
+            capture(f"{counter}_chosen")
+            site_evidence.add_wallets(found_now, href)
+            logging.info(f"Deposit pass {counter} on {href}: after choosing {what!r}, before submitting: wallet-like strings {found_now}")
+        return set(found_now)
+
     def accept_alert(where):
         try:
             alert = driver.switch_to.alert
@@ -2656,7 +2921,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                 if state.get('error'):
                     logging.info(f"Deposit pass {counter} on {href}: {state['error']}, stopping")
                     break
-                time.sleep(0.5)
+                wallets.update(wallets_before_submit(counter, label))
                 driver.execute_script(CUSTOM_DROPDOWN_SUBMIT_JS)
                 time.sleep(1)
                 accept_alert("after submitting")
@@ -2748,7 +3013,11 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
             return
 
         plan_choice = plan['options'][0] if plan else None
-        options = payment['options'] if payment else [None]
+        # A form hidden in a dialog gets one pass per button that opens it (see OPENERS_JS); a
+        # payment dropdown inside the dialog then keeps its first option.
+        openers = found.get('openers') or []
+        fixed_payment = payment['options'][0] if openers and payment and payment['kind'] != 'button' else None
+        options = openers or (payment['options'] if payment else [None])
         if len(options) > MAX_DEPOSIT_PASSES:
             logging.info(f"Deposit page {href}: {len(options)} payment options, only the first {MAX_DEPOSIT_PASSES} are tried")
             options = options[:MAX_DEPOSIT_PASSES]
@@ -2758,7 +3027,9 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
             f"Deposit page {href}: form #{form['index']} {form['name']!r}; "
             + (f"plan {plan['kind']} {plan['name']!r} ({len(plan['options'])} options), using {plan_choice['label']!r}"
                + (f" range {plan_choice['range']}" if plan_choice.get('range') else "") if plan else "no plan control")
-            + "; " + (f"payment {payment['kind']} {payment['name']!r} with {len(payment['options'])} options "
+            + "; " + (f"the form is hidden in a dialog opened by {len(openers)} button(s) {[o['label'] for o in openers]}, one pass each"
+                      + (f" with payment {payment['name']!r} = {fixed_payment['label']!r}" if fixed_payment else "") if openers else
+                      f"payment {payment['kind']} {payment['name']!r} with {len(payment['options'])} options "
                       f"{[o['label'] for o in payment['options']]}" if payment else "no payment-method control, one pass with the site's default")
             + f"; amount field {form['amount']!r}"
             + (f"; left as they are: {others}" if others else "")
@@ -2778,7 +3049,18 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                             break
                         driver.get(href)
                         wait_for_page()
-                by_button = bool(payment) and payment['kind'] == 'button'
+                by_button = not openers and bool(payment) and payment['kind'] == 'button'
+                if openers:
+                    opened = driver.execute_script(OPENER_CLICK_JS, form['index'], option['value'])
+                    if opened.get('error'):
+                        logging.info(f"Deposit pass {counter} on {href}: {opened['error']}, stopping")
+                        break
+                    try:
+                        WebDriverWait(driver, 6).until(lambda d: d.execute_script(FORM_SHOWN_JS, form['index']))
+                    except TimeoutException:
+                        logging.info(f"Deposit pass {counter} on {href}: the {option['label']!r} button did not open the "
+                                     f"deposit form; skipping it")
+                        continue
                 if by_button:
                     clicked = driver.execute_script(METHOD_CLICK_JS, form['index'], option['value'])
                     if clicked.get('error'):
@@ -2790,16 +3072,19 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                         logging.info(f"Deposit pass {counter} on {href}: the {option['label']!r} button did not fill "
                                      f"{payment['name']!r}; skipping this method")
                         continue
+                pay = (fixed_payment if openers else None if by_button else option)
                 state = driver.execute_script(
                     DEPOSIT_FILL_JS, form['index'],
                     {'kind': plan['kind'], 'name': plan['name'], 'value': plan_choice['value']} if plan else None,
-                    {'kind': payment['kind'], 'name': payment['name'], 'value': option['value']} if option and not by_button else None,
+                    {'kind': payment['kind'], 'name': payment['name'], 'value': pay['value']} if pay and payment else None,
                     form['amount'], (plan_choice or {}).get('range') or (option or {}).get('range'))
                 if state.get('error'):
                     logging.info(f"Deposit pass {counter} on {href}: {state['error']}, stopping")
                     break
                 if by_button:
                     state['payment'] = driver.execute_script(FIELD_VALUE_JS, form['index'], payment['name'])
+                before = wallets_before_submit(counter, option['label'] if option else 'site default')
+                wallets.update(before)
                 how = driver.execute_script(DEPOSIT_SUBMIT_JS, form['index'])
                 time.sleep(1)
                 accept_alert("after submitting")
@@ -2816,7 +3101,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                     f"result title {driver.title[:60]!r}, url {driver.current_url}, wallet-like strings {found_wallets or 'none'}"
                     + (f"; the deposit form came back{': ' + ' | '.join(result['messages']) if result['messages'] else ' with no message'}"
                        if result['back'] else ""))
-                form_back_in_a_row = form_back_in_a_row + 1 if result['back'] and not found_wallets else 0
+                form_back_in_a_row = form_back_in_a_row + 1 if result['back'] and not found_wallets and not before else 0
                 if form_back_in_a_row >= 2:
                     logging.info(f"Deposit page {href}: the form came back on two passes in a row, stopping")
                     break
