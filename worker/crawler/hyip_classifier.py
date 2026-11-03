@@ -602,13 +602,10 @@ def classify(ev):
     if ev.has(*ACCOUNT) and ev.has(*OFFER_STRONG):
         return result('A', 'HYIP', 'hard A', ['account controls and an HYIP plan offer']
                       + _why(ev, *ACCOUNT, limit=2) + _why(ev, *OFFER_STRONG, 'crawl_wallets', limit=3))
-    # Nor does the score: account features alone (sign-up fields, a login form, Laravel) outweighed
-    # the missing offer and gave admin.totemoption +10.7 and byttrading +15.0. The score is left to
-    # sites that show a real plan offer but no account controls.
-    if not ev.has(*OFFER_STRONG):
-        return result('B', _best_family(ev), 'no offer', ['no HYIP plan offer seen (no plan cards with % and a $ range, no deposit '
-                                                          'page with plan choices, no payout-wallet sign-up, no HYIP script)']
-                      + _why(ev, *ACCOUNT, limit=1) + _why(ev, *OFFER, limit=2))
+    # Everything else goes to the score. A "no plan offer seen -> B" rule sat here on Nov 2 (blind set
+    # 81% -> 84%) and was dropped on Nov 3: on the regression set of 33 known HYIPs it called 8 of
+    # them B (17 of 33 YES, against 25 without it), digital4xtrade and minnercoinex among them, both of
+    # which gave wallets; the plan-card check misses many sites' plans, so "not seen" is not "not there".
     a = total > 0 or (total == 0 and ev.has(*ACCOUNT))
     side = sorted((t for t in terms if (t[1] > 0) == a and t[1] != 0), key=lambda t: -abs(t[1]))[:5]
     reasons = [f"no hard rule applies; score {total:+.1f} over {len(terms)} features"
