@@ -327,12 +327,17 @@ LABELS = {
 ACCOUNT = ('crawl_logged_in', 'crawl_signup_form', 'signup_form', 'login_form', 'password_field_any', 'login_link', 'account_button')
 CONTROLS = ACCOUNT + ('register_link',)
 PASSWORD = ('crawl_logged_in', 'crawl_signup_form', 'signup_form', 'login_form', 'password_field_any')
-# Offer features no other family uses this way; any one of them keeps a site out of the hard-B rules.
-OFFER_STRONG = ('crawl_deposit_plans', 'plan_card_txt', 'signup_wallet_fields', 'principal_return', 'last_tx_table',
-                'goldcoders_hscript', 'viserlab_hyiplab')
-# Plan names, min/max deposits and "% daily" also turn up on brokers, subscriptions ("Premium plan")
-# and prop firms ("5% daily drawdown"), so they only count next to account controls.
-OFFER = OFFER_STRONG + ('plan_tiers', 'min_max_deposit', 'pct_per_period')
+# A real plan offer: features no other family uses this way. Any one of them keeps a site out of the
+# hard-B rules, and a YES needs one (see classify).
+# "principal" and "recent deposits/payouts" used to be here. On the Nov 1 blind run (confirmed-2026-10-30.csv
+# rows 101-173) they were the only "offer" on prop firms with a "recent payouts" box (northpeakfunded,
+# fxcapital3-network), on prop firms and blogs that say "principal" (fundingperpetuals, myfundedstep,
+# howtomakemoneyonline5000) and on hash-rate sellers (ltcprime, quarkcoins): their NO rule never ran.
+OFFER_STRONG = ('crawl_deposit_plans', 'plan_card_txt', 'signup_wallet_fields', 'goldcoders_hscript', 'viserlab_hyiplab')
+# Plan names, min/max deposits, "% daily", "principal" and recent-payout tables also turn up on brokers,
+# bots, subscriptions ("Premium plan") and prop firms ("5% daily drawdown"); they are listed as
+# reasons but decide nothing on their own.
+OFFER = OFFER_STRONG + ('plan_tiers', 'min_max_deposit', 'pct_per_period', 'principal_return', 'last_tx_table')
 LEAD = ('crawl_lead_form', 'lead_form_phone')
 ARTICLE = ('article_markers', 'review_language', 'article_markup')
 OFFSITE = ('crawl_offsite_signup', 'register_offsite')
@@ -591,9 +596,19 @@ def classify(ev):
     found = hard_b(ev)
     if found:
         return result('B', found[0], 'hard B', found[1])
-    if ev.has(*ACCOUNT) and ev.has(*OFFER):
+    # Hard A needs a real plan offer (OFFER_STRONG), not account controls next to "% daily", a min/max
+    # deposit, "principal" or a payouts table: on the Nov 1 blind run that pairing made 7 YES labels on
+    # sites James labelled NO (brokers, bots, a simulator, a news site, a real-estate token).
+    if ev.has(*ACCOUNT) and ev.has(*OFFER_STRONG):
         return result('A', 'HYIP', 'hard A', ['account controls and an HYIP plan offer']
-                      + _why(ev, *ACCOUNT, limit=2) + _why(ev, *OFFER, 'crawl_wallets', limit=3))
+                      + _why(ev, *ACCOUNT, limit=2) + _why(ev, *OFFER_STRONG, 'crawl_wallets', limit=3))
+    # Nor does the score: account features alone (sign-up fields, a login form, Laravel) outweighed
+    # the missing offer and gave admin.totemoption +10.7 and byttrading +15.0. The score is left to
+    # sites that show a real plan offer but no account controls.
+    if not ev.has(*OFFER_STRONG):
+        return result('B', _best_family(ev), 'no offer', ['no HYIP plan offer seen (no plan cards with % and a $ range, no deposit '
+                                                          'page with plan choices, no payout-wallet sign-up, no HYIP script)']
+                      + _why(ev, *ACCOUNT, limit=1) + _why(ev, *OFFER, limit=2))
     a = total > 0 or (total == 0 and ev.has(*ACCOUNT))
     side = sorted((t for t in terms if (t[1] > 0) == a and t[1] != 0), key=lambda t: -abs(t[1]))[:5]
     reasons = [f"no hard rule applies; score {total:+.1f} over {len(terms)} features"
