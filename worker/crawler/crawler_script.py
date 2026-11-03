@@ -381,9 +381,31 @@ const texts = e => {
     for (let p = e.parentElement, i = 0; p && i < 4; p = p.parentElement, i++) out.push(p.innerText || p.textContent || '');
     return out.map(t => t.replace(/\s+/g, ' ').trim().slice(0, 300)).filter(Boolean);
 };
-const inputs = q('input').filter(e => e.type !== 'hidden'
-    && /captcha|validation_number|turing|security.?code|verif\w*.?code|antibot|math/i.test((e.name || '') + ' ' + e.id + ' ' + (e.placeholder || '')));
-return {widgets: widgets, invisible: invisible, images: images.length,
+// A captcha box may have a plain name: uphilltradex.com's is name="answer" ("Enter Your Answer"),
+// two levels under "Human verification required / Fill in these characters 9mekka" (Nov 2). The
+// wording in its label or its nearest three parent elements counts too.
+const CUE = /human verification|verification required|fill in (these|the following) characters|(enter|type) (these|the) (characters|code)|security check/i;
+// Only the box's own group counts: the climb stops at a parent that holds another visible field.
+// Climbing to the whole form made aziminer.com's "Full name" box a captcha box (Nov 3 regression run).
+const field = x => vis(x) && !['hidden', 'submit', 'button', 'checkbox', 'radio'].includes((x.type || '').toLowerCase());
+const cued = e => {
+  for (let p = e.parentElement, i = 0; p && i < 3; p = p.parentElement, i++) {
+    if (Array.from(p.querySelectorAll('input, select, textarea')).some(x => x !== e && field(x))) return false;
+    if (CUE.test(p.innerText || '')) return true;
+  }
+  return false;
+};
+const inputs = q('input').filter(e => e.type !== 'hidden' && !['password', 'email', 'checkbox', 'radio', 'submit', 'button'].includes(e.type)
+    && (/captcha|validation_number|turing|security.?code|verif\w*.?code|antibot|math/i.test((e.name || '') + ' ' + e.id + ' ' + (e.placeholder || ''))
+        || cued(e)));
+// The labels, placeholders and names of the form's other fields: a code-like word in them is not the
+// challenge. oneexclusivecapitalbitfx.com's image captcha sits under payout fields labelled
+// "USDT (TRC20) Address", and "TRC20" was typed in as the captcha answer (Nov 1-2).
+const others = q('input, select, textarea').filter(e => !inputs.includes(e)).map(e => {
+    const l = (e.id && document.querySelector('label[for="' + CSS.escape(e.id) + '"]')) || e.closest('label');
+    return [e.placeholder, e.getAttribute('aria-label'), e.id, e.name, l ? (l.innerText || l.textContent) : ''].join(' ');
+});
+return {widgets: widgets, invisible: invisible, images: images.length, others: others,
         inputs: inputs.map(e => ({name: e.name, id: e.id, visible: vis(e), texts: texts(e)}))};
 """
 CAPTCHA_MATH_RE = re.compile(r"(\d{1,3})\s*(\+|-|−|x|×|\*|÷|/|plus|minus|times)\s*(\d{1,3})\s*(?:=|\?)", re.I)
@@ -391,14 +413,22 @@ CAPTCHA_SPACED_RE = re.compile(r"(?<!\w)\d(?: \d){3,7}(?!\w)")                  
 CAPTCHA_CODE_RE = re.compile(r"\b(?=[A-Z0-9]*\d)[A-Z0-9]{4,8}\b")                 # "B730FF", "0EAAB3"
 # A code right after "code/captcha/token ...:" may be letters only: fxtastytrades.com showed
 # "Enter the code below: PCULLW" (another load: "X7DPDX"), which CAPTCHA_CODE_RE needs a digit for.
-CAPTCHA_CUED_RE = re.compile(r"(?i:code|captcha|token)(?:\s+(?i:below|above))?\s*[:：]\s*([A-Z0-9]{4,8})\b")
+# After a cue, lower-case codes count when they hold a digit: uphilltradex.com's "Fill in these
+# characters 9mekka" (Nov 2). A lower-case word without a digit ("8 characters long") does not.
+CUED_CODE = r"([A-Z0-9]{4,8}|(?=[A-Za-z]*\d)[A-Za-z0-9]{4,8})\b"
+CAPTCHA_CUED_RE = re.compile(r"(?i:code|captcha|token)(?:\s+(?i:below|above))?\s*[:：]\s*" + CUED_CODE)
+CAPTCHA_CHARS_RE = re.compile(r"(?i:characters?|letters)\s*[:：]?\s*[\"'“]?" + CUED_CODE)
 CAPTCHA_OPS = {"+": lambda a, b: a + b, "plus": lambda a, b: a + b, "-": lambda a, b: a - b, "−": lambda a, b: a - b,
                "minus": lambda a, b: a - b, "x": lambda a, b: a * b, "×": lambda a, b: a * b, "*": lambda a, b: a * b,
                "times": lambda a, b: a * b, "÷": lambda a, b: a // b, "/": lambda a, b: a // b}
 
-def solve_text_captcha(texts):
+def solve_text_captcha(texts, others=()):
     """(answer, challenge) for a text or math captcha, read from the texts around its input
-    (placeholder, label, then up to four parent elements, nearest first), or (None, None)."""
+    (placeholder, label, then up to four parent elements, nearest first), or (None, None). A code
+    that also appears in another field's label, placeholder or name (others) is skipped."""
+    taken = {w.lower() for o in others for w in re.findall(r"[A-Za-z0-9]{4,8}", o or "")}
+    def first(rx, t, group):
+        return next((m for m in rx.finditer(t) if m.group(group).lower() not in taken), None)
     for t in texts:
         m = CAPTCHA_MATH_RE.search(t)
         if m and not (m.group(2) in ("÷", "/") and int(m.group(3)) == 0):
@@ -406,10 +436,10 @@ def solve_text_captcha(texts):
         m = CAPTCHA_SPACED_RE.search(t)
         if m:
             return m.group(0).replace(" ", ""), m.group(0)
-        m = CAPTCHA_CUED_RE.search(t)
+        m = first(CAPTCHA_CUED_RE, t, 1) or first(CAPTCHA_CHARS_RE, t, 1)
         if m:
             return m.group(1), m.group(0)
-        m = CAPTCHA_CODE_RE.search(t)
+        m = first(CAPTCHA_CODE_RE, t, 0)
         if m:
             return m.group(0), m.group(0)
     return None, None
@@ -433,7 +463,7 @@ def check_captcha(driver):
     visible = [i for i in c["inputs"] if i["visible"]]
     if visible:
         i = visible[0]
-        answer, challenge = solve_text_captcha(i["texts"])
+        answer, challenge = solve_text_captcha(i["texts"], c.get("others") or [])
         if answer is not None:
             target = (By.ID, i["id"]) if i["id"] else (By.NAME, i["name"])
             return False, f"text captcha {challenge!r}, answering {answer!r}", answer, target
@@ -546,6 +576,8 @@ def predict_values(form):
             continue  # left empty; see REFERRAL_FIELD_RE
         if "username" in hints or "user name" in hints:
             predictions[key] = predicted_username
+        elif input_type == "password" and SECOND_SECRET_RE.search(hints):
+            predictions[key] = SECOND_PIN if re.search(r"\bpin\b", hints) else SECOND_SECRET
         elif input_type == "password":
             predictions[key] = predicted_password
         elif input_type == "email" or "email" in hints or "e-mail" in hints:
@@ -586,8 +618,20 @@ def place_value(hints):
 ACCOUNT_PASSWORD_ALT = '<CRAWLER_PASSWORD_ALT>'
 password_used = ACCOUNT_PASSWORD
 
+# A second secret in the sign-up form (transaction code, PIN, withdrawal or fund password) gets its
+# own value. GoldCoders sites ask for "Define Transaction Code" twice, type=password, and refuse
+# one equal to the password: brightpathwealthassets.com answered "The Transaction Code should not
+# be equal to the Password you have defined" (Nov 2), so no account was made. A field called PIN
+# gets digits. These fields are left out of password_for()'s length and pattern check.
+SECOND_SECRET_RE = re.compile(r"transaction|\bpin\b|secret|security.?(code|pin|password)|withdraw\w*.?(password|pin|code)"
+                              r"|(fund|trade|trading|payment|pay).?password|tx.?code", re.I)
+SECOND_SECRET = '<CRAWLER_SECOND_SECRET>'
+SECOND_PIN = '4827'
+
 def password_for(form):
-    refused = form.parent.execute_script(f"const pw = arguments[1]; return {CONTROLS_JS}(arguments[0])" + r""".filter(e => e.type === 'password').some(e => {
+    refused = form.parent.execute_script(f"const pw = arguments[1]; return {CONTROLS_JS}(arguments[0])" + r""".filter(e => e.type === 'password'
+    && !/transaction|\bpin\b|secret|security.?(code|pin|password)|withdraw\w*.?(password|pin|code)|(fund|trade|trading|payment|pay).?password|tx.?code/i
+        .test([e.name, e.id, e.placeholder].join(' '))).some(e => {
   if (e.maxLength > 0 && pw.length > e.maxLength) return true;
   if (e.pattern) { try { return !new RegExp('^(?:' + e.pattern + ')$').test(pw); } catch (x) { return false; } }
   return false;
@@ -1579,6 +1623,20 @@ def get_base_domain(url):
     return netloc[4:] if netloc.startswith('www.') else netloc
 
 # Login and take screenshot
+# [username/e-mail box, password field] for the login: the first visible password field and the
+# first visible, editable text or e-mail box of its form (of the page when it has no form), or null
+# while no password field is visible. "Visible" as Selenium sees it, so a box with opacity 0 is not.
+LOGIN_BOXES_JS = r"""
+const shown = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length)
+    && getComputedStyle(e).visibility !== 'hidden' && getComputedStyle(e).opacity !== '0';
+const pw = Array.from(document.querySelectorAll('input[type=password]')).find(shown);
+if (!pw) return null;
+const box = e => e.tagName === 'INPUT' && ['text', 'email', ''].includes((e.getAttribute('type') || '').toLowerCase())
+    && shown(e) && !e.disabled && !e.readOnly;
+const own = pw.form ? Array.from(pw.form.elements).find(box) : null;
+return [own || Array.from(document.querySelectorAll('input')).find(box) || null, pw];
+"""
+
 def login_and_take_screenshot(driver, login_url, predicted_password, email_used):
     base_domain = get_base_domain(login_url)
     original_window = None  # the finally block below reads it even if driver.get() fails
@@ -1593,8 +1651,17 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
         pass_bot_wall(driver)
         original_window = driver.current_window_handle
 
+        # The visible password field and the visible text/e-mail box of its own form. The first
+        # username/e-mail/text box in the page used to be taken: on coinrulefx.com/login/ that is a
+        # hidden ARMember box (opacity 0), and the login ended with "element not interactable" right
+        # after a successful sign-up (Nov 2).
         try:
-            username_input = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[name="username"],input[type="email"],input[type="text"]')))
+            username_input, password_input = WebDriverWait(driver, 10).until(lambda d: d.execute_script(LOGIN_BOXES_JS))
+        except TimeoutException:
+            username_input = password_input = None
+        try:
+            if username_input is None:
+                raise TimeoutException()
             input_type = username_input.get_attribute('type')
             # A text box named or labelled e-mail gets the address: fxtastytrades.com's login answered
             # "The email must be a valid email address" when it got the derived username. A box whose
@@ -1611,7 +1678,8 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
         except TimeoutException:
             logging.error("Timeout occurred while trying to find the username/email input field.")
 
-        password_input = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[type="password"]')))
+        if password_input is None:
+            password_input = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[type="password"]')))
         password_input.send_keys(predicted_password)
 
         before_submit = page_state(driver)
