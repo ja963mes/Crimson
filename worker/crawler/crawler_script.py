@@ -1,6 +1,7 @@
 
 import argparse
 import base64
+import hashlib
 import html
 import json
 import logging
@@ -507,10 +508,30 @@ if (k.startsWith('@')) return els.filter(e => e.tagName === 'INPUT')[parseInt(k.
 return els.find(e => e.name === k) || null;
 """
 # name, id, placeholder, autocomplete, aria-label and label text of each input, for choosing values.
-FIELD_HINTS_JS = f"return {CONTROLS_JS}(arguments[0])" + r""".filter(e => e.tagName === 'INPUT').map(e => {
+# The caption next to a field counts too when no <label> is tied to it: libertyglobalcapital.org's
+# payout boxes sit under <label for="">Your Ethereum Account:</label> and "Your USDT TRC20 Account
+# ID:" in the neighbouring <div>, so they read as unnamed boxes and got names (Nov 3). The text runs
+# back to the previous field; a field alone in its wrapper (a <div>, a table cell) takes the text of
+# the wrapper's previous sibling, up to two wrappers up.
+NEAR_TEXT_JS = r"""
+const nearText = e => {
+  let s = '';
+  for (let n = e.previousSibling; n && s.length < 80; n = n.previousSibling) {
+    if (n.nodeType === 1 && (n.matches('input, select, textarea') || n.querySelector('input, select, textarea'))) break;
+    s = (n.textContent || '') + ' ' + s;
+  }
+  for (let p = e.parentElement, k = 0; p && k < 2 && !s.trim(); p = p.parentElement, k++) {
+    if (Array.from(p.querySelectorAll('input, select, textarea')).some(x => x !== e && x.type !== 'hidden')) break;
+    const prev = p.previousElementSibling;
+    if (prev && !prev.querySelector('input, select, textarea')) s = prev.innerText || prev.textContent || '';
+  }
+  return s.replace(/\s+/g, ' ').trim().slice(-80);
+};
+"""
+FIELD_HINTS_JS = NEAR_TEXT_JS + f"return {CONTROLS_JS}(arguments[0])" + r""".filter(e => e.tagName === 'INPUT').map(e => {
   const l = (e.id && document.querySelector('label[for="' + CSS.escape(e.id) + '"]')) || e.closest('label');
   return [e.name || '', e.id || '', e.type || 'text', [e.name, e.id, e.placeholder, e.autocomplete, e.getAttribute('aria-label'),
-          l ? l.innerText : ''].join(' ').replace(/\s+/g, ' ').toLowerCase(), e.required];
+          l ? l.innerText : nearText(e)].join(' ').replace(/\s+/g, ' ').toLowerCase(), e.required];
 });
 """
 TEXT_LIKE_TYPES = ('text', 'email', 'password', 'tel', 'number', 'url', 'search', '')
@@ -574,23 +595,89 @@ def predict_values(form):
             continue  # unnamed checkboxes, buttons, hidden fields: nothing to type
         if REFERRAL_FIELD_RE.search(hints) and not required:
             continue  # left empty; see REFERRAL_FIELD_RE
-        if "username" in hints or "user name" in hints:
-            predictions[key] = predicted_username
-        elif input_type == "password" and SECOND_SECRET_RE.search(hints):
-            predictions[key] = SECOND_PIN if re.search(r"\bpin\b", hints) else SECOND_SECRET
-        elif input_type == "password":
-            predictions[key] = predicted_password
-        elif input_type == "email" or "email" in hints or "e-mail" in hints:
-            predictions[key] = predicted_email
-        elif input_type == "tel" or PHONE_HINT_RE.search(hints):
-            predictions[key] = generate_phone_number()
-        elif input_type in DATE_INPUT_FORMATS:
-            predictions[key] = generate_date_value(input_type)
-        elif (place := place_value(hints)) is not None:
-            predictions[key] = place
-        else:
-            predictions[key] = generate_random_string()
+        predictions[key] = value_for(input_type, hints, predicted_username, predicted_password, predicted_email)
     return predictions
+
+# The value one field gets, decided by its type first and then by what its name, placeholder and
+# label ask for. The type comes first: swissstaketraders.com's e-mail box is type="email" with
+# autocomplete="username", got the username, and the browser refused it ("'marianne' is missing
+# an '@'", Nov 3).
+def value_for(input_type, hints, username, password, email):
+    if input_type == "email":
+        return email
+    if "username" in hints or "user name" in hints:
+        return username
+    if input_type == "password" and SECOND_SECRET_RE.search(hints):
+        return SECOND_PIN if re.search(r"\bpin\b", hints) else SECOND_SECRET
+    if input_type == "password":
+        return password
+    if "email" in hints or "e-mail" in hints:
+        return email
+    if COUNTRY_CODE_HINT_RE.search(hints):
+        return "+1"
+    if input_type == "tel" or PHONE_HINT_RE.search(hints):
+        return phone_for(hints)
+    if input_type in DATE_INPUT_FORMATS:
+        return generate_date_value(input_type)
+    if (address := payout_address(hints)) is not None:
+        return address
+    if (place := place_value(hints)) is not None:
+        return place
+    if input_type == "number":
+        return str(random.randint(100, 999))
+    return generate_random_string()
+
+# A separate dialling-code box (swissstaketraders.com: placeholder "+376", autocomplete
+# "tel-country-code") gets +1, to go with the US numbers.
+COUNTRY_CODE_HINT_RE = re.compile(r"country.?code|dial.?code|calling.?code|tel-country-code", re.I)
+# A phone box whose placeholder shows a sample number follows that sample: staging.skylinkscapital.in's
+# phone sits behind a +971 country picker with placeholder "50 123 4567", refused the US number as
+# "Please enter a valid phone number for the selected country" (Nov 3), and gets 50 and 7 more digits.
+SAMPLE_PHONE_RE = re.compile(r"(?<![\w+])(\d[\d\s().-]{5,}\d)")
+
+def phone_for(hints):
+    m = SAMPLE_PHONE_RE.search(hints)
+    if m:
+        digits = re.sub(r"\D", "", m.group(1))
+        if 7 <= len(digits) <= 12 and not digits.startswith("0"):
+            return digits[:2] + ''.join(random.choices(string.digits, k=len(digits) - 2))
+    return generate_phone_number()
+
+# Payout-wallet fields get an address of the coin they name, in that coin's real format with a
+# valid checksum (random, so nobody holds it; nothing is ever sent to it). GoldCoders sign-ups ask
+# for them: libertyglobalcapital.org's pay_account[68] (placeholder "LYourLitecoinsAddress...") got
+# a name from names.txt and the site answered "Invalid account format. Expected Litecoin Address"
+# (Nov 3). A field that names no coin keeps the old value.
+PAYOUT_FIELD_RE = re.compile(r"wallet|pay_?account|payout|(bitcoin|btc|litecoin|ltc|ethereum|eth|usdt|tether|trc ?20|erc ?20|bep ?20|tron|trx"
+                             r"|dogecoin|doge|xrp|ripple|bnb|bch|perfect ?money|payeer)\w{0,3}\W{0,3}(address|account|wallet|id)\b", re.I)
+PAYOUT_COINS = ((r"perfect ?money", "pm"), (r"payeer", "payeer"), (r"trc ?20|tron|\btrx\b", "tron"), (r"erc ?20|bep ?20|ethereum|\beth\b|\bbnb\b", "eth"),
+                (r"litecoin|\bltc\b", "ltc"), (r"doge", "doge"), (r"\bxrp\b|ripple", "xrp"), (r"bitcoin|\bbtc\b|\bbch\b", "btc"),
+                (r"usdt|tether", "tron"))
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+B58_RIPPLE = "rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz"
+
+def base58check(payload, alphabet=B58):
+    raw = payload + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    n, out = int.from_bytes(raw, 'big'), ''
+    while n:
+        n, r = divmod(n, 58)
+        out = alphabet[r] + out
+    return alphabet[0] * (len(raw) - len(raw.lstrip(b'\0'))) + out
+
+def payout_address(hints):
+    if not PAYOUT_FIELD_RE.search(hints) or re.search(r"e-?mail", hints):
+        return None
+    coin = next((c for pattern, c in PAYOUT_COINS if re.search(pattern, hints, re.I)), None)
+    if coin is None:
+        return None
+    if coin == "eth":
+        return "0x" + random.randbytes(20).hex()
+    if coin == "pm":
+        return "U" + ''.join(random.choices(string.digits, k=8))
+    if coin == "payeer":
+        return "P" + ''.join(random.choices(string.digits, k=9))
+    version = {"btc": b"\x00", "ltc": b"\x30", "doge": b"\x1e", "tron": b"\x41", "xrp": b"\x00"}[coin]
+    return base58check(version + random.randbytes(20), B58_RIPPLE if coin == "xrp" else B58)
 
 # Postal-address fields get a US address that matches the US phone numbers, not a name from
 # names.txt: uphilltradex.com refused a sign-up with "The zip field is required." (Nov 1), and the
@@ -1018,6 +1105,110 @@ def handle_custom_choices(driver, form):
     except Exception as e:
         logging.info(f"Custom dropdowns could not be set: {str(e).splitlines()[0] if str(e) else e!r}")
 
+# --- Checking the form before it goes out ------------------------------------------------------
+# The browser checks every field when a form is submitted and refuses the submit if one is empty,
+# in the wrong format or unticked; the crawler used to find that out only afterwards, from the
+# messages on the page, with the attempt already spent. On the Nov 3 blind run that cost 5 sign-ups:
+# mail.eq-energylimited.com went out with every field empty ("fullname: Please fill out this field",
+# cause of the empty fields not established), olympicdiamontrade.pro with its country and package
+# dropdowns unset, its password empty and its custom terms box unticked, and swissstaketraders.com,
+# libertyglobalcapital.org and staging.skylinkscapital.in with values the fields did not accept.
+# Now, just before submitting, the browser is asked which fields it would refuse (checkValidity),
+# each one gets a value by the same rules as predict_values() (see value_for), set the way scripts
+# see it, and the form is checked again, at most twice. What was set is logged.
+INVALID_FIELDS_JS = NEAR_TEXT_JS + f"const els = {CONTROLS_JS}(arguments[0]);" + r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+const skip = ['hidden', 'submit', 'button', 'image', 'reset', 'file'];
+return els.map((e, i) => [e, i]).filter(([e]) => ['INPUT', 'SELECT', 'TEXTAREA'].includes(e.tagName) && !e.disabled
+    && !skip.includes((e.type || '').toLowerCase()) && e.willValidate && !e.checkValidity()).map(([e, i]) => {
+  const l = (e.id && document.querySelector('label[for="' + CSS.escape(e.id) + '"]')) || e.closest('label');
+  return {i: i, tag: e.tagName, type: (e.type || 'text').toLowerCase(), name: e.name || e.id || '', visible: vis(e),
+          message: (e.validationMessage || '').slice(0, 120), minLength: e.minLength || 0, maxLength: e.maxLength || 0,
+          pattern: e.getAttribute('pattern') || '',
+          hints: [e.name, e.id, e.placeholder, e.getAttribute('autocomplete'), e.getAttribute('aria-label'), l ? l.innerText : nearText(e)]
+                 .join(' ').replace(/\s+/g, ' ').toLowerCase()};
+});
+"""
+SET_FIELD_JS = f"const els = {CONTROLS_JS}(arguments[0]);" + r"""
+const i = arguments[1], action = arguments[2], value = arguments[3];
+const e = els[i];
+if (!e) return 'no longer on the page';
+const fire = () => { ['input', 'change', 'blur'].forEach(t => e.dispatchEvent(new Event(t, {bubbles: true})));
+                     if (window.jQuery) { try { window.jQuery(e).trigger('change'); } catch (x) {} } };
+if (action === 'check') {
+  if (!e.checked) e.click();
+  if (!e.checked) e.checked = true;
+  fire();
+  return e.checked ? 'ticked' : 'still unticked';
+}
+if (action === 'select') {
+  const PH = /^\s*(-+.*|select\b.*|choose\b.*|please (select|choose)\b.*|\.\.\.|…)?\s*$/i;
+  const usable = Array.from(e.options).filter(o => !o.disabled && o.value.trim() && !PH.test(o.text));
+  // value 'us' asks for the United States (a country list), to go with the US phone numbers and address.
+  const o = (value === 'us' && usable.find(o => /^\s*(united states( of america)?|usa?)\s*$/i.test(o.text))) || usable[0];
+  if (!o) return 'no usable option';
+  Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(e, o.value);
+  fire();
+  return 'picked ' + JSON.stringify(o.text.trim().slice(0, 30));
+}
+Object.getOwnPropertyDescriptor(e.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value').set.call(e, value);
+fire();
+return 'filled';
+"""
+
+def fit_field(value, field):
+    """value adjusted to the field's minlength, maxlength and pattern where it can be."""
+    minimum, maximum, pattern = field.get('minLength') or 0, field.get('maxLength') or 0, field.get('pattern') or ''
+    if minimum > len(value):
+        value += ''.join(random.choices(string.digits, k=minimum - len(value)))
+    if 0 < maximum < len(value):
+        value = value[:maximum]
+    if pattern:
+        sizes = [s for s in (maximum, minimum, 10, 11, 8, 6, 4) if s > 0]
+        try:
+            if not re.fullmatch(pattern, value):
+                for candidate in [re.sub(r"\W", "", value), value.lower(), value.capitalize() + "1"] + \
+                                 [''.join(random.choices(string.digits, k=s)) for s in sizes]:
+                    if re.fullmatch(pattern, candidate):
+                        return candidate
+        except re.error:
+            pass
+    return value
+
+def check_form_before_submit(driver, form, predictions):
+    """Ask the browser which fields it would refuse, fill those, and check again (see INVALID_FIELDS_JS)."""
+    email = next((v for v in predictions.values() if isinstance(v, str) and v.endswith(f"@{EMAIL_DOMAIN}")),
+                 f"{generate_random_string().lower()}{random.randint(60, 99)}@{EMAIL_DOMAIN}")
+    username = re.sub(r"\d+", "", email).replace(f"@{EMAIL_DOMAIN}", "")
+    try:
+        for attempt in (1, 2):
+            flagged = driver.execute_script(INVALID_FIELDS_JS, form) or []
+            if not flagged:
+                if attempt == 2:
+                    logging.info("Before submitting: the browser now accepts every field")
+                return
+            done, groups = [], set()
+            for field in flagged:
+                if field['type'] in ('checkbox', 'radio') or field['tag'] == 'SELECT':
+                    if field['type'] == 'radio' and field['name'] in groups:
+                        continue
+                    groups.add(field['name'])
+                    action = 'select' if field['tag'] == 'SELECT' else 'check'
+                    value = 'us' if action == 'select' and re.search(r"country|nationality|residen", field['hints']) else None
+                else:
+                    action = 'value'
+                    value = fit_field(value_for(field['type'], field['hints'], username, password_used, email), field)
+                    if field['name'] and field['type'] != 'password':
+                        predictions[field['name']] = value  # the login reads the account e-mail from here
+                result = driver.execute_script(SET_FIELD_JS, form, field['i'], action, value)
+                done.append(f"{field['name'] or field['type']} ({field['message'][:60]}): {result}")
+            logging.info(f"Before submitting (check {attempt}): the browser flagged {len(flagged)} field(s); {done}")
+        still = driver.execute_script(INVALID_FIELDS_JS, form) or []
+        if still:
+            logging.info(f"Before submitting: still flagged after two rounds: {[(f['name'], f['message'][:60]) for f in still]}")
+    except Exception as e:
+        logging.info(f"Could not check the form before submitting: {str(e).splitlines()[0] if str(e) else e!r}")
+
 # --- Sign-up and login outcome checks --------------------------------------------------
 # Until Oct 20 a sign-up counted as successful whenever a button was clicked (the URL was
 # compared with a module-level start_url that was always ''), and a login whenever the URL
@@ -1342,6 +1533,8 @@ def fill_sign_up_form(driver, start_url):
                             time.sleep(0.5)
                             logging.info(f"Submit button disabled with the usual password; retried with {ACCOUNT_PASSWORD_ALT!r}: "
                                          + ("now enabled" if not submit_disabled(form) else "still disabled"))
+
+                        check_form_before_submit(driver, form, predictions)
 
                         selectors = [
                             ('input[type="submit"]', By.CSS_SELECTOR),
@@ -1823,11 +2016,13 @@ def pass_profile_gate(driver):
             return
         start = driver.current_url
         form = driver.execute_script("return document.forms[arguments[0]];", gate['index'])
-        fill_form(form, predict_values(form), only_empty=True)
+        predictions = predict_values(form)
+        fill_form(form, predictions, only_empty=True)
         fill_textareas(form)
         handle_dropdowns(form, driver)
         handle_custom_choices(driver, form)
         handle_checkbox(driver, form)
+        check_form_before_submit(driver, form, predictions)
         before = page_state(driver)
         driver.execute_script("const f = arguments[0];"
                               "const b = Array.from(f.querySelectorAll('button, input[type=submit]')).find(x => (x.getAttribute('type') || 'submit').toLowerCase() === 'submit');"
