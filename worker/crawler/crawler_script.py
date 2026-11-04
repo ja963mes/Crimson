@@ -38,6 +38,11 @@ logs_directory = 'logs'
 os.makedirs(logs_directory, exist_ok=True)
 log_file_path = os.path.join(logs_directory, 'logfile.log')
 email_used = None
+# The username the account was made with, for logging in when the sign-up form had no e-mail field:
+# noblechaincapital.com's sign-up is username and password only, the account was made, and the login
+# was skipped for want of an e-mail (Nov 3). last_predicted_username is predict_values()'s latest.
+username_used = None
+last_predicted_username = None
 blacklisted_urls = ["facebook.com", "example.com","linkedin.com","paypal.com"]
 
 # --- Paths & credentials --------------------------------------------------
@@ -580,9 +585,10 @@ def pass_captcha_gate(driver, answer, target):
 def predict_values(form):
     predictions = {}
     predicted_password = password_for(form)
+    global last_predicted_username
     # Lower case: aziminer.com refused "Florence95@..." with "The email field must be lowercase."
     # Mailinator inboxes ignore case, and the login username derived from the address stays the same.
-    predicted_username = generate_random_string().lower()
+    predicted_username = last_predicted_username = generate_random_string().lower()
     predicted_email = f"{predicted_username}{random.randint(60, 99)}@{EMAIL_DOMAIN}"
 
     for position, (name, field_id, input_type, hints, required) in enumerate(form.parent.execute_script(FIELD_HINTS_JS, form)):
@@ -1387,7 +1393,7 @@ OFFSITE_SIGNUP_TEXT_RE = re.compile(r"^(sign ?up|register|registration|join( now
                                     r"|create (an? |your |my )?(free |new |live |real |trading )?account)( now| here)?$", re.I)
 
 def fill_sign_up_form(driver, start_url):
-    global should_continue, email_used, password_used
+    global should_continue, email_used, password_used, username_used
     driver = ensure_driver(driver)
     base_domain = get_base_domain(start_url)
     site_domains = {base_domain}  # plus the domain the start page redirects to, if another one
@@ -1562,11 +1568,12 @@ def fill_sign_up_form(driver, start_url):
                             # generated address from whichever field received it.
                             email_used = next((v for v in predictions.values()
                                                if isinstance(v, str) and v.endswith(f"@{EMAIL_DOMAIN}")), None)
+                            username_used = last_predicted_username if last_predicted_username in predictions.values() else None
                             form_filled = True
                             if outcome == "success":
-                                logging.info(f"Sign-up succeeded with {email_used}")
+                                logging.info(f"Sign-up succeeded with {email_used or username_used}")
                             else:
-                                logging.info(f"Sign-up submitted with {email_used}, but the page gave no sign of success; trying to log in anyway")
+                                logging.info(f"Sign-up submitted with {email_used or username_used}, but the page gave no sign of success; trying to log in anyway")
                             want_code = bool(driver.execute_script(CODE_INPUTS_JS))
                             if want_code:
                                 logging.info(f"The page after sign-up ({driver.current_url}) asks for a code; waiting for it by e-mail")
@@ -1834,10 +1841,11 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
     base_domain = get_base_domain(login_url)
     original_window = None  # the finally block below reads it even if driver.get() fails
     try:
-        if not email_used:
+        if not email_used and not username_used:
             # The username below is derived from the e-mail, and re.sub() on None used to crash
-            # here ("Unexpected error during login") after every such sign-up.
-            logging.info("Login result: skipped - the sign-up form had no e-mail field, so there is no account e-mail to log in with")
+            # here ("Unexpected error during login") after every such sign-up. A sign-up with a
+            # username and no e-mail logs in with that username (see username_used).
+            logging.info("Login result: skipped - the sign-up form had neither an e-mail nor a username field, so there is nothing to log in with")
             return
         driver.get(login_url)
         logging.info(f"Navigating to URL: {login_url}")
@@ -1863,7 +1871,9 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
             # (say=invalid_login) and accepted the username.
             email_box = re.search(r"mail", ' '.join((username_input.get_attribute(a) or '') for a in ('name', 'id', 'placeholder', 'autocomplete')), re.I)
             user_box = re.search(r"user", ' '.join((username_input.get_attribute(a) or '') for a in ('name', 'id')), re.I)
-            if input_type == "text" and (user_box or not email_box):
+            if not email_used:
+                username_input.send_keys(username_used)
+            elif input_type == "text" and (user_box or not email_box):
                 modified_email = re.sub(r'\d+', '', email_used).replace(f"@{EMAIL_DOMAIN}", "")
                 username_input.send_keys(modified_email)
             else:
@@ -1944,11 +1954,11 @@ def looks_logged_out(driver):
 def relogin_here(driver):
     """Log in again on the login page the browser is showing. True when it worked."""
     global relogins_done, session_lost
-    if session_lost or relogins_done >= MAX_RELOGINS or not email_used:
+    if session_lost or relogins_done >= MAX_RELOGINS or not (email_used or username_used):
         session_lost = True
         return False
     relogins_done += 1
-    logging.info(f"Session lost (now at {driver.current_url}); logging in again as {email_used} (attempt {relogins_done})")
+    logging.info(f"Session lost (now at {driver.current_url}); logging in again as {email_used or username_used} (attempt {relogins_done})")
     try:
         passwords = [e for e in driver.find_elements(By.CSS_SELECTOR, 'input[type="password"]') if e.is_displayed()]
         login_form = driver.execute_script("return arguments[0].form;", passwords[0])
@@ -1959,7 +1969,7 @@ def relogin_here(driver):
             email_box = re.search(r"mail", ' '.join((box.get_attribute(a) or '') for a in ('name', 'id', 'placeholder', 'autocomplete')), re.I)
             user_box = re.search(r"user", ' '.join((box.get_attribute(a) or '') for a in ('name', 'id')), re.I)
             box.clear()
-            box.send_keys(re.sub(r'\d+', '', email_used).replace(f"@{EMAIL_DOMAIN}", "")
+            box.send_keys(username_used if not email_used else re.sub(r'\d+', '', email_used).replace(f"@{EMAIL_DOMAIN}", "")
                           if box.get_attribute('type') == 'text' and (user_box or not email_box) else email_used)
         passwords[0].clear()
         passwords[0].send_keys(password_used)
@@ -3382,11 +3392,12 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
 
 # Sign-up form with timeout
 def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=300):
-    global should_continue, form_filled, logged_in, email_used, password_used, relogins_done, session_lost, site_evidence
+    global should_continue, form_filled, logged_in, email_used, password_used, relogins_done, session_lost, site_evidence, username_used
     should_continue = True
     form_filled = False
     logged_in = False
     email_used = None  # else a previous site's address leaked into this site's result
+    username_used = None
     password_used = ACCOUNT_PASSWORD
     relogins_done, session_lost = 0, False
     deposit_pages_opened.clear()
@@ -3405,8 +3416,8 @@ def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=300):
         thread.join()
         # The account's address, not False: digital4xtrade.com ran past the limit after logging in
         # and the result line read "Success: ... (logged in as False)".
-        return email_used
-    return email_used if form_filled else None
+        return email_used or username_used
+    return (email_used or username_used) if form_filled else None
 
 # Find login URL with a single password field
 # The sign-up page itself is never taken as the login page: /auth?mode=signup matched the
@@ -3459,9 +3470,19 @@ def find_login_url_with_single_password_field(driver, start_url, signup_url=None
             # A login page that sends the browser on to an account page means the session is already
             # logged in, even with no Logout link to see: ultrabitfx.com's /login went to
             # /user/dashboard after the e-mail confirmation, and its dashboard has no logout element.
-            # The site's front page does not count: some sites send visitors there from /login.
+            # A sign-up page doing the same counts too: lidfxmarket.com's sign-up landed on
+            # /t/dashboard, the search then found /t/register sending the browser to /t/dashboard,
+            # and as /t/register is no login URL it gave up looking for a login page (Nov 3; also
+            # epicfuturetraders.com's /register -> /dashboard, Nov 1). The site's front page does not
+            # count (some sites send visitors there from /login), nor another path that is itself a
+            # sign-up, login, e-mail verification or password-reset step (mail.iihubassets.com waits
+            # on /verify-email until the address is confirmed), nor the same path with a new query.
             landed_path = urlparse(state['url']).path.strip('/').lower()
-            if (LOGIN_URL_RE.search(current_url) and state['url'] and state['url'] != current_url and not state['passwords']
+            moved_on = (state['url'] and urlparse(state['url']).path != urlparse(current_url).path
+                        and not LOGIN_URL_RE.search(state['url']) and not any(k in state['url'].lower() for k in SIGNUP_URL_KEYWORDS)
+                        and not re.search(r"verif|confirm|activat|pending|otp|2fa|two-factor", state['url'], re.I)
+                        and not PASSWORD_RECOVERY_URL_RE.search(state['url']))
+            if ((LOGIN_URL_RE.search(current_url) or is_signup_page) and moved_on and not state['passwords']
                     and landed_path not in ('', 'index', 'index.html', 'index.php', 'home') and same_site(state['url'], base_domain)):
                 logging.info(f"Login search: {current_url} sends a logged-in browser on to {state['url']}")
                 return None, state['url']
