@@ -1445,6 +1445,8 @@ def fill_sign_up_form(driver, start_url):
             if current_url == start_url and landed.startswith('http') and not same_site(landed, base_domain):
                 site_domains.add(get_base_domain(landed))
                 logging.info(f"{start_url} redirected to {landed}; pages on {get_base_domain(landed)} count as the same site")
+            if current_url == start_url:
+                remember_key_pages(driver, driver.current_url)
             # A lead form or another product on the start page ends the site before any sign-up.
             if current_url == start_url and stop_if_clearly_b("start page"):
                 return False
@@ -1461,6 +1463,14 @@ def fill_sign_up_form(driver, start_url):
                 driver = ensure_driver(driver)
                 driver.get(current_url)
                 pass_bot_wall(driver)
+                # The form may be drawn by JavaScript seconds after load (cn-zfx.asia, sfxcoin.com,
+                # mail.trade-vortex.com and investorassetmanagement.com ended with nothing after the old
+                # 5 s wait, Nov 5): wait for a password field first, then read the page for the evidence.
+                waited = wait_for_password_fields(driver, SIGNUP_FORM_SECONDS, want=1)
+                if waited:
+                    logging.info(f"Sign-up form drawn {waited:.0f} s after {driver.current_url} loaded")
+                elif waited is None:
+                    logging.info(f"No password field on {driver.current_url} after waiting {SIGNUP_FORM_SECONDS} s")
                 read_page(driver, 'register')
                 captcha_blocks, captcha_summary, captcha_answer, captcha_target = check_captcha(driver)
                 logging.info(f"Captcha check on {driver.current_url}: {captcha_summary}")
@@ -1664,22 +1674,56 @@ def fill_sign_up_form(driver, start_url):
         logging.info("No page with two or more password fields found.")
     return form_filled
 
+# --- Late forms (Nov 6) ---------------------------------------------------------------------------
+# Pages that look like sign-up, login or account-app pages get up to LATE_FORM_SECONDS for their
+# password fields to be drawn before they are counted, and the chosen sign-up page gets up to
+# SIGNUP_FORM_SECONDS before it is read for the HYIP evidence and filled in.
+LATE_FORM_SECONDS = 10
+SIGNUP_FORM_SECONDS = 15
+LATE_FORM_PAGE_RE = re.compile(r"regist|sign-?up|sign_up|sign-?in|log-?in|\bauth|account|join|create|portal|cabinet|"
+                               r"//(app|my|client|clients|account|accounts|portal|secure|members?|dashboard)\.", re.I)
+
+def wait_for_password_fields(driver, seconds, want=1):
+    """Poll until `want` visible password fields are on the page or `seconds` pass. Returns the seconds
+    waited when it had to wait (0 when they were there at once), None when they never came."""
+    start = time.time()
+    while True:
+        try:
+            n = driver.execute_script(VISIBLE_PASSWORDS_JS) or 0
+        except Exception:
+            return None
+        if n >= want:
+            return time.time() - start
+        if time.time() - start >= seconds or not should_continue:
+            return None
+        time.sleep(0.5)
+
 # Check for multiple password fields. Each page loaded is logged with where it ended up, so a site
 # with no sign-up page found shows what the search saw (Oct 29: six such sites logged nothing).
 def has_two_or_more_password_fields(driver, url):
     if url.startswith('javascript:'):
         return None
-    keywords = ['joinus', 'register', 'signup','createaccount', 'newuser', 'registration'] #Keywords to detect signup pages in DOM
+    # 'sign-up', 'sign_up', 'create-account', 'open-account' added Nov 6: primestrades.com/sign-up and
+    # tptexchange.com/sign-up were not taken for sign-up pages ('signup' only) and were counted at load.
+    keywords = ['joinus', 'register', 'signup', 'sign-up', 'sign_up', 'createaccount', 'create-account', 'open-account',
+                'newuser', 'registration'] #Keywords to detect signup pages in DOM
     if any(keyword in url.lower() for keyword in keywords):
         logging.info(f"Registration URL is {url}")
         return url
     try:
         driver.get(url)
         pass_bot_wall(driver)
-        password_inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="password"]')
         landed = driver.current_url
+        # Sign-up and login forms drawn by JavaScript a few seconds after load were counted before they
+        # existed: primestrades.com /sign-in, tptexchange.com /sign-in, app.atominvestors.com and
+        # my.cn-zfx.asia/login all logged "0 password field(s)" within a second of loading (Nov 5 run),
+        # and my.cn-zfx.asia / my.fxmetagold.com show their forms ~10 s after load (Nov 3).
+        waited = wait_for_password_fields(driver, LATE_FORM_SECONDS, want=1) if LATE_FORM_PAGE_RE.search(url + ' ' + landed) else None
+        if waited:
+            time.sleep(1)  # the rest of a late form (the confirm-password field) is drawn with or just after the first
+        password_inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="password"]')
         logging.info(f"Sign-up search: {url}" + (f" -> {landed}" if landed != url else "")
-                     + f"; {len(password_inputs)} password field(s)")
+                     + f"; {len(password_inputs)} password field(s)" + (f" (after waiting {waited:.0f} s for a late form)" if waited else ""))
         read_page(driver)
         if len(password_inputs) >= 2:
             return url
@@ -1751,7 +1795,65 @@ def log_site_result(url, email):
 
 # The HYIP verdict line (run_regression.py reads it) and every feature behind it, with the page it
 # was seen on, in hyip_evidence.json (hyip_evidence_<domain>.json when crawling urls.txt).
+# --- Key pages for the HYIP evidence (Nov 6) ---------------------------------------------------------
+# The verdict was made from whatever pages the sign-up search happened to open (the first 12, in link
+# order) and often never saw the plans, FAQ or how-it-works pages, where deposit/withdraw wording and
+# plan cards usually are: 9 of James's 107 reachable HYIPs on the 10-31 CSV had no deposit or withdraw
+# wording on the pages read. The start page's links to such pages are remembered, and before the
+# verdict up to KEY_PAGES_MAX of them that were not read yet are opened and read.
+KEY_PAGES_MAX = 5
+KEY_PAGES_SECONDS = 45
+KEY_PAGE_ORDER = [re.compile(p, re.I) for p in (
+    r"\b(plans?|pricing|packages?|invest(ment)?s?|tariffs?|offers?)\b",
+    r"how[- _]?it[- _]?works|how to (start|invest)|get(ting)?[- _]?started",
+    r"\bfaqs?\b|questions",
+    r"\b(deposits?|withdraw(al)?s?|payouts?)\b",
+    r"\b(terms|rules|conditions|about( us)?)\b")]
+key_page_links = []
+
+def remember_key_pages(driver, page_url):
+    """The start page's links to plans/how-it-works/FAQ/deposit/terms/about pages, best first."""
+    global key_page_links
+    try:
+        links = driver.execute_script("return Array.from(document.querySelectorAll('a[href]'))"
+                                      ".map(a => [a.href, (a.innerText || '').trim()]);") or []
+    except Exception:
+        return
+    picked = []
+    for rx in KEY_PAGE_ORDER:
+        for href, text in links:
+            full = urljoin(page_url, href).split('#')[0]
+            if (full.startswith('http') and full not in picked and full.rstrip('/') != page_url.split('#')[0].rstrip('/')
+                    and site_evidence.is_onsite(full) and not SESSION_END_RE.search(full) and not LANGUAGE_LINK_RE.search(full)
+                    and rx.search(text + ' ' + urlparse(full).path)):
+                picked.append(full)
+    key_page_links = picked[:KEY_PAGES_MAX * 2]
+
+def read_key_pages(driver):
+    """Read the remembered key pages that the crawl did not read, for the HYIP evidence only."""
+    if not key_page_links or not site_evidence.read or site_evidence.unreachable:
+        return
+    start, done = time.time(), []
+    for href in key_page_links:
+        if len(done) >= KEY_PAGES_MAX or time.time() - start > KEY_PAGES_SECONDS:
+            break
+        if href in site_evidence.pages:
+            continue
+        try:
+            driver.get(href)
+            time.sleep(1.5)
+            site_evidence.add_page(driver.page_source, driver.current_url, 'page', count=False)
+            done.append(href)
+        except Exception as e:
+            logging.info(f"HYIP check: key page {href} could not be read: {str(e).splitlines()[0] if str(e) else e!r}")
+    if done:
+        logging.info(f"HYIP check: read {len(done)} more page(s) for the evidence: {done}")
+
 def log_hyip_verdict(url):
+    try:
+        read_key_pages(ensure_driver(driver))
+    except Exception as e:
+        logging.info(f"HYIP check: key pages not read: {str(e).splitlines()[0] if str(e) else e!r}")
     try:
         verdict = classify(site_evidence)
         logging.info(verdict_line(verdict))
@@ -2045,6 +2147,32 @@ def pass_profile_gate(driver):
     except Exception as e:
         logging.info(f"Profile gate could not be passed: {str(e).splitlines()[0] if str(e) else e!r}")
 
+# Plans that show only after login (Nov 6): the back-office plans/invest page was recorded as a link
+# (crawl_bo_plans) but never read, so its plan cards and % returns were not evidence (earn-way.com's
+# "Fixed Deposit", lidfxmarket.com's "Staking"). It is opened and read here, then the browser goes
+# back to the page after login so the logged-in crawl starts from the same page as before.
+def read_backoffice_plans(driver):
+    href = site_evidence.backoffice.get('crawl_bo_plans')
+    if not href or not href.startswith('http') or not site_evidence.is_onsite(href) or SESSION_END_RE.search(href):
+        return
+    here = driver.current_url
+    try:
+        driver.get(href)
+        time.sleep(2)  # let a JavaScript back office draw its plan cards
+        if looks_logged_out(driver):
+            logging.info(f"HYIP check: back-office plans page {href} showed a logged-out page; not read")
+        else:
+            site_evidence.add_page(driver.page_source, driver.current_url, 'account', count=False)
+            logging.info(f"HYIP check: read the back-office plans page {driver.current_url}")
+    except Exception as e:
+        logging.info(f"HYIP check: could not read the back-office plans page {href}: {str(e).splitlines()[0] if str(e) else e!r}")
+    try:
+        if driver.current_url != here:
+            driver.get(here)
+            dismiss_blocking_popups(driver)
+    except Exception as e:
+        logging.info(f"HYIP check: could not go back to {here}: {str(e).splitlines()[0] if str(e) else e!r}")
+
 # Save and crawl the site from the current, logged-in page. The folder is named after
 # folder_url: the login page, or the page that was already logged in when no login was needed.
 def crawl_logged_in(driver, folder_url, base_domain, original_window):
@@ -2060,6 +2188,7 @@ def crawl_logged_in(driver, folder_url, base_domain, original_window):
             driver.current_url)
     except Exception as e:
         logging.info(f"HYIP check: could not read the page after login: {str(e).splitlines()[0] if str(e) else e!r}")
+    read_backoffice_plans(driver)
 
     directory_name = windows_safe(folder_url.replace('://', '_').replace('/', '_'))
     os.makedirs(directory_name, exist_ok=True)
@@ -3393,8 +3522,10 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
 # Sign-up form with timeout
 def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=300):
     global should_continue, form_filled, logged_in, email_used, password_used, relogins_done, session_lost, site_evidence, username_used
+    global key_page_links
     should_continue = True
     form_filled = False
+    key_page_links = []
     logged_in = False
     email_used = None  # else a previous site's address leaked into this site's result
     username_used = None

@@ -92,6 +92,11 @@ TEXT = {
     'article_markers': W(r'published (on|by)|updated on|posted (on|by)|share this (article|post)|leave a (comment|reply)|min(ute)? read|editor.s (note|pick)'),
     'invest_cta': W(r'invest now|make (a )?deposit|deposit now|start investing|choose (a |your )?plan|get started now'),
     'deposit_withdraw_ui': W(r'\b(deposit|withdraw)\b.{0,40}\b(withdraw|deposit)\b'),
+    # Nov 6: the two words anywhere on a page, each on its own. deposit_withdraw_ui wants them within
+    # 40 characters; 14 of James's HYIPs on the 10-31 CSV use both words, only further apart (no
+    # research rates yet, so they are recorded as evidence and not scored).
+    'deposit_word': W(r'\bdeposit(s|ed|ing)?\b|fund (your|the) account|add funds|top ?up'),
+    'withdraw_word': W(r'\bwithdraw(al|als|n|ing)?\b|cash ?out|\bpayouts?\b'),
     'media_celebrity': W(r'elon musk|bill gates|jeff bezos|\bbbc\b|\bcnn\b|dragons.? den|shark tank|as seen on|featured (in|on)|forbes|bloomberg|reuters|yahoo finance|the guardian'),
     'review_language': W(r'\breview(s|ed)?\b.{0,40}(scam|legit)|is it (a )?(scam|legit)|pros and cons|our verdict|\brating\b|trustpilot'),
     'urgency': W(r'limited (time|spots|places|offer)|only \d+ (spots|places|slots)|offer (ends|expires)|hurry|don.t miss|last chance|spots? (left|remaining)'),
@@ -306,6 +311,7 @@ LABELS = {
     'crawl_bo_deposit': 'back office: deposit page', 'crawl_bo_withdraw': 'back office: withdraw page',
     'crawl_bo_referral': 'back office: referral page', 'crawl_bo_plans': 'back office: plans/invest page',
     'crawl_bo_challenge': 'back office: challenges page',
+    'deposit_word': 'deposit wording', 'withdraw_word': 'withdraw wording',
     'plan_tiers': 'named plan tiers', 'plan_card_txt': 'plan cards with % or duration and a $ range', 'min_max_deposit': 'min/max deposit',
     'pct_per_period': '"% per day/hour" returns', 'principal_return': 'capital back / principal returned', 'last_tx_table': 'last deposits/withdrawals table',
     'goldcoders_hscript': 'HYIP script URLs (?a=signup)', 'viserlab_hyiplab': 'HyipLab template', 'signup_wallet_fields': 'sign-up asks for payout wallets',
@@ -344,7 +350,8 @@ OFFSITE = ('crawl_offsite_signup', 'register_offsite')
 BACKOFFICE = {'crawl_bo_deposit': re.compile(r'deposit|add[- _]?funds?|top[- _]?up|recharge', re.I),
               'crawl_bo_withdraw': re.compile(r'withdraw|payout', re.I),
               'crawl_bo_referral': re.compile(r'referr?al|affiliate|downline|\bteam\b', re.I),
-              'crawl_bo_plans': re.compile(r'\bplans?\b|invest(ment)?s?\b|packages?\b', re.I),
+              # Nov 6: + "Fixed Deposit" and "Staking" (earn-way.com's and lidfxmarket.com's plan pages)
+              'crawl_bo_plans': re.compile(r'\bplans?\b|invest(ment)?s?\b|packages?\b|fixed[- _]?deposits?\b|\bstak(e|ing)\b', re.I),
               'crawl_bo_challenge': re.compile(r'challenges?\b|evaluation', re.I)}
 # Not scored: the crawler never sees them (detection-time IOC extraction, WHOIS age, hosting ISP,
 # the plain-HTTP fetch of a JavaScript page).
@@ -405,9 +412,13 @@ class SiteEvidence:
         """Features of one loaded page (the rendered page source). kind 'home' is the start page,
         'register' a page the crawler took for the sign-up page. count=False reads it even past
         MAX_PAGES (deposit pages and the page after login)."""
-        if url in self.pages or (count and not self.wants_page(url)):
+        # The sign-up page is read again as 'register' even if the search already read it: the search
+        # reads a page as soon as it loads, before a late sign-up form is drawn (Nov 6).
+        seen = url in self.pages
+        if (seen and kind != 'register') or (not seen and count and not self.wants_page(url)):
             return
-        self.pages.append(url)
+        if not seen:
+            self.pages.append(url)
         try:
             soup = BeautifulSoup(raw_html, 'html.parser')
         except Exception:
@@ -422,7 +433,8 @@ class SiteEvidence:
             return
         if kind == 'home':
             self.hosts.add(host_of(url))  # the start page may have redirected to another domain
-        self.read += 1
+        if not seen:
+            self.read += 1
         if not self.title:
             self.title = title
             for k in title_feats(title, self.domain):

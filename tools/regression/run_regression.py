@@ -92,7 +92,7 @@ def outcome(lines):
         level = 'SIGNUP_FOUND'
         error = last(r"ERROR - (An error occurred.*)")
         if error and error.rstrip().endswith('Message:'):
-            error = 'no sign-up form appeared'  # the empty TimeoutException message (15 s password wait + 5 s form wait since Nov 6)
+            error = 'no <form> or password field appeared within 5 s'  # the empty TimeoutException message
         reason = (('rejected: ' + last(r"Sign-up result: rejected - (.*)")) if last(r"Sign-up result: rejected - (.*)")
                   else ('sign-up result unclear; ' + (last(r"Login result: failed - (.*)") or 'not logged in')) if 'Sign-up submitted with' in text
                   else error or last(r"(No sign-up form found.*)") or 'sign-up not completed')
