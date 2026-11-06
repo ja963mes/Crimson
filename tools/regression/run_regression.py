@@ -92,7 +92,7 @@ def outcome(lines):
         level = 'SIGNUP_FOUND'
         error = last(r"ERROR - (An error occurred.*)")
         if error and error.rstrip().endswith('Message:'):
-            error = 'no <form> or password field appeared within 5 s'  # the empty TimeoutException message
+            error = 'no sign-up form appeared'  # the empty TimeoutException message (15 s password wait + 5 s form wait since Nov 6)
         reason = (('rejected: ' + last(r"Sign-up result: rejected - (.*)")) if last(r"Sign-up result: rejected - (.*)")
                   else ('sign-up result unclear; ' + (last(r"Login result: failed - (.*)") or 'not logged in')) if 'Sign-up submitted with' in text
                   else error or last(r"(No sign-up form found.*)") or 'sign-up not completed')
@@ -217,6 +217,8 @@ def main():
     parser.add_argument('--all', action='store_true', help="include the 'unreachable' group")
     parser.add_argument('--show-browser', action='store_true', help="run Chrome with a visible window")
     parser.add_argument('--report', action='store_true', help="re-print the last run's summary and exit")
+    parser.add_argument('--out', help="folder for the site run folders (default crawler-test/runs, which the crawler's "
+                                      "logs are appended to); results/ is the same either way")
     args = parser.parse_args()
     sites = load_sites()
 
@@ -243,7 +245,8 @@ def main():
     try:
         for i, s in enumerate(chosen, start=1):
             print(f"\n===== [{i}/{len(chosen)}] {s['name']} ({s['url']}) =====", flush=True)
-            lines, seconds = run_site(s['name'], s['url'], args.show_browser)
+            lines, seconds = run_site(s['name'], s['url'], args.show_browser,
+                                      runs=os.path.normpath(os.path.abspath(args.out)) if args.out else RUNS)
             level, wallets, reason = outcome(lines)
             v, family, why = verdict(lines)
             rows.append({'name': s['name'], 'url': s['url'], 'level': level, 'wallet_count': len(wallets),
