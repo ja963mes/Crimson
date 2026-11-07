@@ -92,7 +92,7 @@ def outcome(lines):
         level = 'SIGNUP_FOUND'
         error = last(r"ERROR - (An error occurred.*)")
         if error and error.rstrip().endswith('Message:'):
-            error = 'no <form> or password field appeared within 5 s'  # the empty TimeoutException message
+            error = 'no sign-up form appeared'  # the empty TimeoutException message (15 s password wait + 5 s form wait since Nov 6)
         reason = (('rejected: ' + last(r"Sign-up result: rejected - (.*)")) if last(r"Sign-up result: rejected - (.*)")
                   else ('sign-up result unclear; ' + (last(r"Login result: failed - (.*)") or 'not logged in')) if 'Sign-up submitted with' in text
                   else error or last(r"(No sign-up form found.*)") or 'sign-up not completed')
@@ -113,7 +113,7 @@ def outcome(lines):
     if processor:
         reason = (reason + '; ' if reason else '') + f"processor {processor.group(1)}" + (f" id {processor.group(2)}" if processor.group(2) else '')
     if 'Timeout exceeded for' in text:
-        reason = (reason + '; ' if reason else '') + 'hit the 5-minute limit'
+        reason = (reason + '; ' if reason else '') + 'hit the per-site time limit (8 min)'
     relogins = len(re.findall(r"logging in again as", text))
     if relogins:
         reason = (reason + '; ' if reason else '') + f"re-logged in {relogins}x"
