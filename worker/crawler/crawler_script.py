@@ -26,7 +26,7 @@ from selenium.common.exceptions import (
     TimeoutException, WebDriverException, NoAlertPresentException,
     UnexpectedAlertPresentException, StaleElementReferenceException
 )
-from hyip_classifier import MAX_PAGES, SiteEvidence, classify, clear_b, verdict_line
+from hyip_classifier import BACKOFFICE, MAX_PAGES, SiteEvidence, classify, clear_b, verdict_line
 
 
 # Global variables
@@ -197,6 +197,10 @@ const html = document.documentElement ? document.documentElement.outerHTML : '';
 const cf = /\/cdn-cgi\/challenge-platform\/|challenges\.cloudflare\.com|cf-chl|cf_chl_opt/i.test(html);
 if (text.length < 3000 && /sorry, you have been blocked|error 1020|you are unable to access/i.test(text) && (cf || /cloudflare|ray id/i.test(text)))
   return {kind: 'blocked', title: title, text: text.slice(0, 200)};
+// Cloudflare's "Warning: Suspected Phishing" page, put in front of reported sites (globusfxtrade.com,
+// ruifxm.online, Oct 26); it has an "Ignore & Proceed" button that lets the visitor through.
+if (text.length < 3000 && /suspected phishing/i.test(title + ' ' + text) && (cf || /cloudflare/i.test(title + ' ' + text)))
+  return {kind: 'phishing', title: title, text: text.slice(0, 200)};
 if (/^(just a moment|please wait|attention required|one more step|ddos-guard|checking your browser)/i.test(title)
     || (text.length < 1500 && /verify(ing)? (that )?you are (a )?human|checking (if the site connection is secure|your browser)|enable javascript and cookies to continue|performing security verification/i.test(text)))
   return {kind: 'challenge', title: title, cf: cf, text: text.slice(0, 200)};
@@ -247,6 +251,23 @@ def pass_bot_wall(driver):
     url = driver.current_url
     if wall['kind'] == 'blocked':
         logging.info(f"Bot wall on {url}: blocked page ({wall['title']!r}: {wall['text'][:120]!r}), nothing to pass")
+        return False
+    if wall['kind'] == 'phishing':
+        # James approved going past it (Nov 7, list item C21): the warning is about the very sites crawled.
+        pressed = driver.execute_script(
+            "const b = Array.from(document.querySelectorAll('button, a, input[type=submit], input[type=button]'))"
+            ".find(e => /^\\s*ignore\\s*(&|and)\\s*proceed/i.test(e.innerText || e.value || ''));"
+            "if (!b) return null; setTimeout(() => b.click(), 0); return (b.innerText || b.value).trim();")
+        if not pressed:
+            logging.info(f"Cloudflare phishing warning on {url}: no 'Ignore & Proceed' button found")
+            return False
+        for _ in range(10):
+            time.sleep(1)
+            now = bot_wall(driver)
+            if not now or now['kind'] != 'phishing':
+                logging.info(f"Cloudflare phishing warning on {url}: pressed {pressed!r}, now at {driver.current_url}")
+                return pass_bot_wall(driver) if now else True  # a challenge page can follow
+        logging.info(f"Cloudflare phishing warning on {url}: pressed {pressed!r}, still there after 10 s")
         return False
     logging.info(f"Bot wall on {url}: {wall['title']!r}" + (" (Cloudflare)" if wall.get('cf') else "") + f": {wall['text'][:120]!r}")
     if wall_cleared(driver, 10):
@@ -376,6 +397,9 @@ if (q('iframe[src*="recaptcha/api2/anchor"],iframe[src*="recaptcha/enterprise/an
     || q('.g-recaptcha[data-sitekey]').some(e => vis(e) && e.getAttribute('data-size') !== 'invisible')) widgets.push('reCAPTCHA v2');
 if (q('.h-captcha,iframe[src*="hcaptcha.com"]').some(vis)) widgets.push('hCaptcha');
 if (q('.cf-turnstile,iframe[src*="challenges.cloudflare.com"]').some(vis)) widgets.push('Cloudflare Turnstile');
+// A Turnstile whose box is not drawn still leaves its token field in the form: swissstaketraders.com's
+// showed "Unable to connect" and the check said "none" (Nov 6), so the site got the form without a token.
+if (!widgets.includes('Cloudflare Turnstile') && q('input[name="cf-turnstile-response"]').length) widgets.push('Cloudflare Turnstile');
 if (q('altcha-widget').some(vis)) widgets.push('ALTCHA');
 const invisible = !!document.querySelector('.grecaptcha-badge,iframe[src*="size=invisible"]')
                || /recaptcha\/(api|enterprise)\.js\?[^"']*render=(?!explicit)/i.test(document.documentElement.innerHTML);
@@ -384,7 +408,13 @@ const images = q('img').filter(e => vis(e) && /captcha|turing|validation_image|s
 const texts = e => {
     const out = [e.placeholder || ''];
     if (e.id) { const l = document.querySelector('label[for="' + CSS.escape(e.id) + '"]'); if (l) out.push(l.innerText || l.textContent); }
-    for (let p = e.parentElement, i = 0; p && i < 4; p = p.parentElement, i++) out.push(p.innerText || p.textContent || '');
+    // innerText leaves out input values: topadvancetrade.com shows its question "What is 3 + 10?" as the
+    // value of a read-only input above math_answer (Nov 1). Such values count as text of their parent.
+    for (let p = e.parentElement, i = 0; p && i < 4; p = p.parentElement, i++) {
+        out.push(p.innerText || p.textContent || '');
+        Array.from(p.querySelectorAll('input[readonly], input[disabled]')).filter(x => x !== e && x.type !== 'hidden' && x.value)
+            .forEach(x => out.push(x.value));
+    }
     return out.map(t => t.replace(/\s+/g, ' ').trim().slice(0, 300)).filter(Boolean);
 };
 // A captcha box may have a plain name: uphilltradex.com's is name="answer" ("Enter Your Answer"),
@@ -590,6 +620,9 @@ def predict_values(form):
     # Mailinator inboxes ignore case, and the login username derived from the address stays the same.
     predicted_username = last_predicted_username = generate_random_string().lower()
     predicted_email = f"{predicted_username}{random.randint(60, 99)}@{EMAIL_DOMAIN}"
+    if forced_signup_email:  # the address an e-mail-code-first step already verified (see email_code_first_signup)
+        predicted_email = forced_signup_email
+        predicted_username = last_predicted_username = re.sub(r"\d+", "", forced_signup_email.split('@')[0])
 
     for position, (name, field_id, input_type, hints, required) in enumerate(form.parent.execute_script(FIELD_HINTS_JS, form)):
         input_type = (input_type or 'text').lower()
@@ -799,6 +832,8 @@ def pick_signup_form(driver):
 # nearest ancestor of the first visible password field outside any form that also holds three or
 # more visible inputs and a button labelled like sign-up. The rest of the sign-up code takes it as
 # the form (form_controls falls back to the inputs inside it).
+# Nov 7: metagold's Angular sign-up has password + confirm and a "Continue" button. A box with two
+# password fields is a sign-up whatever its button says (other than log in / sign in).
 SIGNUP_BUTTON_RE = re.compile(r"^\s*(create( an| my| your)? account|create|sign ?up|register|join( now)?|get started|open( an)? account|submit)\b", re.I)
 SIGNUP_BOX_JS = r"""
 const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
@@ -806,8 +841,10 @@ const button = new RegExp(arguments[0], 'i');
 const pw = Array.from(document.querySelectorAll('input[type=password]')).find(e => vis(e) && !e.form);
 for (let box = pw ? pw.parentElement : null, i = 0; box && i < 12; box = box.parentElement, i++) {
   const inputs = Array.from(box.querySelectorAll('input')).filter(e => vis(e) && e.type !== 'hidden');
-  const send = Array.from(box.querySelectorAll('button, input[type=submit], input[type=button]'))
-      .some(b => vis(b) && button.test((b.innerText || b.value || '').trim()));
+  const buttons = Array.from(box.querySelectorAll('button, input[type=submit], input[type=button]')).filter(vis);
+  const passwords = inputs.filter(e => e.type === 'password').length;
+  const send = buttons.some(b => button.test((b.innerText || b.value || '').trim()))
+      || (passwords >= 2 && buttons.some(b => !/^\s*(log ?in|sign ?in)\b/i.test((b.innerText || b.value || '').trim())));
   if (inputs.length >= 3 && send) return box;
 }
 return null;
@@ -929,26 +966,87 @@ def advance_form_steps(driver, form, predictions, max_steps=3):
 # field_by_key); a page-wide lookup by name found the hidden login form's "email" and "password"
 # first on pages with two forms. only_empty is for later steps of a multi-step form, so fields
 # filled in an earlier step are not typed twice.
+# Captcha widgets keep their token in a field of the form (swissstaketraders.com's hidden
+# cf-turnstile-response, Nov 6); typing into it would only spoil the token.
+CAPTCHA_RESPONSE_RE = re.compile(r"(cf-turnstile|g-recaptcha|h-captcha)-response", re.I)
+
 def fill_form(form, predictions, only_empty=False):
+    """Type the predicted values into the form. Returns the names of the fields filled."""
+    filled = []
     for input_name, prediction in predictions.items():
+        if CAPTCHA_RESPONSE_RE.search(str(input_name)):
+            continue
         input_field = field_by_key(form, input_name)
         if input_field is None:
             logging.info(f"Element {input_name} is no longer on the page")
             continue
-        if only_empty and (not input_field.is_displayed() or (input_field.get_attribute('value') or '')):
-            continue
         try:
+            if only_empty and (not input_field.is_displayed() or (input_field.get_attribute('value') or '')):
+                continue
             if input_field.is_displayed() and input_field.is_enabled() and (input_field.get_attribute('type') or '').lower() in DATE_INPUT_FORMATS:
                 driver.execute_script("arguments[0].value = arguments[1];"
                                       "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));"
                                       "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
                                       input_field, prediction)
+                filled.append(input_name)
             elif input_field.is_displayed() and input_field.is_enabled():
                 input_field.send_keys(prediction)
-            else:
+                filled.append(input_name)
+            elif not only_empty:
                 logging.info(f"Element {input_name} is not interactable")
-        except ElementNotInteractableException:
-            logging.info(f"Element {input_name} is not interactable")
+        except (ElementNotInteractableException, StaleElementReferenceException):
+            if not only_empty:
+                logging.info(f"Element {input_name} is not interactable")
+    return filled
+
+# Choice fields drawn as a read-only text box (Nov 7): swissstaketraders.com's country is
+# <input name="country" readonly required placeholder="Choose your country"> inside a <button>;
+# clicking it opens a searchable list of <button class="option"> countries. The browser does not
+# check read-only fields, so nothing flagged it before submitting, and the server answered "The
+# country field is required." Its phone-code box (+376) is the same kind. Done the way a person
+# does it: click the box, then click United States (the phone numbers are US ones) or the first
+# real item of the list that opened next to it.
+READONLY_CHOICES_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+const f = arguments[0];
+const els = f.elements ? Array.from(f.elements) : Array.from(f.querySelectorAll('input'));
+return els.filter(e => e.tagName === 'INPUT' && ['text', 'tel', 'search', ''].includes((e.getAttribute('type') || '').toLowerCase())
+    && e.readOnly && !e.disabled && vis(e) && !(e.value || '').trim() && !/date|birth|dob/i.test((e.name || '') + ' ' + e.id + ' ' + (e.placeholder || '')));
+"""
+OPEN_CHOICE_JS = "(arguments[0].closest('button, [role=combobox], [class*=select], [class*=dropdown]') || arguments[0]).click();"
+PICK_CHOICE_JS = r"""
+const e = arguments[0], wantUS = arguments[1];
+const vis = x => !!(x.offsetWidth || x.offsetHeight || x.getClientRects().length);
+const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+const PH = /^(-+.*|select\b.*|choose\b.*|please (select|choose)\b.*|search\b.*|\.\.\.|…)?$/i;
+for (let box = e.parentElement, i = 0; box && i < 5; box = box.parentElement, i++) {
+  const opts = Array.from(box.querySelectorAll('[role=option], button.option, [class*=option], li'))
+      .filter(x => !x.contains(e) && vis(x) && clean(x.innerText) && !PH.test(clean(x.innerText))
+                   && !x.querySelector('[role=option], button.option, li'));
+  if (opts.length < 2) continue;
+  const pick = (wantUS && opts.find(x => /united states|^\+?1$|^usa?$/i.test(clean(x.innerText)))) || opts[0];
+  pick.click();
+  return {picked: clean(pick.innerText).slice(0, 40), value: e.value, options: opts.length};
+}
+return null;
+"""
+
+def handle_readonly_choices(driver, form):
+    try:
+        for box in driver.execute_script(READONLY_CHOICES_JS, form) or []:
+            name = box.get_attribute('name') or box.get_attribute('id') or box.get_attribute('placeholder') or '(unnamed)'
+            hints = ' '.join((box.get_attribute(a) or '') for a in ('name', 'id', 'placeholder', 'autocomplete'))
+            driver.execute_script(OPEN_CHOICE_JS, box)
+            time.sleep(0.8)
+            choice = driver.execute_script(PICK_CHOICE_JS, box, bool(re.search(r"country|nation|region|phone|dial|tel|code|\+", hints, re.I)))
+            time.sleep(0.3)
+            if choice:
+                logging.info(f"Read-only choice box {name!r}: picked {choice['picked']!r} of {choice['options']} "
+                             f"(the box now reads {box.get_attribute('value')!r})")
+            else:
+                logging.info(f"Read-only choice box {name!r}: clicking it showed no list to pick from")
+    except Exception as e:
+        logging.info(f"Read-only choice boxes could not be set: {str(e).splitlines()[0] if str(e) else e!r}")
 
 # Required <textarea> fields. predict_values() only looks at <input>s, so no text area was ever
 # filled: fundamints.online/register was refused with "address: Please fill out this field" for
@@ -971,7 +1069,58 @@ def fill_textareas(form):
 
 # Handle checkboxes in the chosen form. The form is already loaded, so there is nothing to
 # wait for; a 10 s wait for checkboxes used to stall every form that has none.
+# Consent boxes that are not <input type=checkbox> (Nov 7): app.miningbest.com/register's "I agree"
+# box is an empty 20x20 <button type="button">; the crawler logged "No checkboxes in the form" and the
+# submit button stayed disabled (Nov 1; one click on the box enables it, checked headless). Other
+# sites draw it as role="checkbox" with aria-checked="false". Both are clicked when the text right
+# next to them reads like consent (agree / terms / privacy / rules); an empty button only while the
+# form's submit button is disabled, since its ticked state cannot be read.
+CONSENT_BOXES_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+const AGREE = /agree|accept|terms|privacy|policy|consent|conditions|rules|i am (over|at least) ?18/i;
+const f = arguments[0];
+const submit = Array.from(f.querySelectorAll('button, input[type=submit]')).find(b => vis(b) && (b.getAttribute('type') || 'submit').toLowerCase() === 'submit');
+const blocked = !!submit && (submit.disabled || submit.getAttribute('aria-disabled') === 'true');
+const consent = e => {
+  for (let p = e.parentElement, i = 0; p && i < 3; p = p.parentElement, i++) {
+    if (Array.from(p.querySelectorAll('input, select, textarea')).some(x => vis(x) && x.type !== 'checkbox' && x.type !== 'hidden')) return '';
+    const t = clean(p.innerText);
+    if (t && t.length < 300 && AGREE.test(t)) return t.slice(0, 80);
+  }
+  return '';
+};
+const done = [];
+for (const e of Array.from(f.querySelectorAll('[role=checkbox], [role=switch], button'))) {
+  if (!vis(e)) continue;
+  const role = e.getAttribute('role');
+  const aria = (role === 'checkbox' || role === 'switch') && e.getAttribute('aria-checked') === 'false';
+  const r = e.getBoundingClientRect();
+  const empty = !role && e.tagName === 'BUTTON' && (e.getAttribute('type') || '').toLowerCase() === 'button'
+      && !clean(e.innerText) && r.width <= 40 && r.height <= 40 && blocked;
+  if (!aria && !empty) continue;
+  const why = consent(e);
+  if (!why) continue;
+  e.click();
+  done.push({kind: aria ? role : 'empty button', text: why, now: e.getAttribute('aria-checked')});
+}
+return {done: done, blocked_before: blocked,
+        blocked_after: !!submit && (submit.disabled || submit.getAttribute('aria-disabled') === 'true')};
+"""
+
+def handle_consent_boxes(driver, form):
+    try:
+        r = driver.execute_script(CONSENT_BOXES_JS, form) or {}
+        for box in r.get('done', []):
+            logging.info(f"Consent box ({box['kind']}) next to {box['text']!r} clicked"
+                         + (f"; aria-checked now {box['now']!r}" if box.get('now') else ""))
+        if r.get('done') and r.get('blocked_before'):
+            logging.info("Submit button " + ("still disabled" if r.get('blocked_after') else "enabled") + " after the consent box click")
+    except Exception as e:
+        logging.info(f"Consent boxes could not be checked: {str(e).splitlines()[0] if str(e) else e!r}")
+
 def handle_checkbox(driver, form):
+    handle_consent_boxes(driver, form)
     try:
         checkboxes = form_controls(form, 'input[type="checkbox"]')
         if not checkboxes:
@@ -1227,7 +1376,7 @@ def check_form_before_submit(driver, form, predictions):
 PAGE_STATE_JS = r"""
 const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
 const errSel = '[class*="error" i],[class*="alert" i],[class*="invalid" i],[class*="warning" i],[class*="danger" i],' +
-               '[role="alert"],.help-block,font[color="red" i],font[color="#ff0000" i],[style*="color:red" i],[style*="color: red" i]';
+               '[role="alert"],.help-block,[class*="text-red" i],[class*="text-danger" i],font[color="red" i],font[color="#ff0000" i],[style*="color:red" i],[style*="color: red" i]';
 const errors = Array.from(document.querySelectorAll(errSel))
     .filter(e => vis(e) && !/success|info/i.test(String(e.className || '')))
     .map(e => (e.innerText || '').trim().replace(/\s+/g, ' ')).filter(t => t && t.length < 300);
@@ -1248,11 +1397,15 @@ return {url: location.href, errors: [...new Set(dialogs.concat(errors))].slice(0
         passwords: Array.from(document.querySelectorAll('input[type=password]')).filter(vis).length,
         dialogs: dialogs, text: (dialogs.join(' \n') + ' \n' + (document.body ? document.body.innerText : '')).slice(0, 20000)};
 """
-SIGNUP_OK_RE = re.compile(r"registration (was |is )?(complete|completed|successful)|successfully (registered|signed up|created)|registered successfully|"
+SIGNUP_OK_RE = re.compile(r"registration (was |is |has been )?(complete|completed|successful|success)|successfully (registered|signed up|created)|registered successfully|"
                           r"account (has been |was )?(created|registered)|thank you for (registering|signing up|joining|your registration)|"
                           r"check your (e-?mail|inbox)|(confirmation|verification|activation) (link|e-?mail|code) (has been |was )?sent|verify your e-?mail", re.I)
 FORM_ERROR_RE = re.compile(r"already (exists|registered|in use|taken)|required|invalid|incorrect|do(es)? not match|must (be|contain|have)|"
                            r"please (enter|fill|provide|select|check|agree|type|correct|choose)|captcha|not valid|too (short|long)|wrong|error|failed", re.I)
+# A URL that says the sign-up went through (Nov 7): beyondmoneyinvestment.top sent the browser to
+# login.php?result=successreg with "Registration Success Your registration has been successful" on the
+# page, and a leftover "! Not valid!" made the sign-up count as rejected (Nov 1).
+SIGNUP_OK_URL_RE = re.compile(r"[?&](result|status|msg|message|reg|signup|registration)=(success\w*|ok|registered|done|complete\w*)|[?&](registered|success)=(1|true)|success_?reg|reg(istration)?[-_]?success|sign_?up[-_]?success", re.I)
 LOGIN_FAILED_URL_RE = re.compile(r"say=invalid|invalid_login|login_?error|[?&]error=", re.I)
 PASSWORD_RECOVERY_URL_RE = re.compile(r"forgot|reset-?password|password-?reset|recover|lost-?password|a=forgot", re.I)
 # The page after a sign-up asks for the e-mail address to be confirmed (text or URL).
@@ -1299,6 +1452,10 @@ def assess_signup(before, after, form_url):
         return "success", "a Logout link is on the page"
     if ok and not SIGNUP_OK_RE.search(before["text"]):
         return "success", f"success message {ok.group(0)!r}"
+    if after["url"] != form_url and SIGNUP_OK_URL_RE.search(after["url"]):
+        return "success", f"moved to {after['url']}, whose address says the sign-up went through"
+    if after["url"] != form_url and ok and LOGIN_URL_RE.search(after["url"]):
+        return "success", f"moved to the login page {after['url']} showing {ok.group(0)!r}"
     # Empty required fields only count while the sign-up form is still shown. On minnercoinex.org
     # the sign-up went on to signin.php, whose untouched login fields ("email: Please fill out this
     # field") were read as the sign-up being refused.
@@ -1471,6 +1628,9 @@ def fill_sign_up_form(driver, start_url):
                     logging.info(f"Sign-up form drawn {waited:.0f} s after {driver.current_url} loaded")
                 elif waited is None:
                     logging.info(f"No password field on {driver.current_url} after waiting {SIGNUP_FORM_SECONDS} s")
+                    if invite_only_signup(driver):
+                        break
+                    email_code_first_signup(driver)
                 read_page(driver, 'register')
                 captcha_blocks, captcha_summary, captcha_answer, captcha_target = check_captcha(driver)
                 logging.info(f"Captcha check on {driver.current_url}: {captcha_summary}")
@@ -1516,6 +1676,7 @@ def fill_sign_up_form(driver, start_url):
 
                         handle_dropdowns(form, driver)
                         handle_custom_choices(driver, form)
+                        handle_readonly_choices(driver, form)
                         time.sleep(1)
                         # A captcha in a later step was hidden when the page was first checked:
                         # fxtastytrades.com's step 3 is "Enter the code below: X7DPDX". Check again.
@@ -1550,6 +1711,12 @@ def fill_sign_up_form(driver, start_url):
                             logging.info(f"Submit button disabled with the usual password; retried with {ACCOUNT_PASSWORD_ALT!r}: "
                                          + ("now enabled" if not submit_disabled(form) else "still disabled"))
 
+                        # Fields that could not be typed into at first get a second try: on
+                        # londontradingindex.com (Nov 6) fields were not interactable when the form
+                        # was first filled and the sign-up went out with them empty.
+                        refilled = fill_form(form, predictions, only_empty=True)
+                        if refilled:
+                            logging.info(f"Second fill pass: filled {refilled} that were still empty")
                         check_form_before_submit(driver, form, predictions)
 
                         selectors = [
@@ -1646,12 +1813,34 @@ def fill_sign_up_form(driver, start_url):
                 # changed in between: on olymptrade-wid.com and blog.investax.io (Oct 29) the
                 # StaleElementReferenceException was not caught here and ended the site's crawl.
                 links = driver.execute_script("return Array.from(document.querySelectorAll('a[href]'))"
-                                              ".map(a => [a.href, (a.innerText || '').trim()]);") or []
+                                              ".map(a => [a.href, (a.innerText || '').trim(), a.hreflang || a.getAttribute('lang') || '']);") or []
                 # Off-site sign-up links only count on the site's own pages: gozmining.com's /login/github
                 # went on to github.com, whose own "Sign up" link was taken for gozmining's (Oct 31).
                 on_site = any(same_site(driver.current_url, d) for d in site_domains)
-                for href, link_text in links:
-                    absolute_link = urljoin(current_url, href)
+                # Language switchers (Nov 7): cn-zfx.asia's search spent its 5 minutes on /en-mena/, /zh-hans/,
+                # /mx/ ... (LANGUAGE_LINK_RE only knew /xx and /xx-yy). Links marked hreflang/lang are skipped,
+                # and so are bare locale paths (/xx/, /xx-yyyy/) when the page has 3 or more of them.
+                locale_links = {h for h, _, _ in links if LOCALE_PATH_RE.match(urlparse(h).path or '')}
+                signup_first = []
+                for href, link_text, hreflang in links:
+                    # A malformed href ("'login_redirection' does not appear to be an IPv4 or IPv6 address",
+                    # research.blackbull.com, Nov 6) ended the whole page; now only that link is skipped.
+                    try:
+                        absolute_link = urljoin(current_url, href)
+                        urlparse(absolute_link).netloc
+                    except ValueError:
+                        continue
+                    if hreflang or (len(locale_links) >= 3 and href in locale_links):
+                        continue
+                    # Sign-up links go to the front of the queue, the way a person goes for "Open account"
+                    # first: tptexchange.com's /sign-up was the 7th page opened (Nov 5).
+                    if (OFFSITE_SIGNUP_TEXT_RE.match(re.sub(r"[^\w\s]", " ", link_text).strip()) and should_continue
+                            and any(same_site(absolute_link, d) for d in site_domains) and not is_blacklisted(absolute_link)
+                            and absolute_link not in visited_urls and not LANGUAGE_LINK_RE.search(absolute_link)):
+                        if absolute_link in urls_to_check:
+                            urls_to_check.remove(absolute_link)
+                        signup_first.append(absolute_link)
+                        continue
                     # same_site() also takes subdomains: securenovatrade.com's sign-up and login are on
                     # account.securenovatrade.com, which used to count as another site.
                     # Language links are skipped as in the login search: gozmining.com's /lang/en ... /lang/gr
@@ -1665,6 +1854,7 @@ def fill_sign_up_form(driver, start_url):
                     elif (on_site and absolute_link.startswith('http') and OFFSITE_SIGNUP_TEXT_RE.match(re.sub(r"[^\w\s]", " ", link_text).strip())
                           and absolute_link not in offsite_signup and not is_blacklisted(absolute_link)):
                         offsite_signup.append(absolute_link)
+                urls_to_check[:0] = list(dict.fromkeys(signup_first))
         except TimeoutException:
             logging.info(f"Sign-up unsuccessful for {current_url}. Website not reachable")
         except Exception as e:
@@ -1740,6 +1930,23 @@ def has_two_or_more_password_fields(driver, url):
 # still be HYIPs; this only ends the sign-up search and says why. Checked on sign-up-like URLs only,
 # so a call-back form elsewhere on a site does not count. A form with a message box is a contact form.
 SIGNUP_LIKE_URL_RE = re.compile(r"regist|sign-?up|join|auth|account|open|lander|get-?started|create", re.I)
+
+# Invitation-only sign-up (Nov 7): 3diceglobal.com/register says "Registration by invitation only ... you
+# need the invitation link of a 3DICE Global member" and has no form; the search went on and reported
+# "No sign-up form found". Now the reason is logged and the sign-up search ends.
+INVITE_ONLY_RE = re.compile(r"(registration|sign[- ]?up|joining|membership) (is )?(by|with) invitation only|invitation[- ]only|"
+                            r"(need|require[sd]?) (an? |the )?(valid )?(invitation|invite|referral) (link|code)|without a valid invitation", re.I)
+
+def invite_only_signup(driver):
+    try:
+        text = driver.execute_script("return (document.body.innerText || '').replace(/\\s+/g, ' ');") or ''
+    except Exception:
+        return False
+    m = INVITE_ONLY_RE.search(text)
+    if not m:
+        return False
+    logging.info(f"Invitation-only sign-up on {driver.current_url}: \"{text[max(0, m.start() - 60): m.end() + 60].strip()}\"; stopping the sign-up search")
+    return True
 LEAD_FORM_JS = r"""
 const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
 if (Array.from(document.querySelectorAll('input[type=password]')).some(vis)) return null;
@@ -1973,7 +2180,12 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
             # (say=invalid_login) and accepted the username.
             email_box = re.search(r"mail", ' '.join((username_input.get_attribute(a) or '') for a in ('name', 'id', 'placeholder', 'autocomplete')), re.I)
             user_box = re.search(r"user", ' '.join((username_input.get_attribute(a) or '') for a in ('name', 'id')), re.I)
-            if not email_used:
+            if issued_login_id and not email_box:
+                # The login ID the site e-mailed (capitalmarketfx.com: "User ID CM345996"); the e-mail
+                # address and the derived username were refused there (Nov 3).
+                logging.info(f"Logging in with the user ID from the welcome e-mail: {issued_login_id}")
+                username_input.send_keys(issued_login_id)
+            elif not email_used:
                 username_input.send_keys(username_used)
             elif input_type == "text" and (user_box or not email_box):
                 modified_email = re.sub(r'\d+', '', email_used).replace(f"@{EMAIL_DOMAIN}", "")
@@ -2120,6 +2332,69 @@ for (let i = 0; i < document.forms.length; i++) {
 return null;
 """
 
+# One-choice set-up screens (Nov 7): lidfxmarket.com's /t/dashboard first shows only "Select Your
+# Preferred Currency To Trade With" (one <select>, USD $ ...) and a SAVE button; the dashboard with
+# Deposit/Staking/Withdrawal comes after it (James's screenshots). uphilltradex.com stopped at
+# /en-us/setup/currency the same way (Nov 2). PROFILE_GATE_JS needs 2+ name/address fields, so neither
+# counted. Here: a visible form or box with one choice control (select or radio group), at most one
+# other text box, and a save/continue button, on a page that reads like a set-up step.
+SETUP_CHOICE_GATE_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+if (Array.from(document.querySelectorAll('input[type=password]')).some(vis)) return null;
+const links = Array.from(document.querySelectorAll('a[href]')).filter(vis).length;
+const text = (document.body.innerText || '').replace(/\s+/g, ' ');
+const stepPage = /setup|currency|onboard|preference|select|choose|welcome/i.test(location.pathname)
+  || /(select|choose)[^.]{0,60}(currency|account|plan|language|country)|to (proceed|continue)/i.test(text) || links <= 8;
+if (!stepPage) return null;
+const label = b => (b.innerText || b.value || '').trim();
+const boxes = Array.from(document.forms).filter(vis);
+if (!boxes.length) { const s = Array.from(document.querySelectorAll('select')).find(vis); if (s) boxes.push(s.closest('div, section') || document.body); }
+for (const box of boxes) {
+  const els = Array.from(box.querySelectorAll('input, select, textarea')).filter(vis);
+  const selects = els.filter(e => e.tagName === 'SELECT');
+  const radios = [...new Set(els.filter(e => e.type === 'radio').map(e => e.name))];
+  const texts = els.filter(e => e.tagName === 'TEXTAREA' || (e.tagName === 'INPUT' && !['radio', 'checkbox', 'hidden', 'submit', 'button'].includes(e.type)));
+  if (selects.length + radios.length !== 1 || texts.length > 1) continue;
+  const button = Array.from(box.querySelectorAll('button, input[type=submit]')).concat(Array.from(document.querySelectorAll('button')))
+    .filter(vis).find(b => /^(save|continue|proceed|submit|next|confirm|done|start|get started)\b/i.test(label(b)));
+  if (!button) continue;
+  return {select: selects[0] || null, radio: radios[0] || null, button: button, label: label(button)};
+}
+return null;
+"""
+
+def pass_setup_choice_gate(driver):
+    """Pick an option on a one-choice set-up screen and save it (see SETUP_CHOICE_GATE_JS)."""
+    try:
+        gate = driver.execute_script(SETUP_CHOICE_GATE_JS)
+        if not gate:
+            return
+        start, before = driver.current_url, page_state(driver)
+        picked = driver.execute_script(r"""
+const g = arguments[0];
+if (g.select) {
+  const opts = Array.from(g.select.options).filter(o => !o.disabled && o.value && !/^\s*(-+|select|choose|please)/i.test(o.text));
+  const o = opts.find(o => /\b(usd|us dollar|united states)\b/i.test(o.text)) || opts[0];
+  if (!o) return null;
+  const set = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+  set.call(g.select, o.value);
+  g.select.dispatchEvent(new Event('input', {bubbles: true})); g.select.dispatchEvent(new Event('change', {bubbles: true}));
+  return o.text.trim();
+}
+const r = Array.from(document.getElementsByName(g.radio)).find(e => !e.disabled);
+if (!r) return null;
+r.click();
+return (r.labels && r.labels[0] ? r.labels[0].innerText : r.value).trim();
+""", gate)
+        if not picked:
+            return
+        time.sleep(0.5)
+        driver.execute_script("arguments[0].click();", gate['button'])
+        after = wait_for_outcome(driver, before)
+        logging.info(f"Set-up screen on {start}: picked {picked!r}, pressed {gate['label']!r}; now at {after['url']}")
+    except Exception as e:
+        logging.info(f"Set-up screen could not be passed: {str(e).splitlines()[0] if str(e) else e!r}")
+
 def pass_profile_gate(driver):
     """Fill in and submit a profile form that stands in front of the back office (see PROFILE_GATE_JS)."""
     try:
@@ -2133,6 +2408,7 @@ def pass_profile_gate(driver):
         fill_textareas(form)
         handle_dropdowns(form, driver)
         handle_custom_choices(driver, form)
+        handle_readonly_choices(driver, form)
         handle_checkbox(driver, form)
         check_form_before_submit(driver, form, predictions)
         before = page_state(driver)
@@ -2151,7 +2427,45 @@ def pass_profile_gate(driver):
 # (crawl_bo_plans) but never read, so its plan cards and % returns were not evidence (earn-way.com's
 # "Fixed Deposit", lidfxmarket.com's "Staking"). It is opened and read here, then the browser goes
 # back to the page after login so the logged-in crawl starts from the same page as before.
+# Plans menu that is a button (Nov 7): earn-way.com's "Fixed Deposit" is a <button> that opens a
+# submenu, so the back office had no plans link and the plans page was never read. When no plans link
+# was found, a visible button (or menu item) labelled like one is pressed and the links it reveals are
+# read again; if pressing it opened a page instead, that page is read.
+BO_PLANS_BUTTON_JS = r"""
+const rx = new RegExp(arguments[0], 'i');
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+const label = e => (e.innerText || e.value || '').replace(/\s+/g, ' ').trim();
+const b = Array.from(document.querySelectorAll('button, [role=button], [role=menuitem], summary, [data-toggle], [data-bs-toggle]'))
+  .find(e => vis(e) && !e.closest('a[href]') && label(e).length <= 40 && rx.test(label(e))
+             && !/log ?out|sign ?out|exit/i.test(label(e)) && !(e.form && e.type === 'submit'));
+if (!b) return null;
+b.click();
+return label(b);
+"""
+
+def open_plans_menu(driver):
+    try:
+        here = driver.current_url
+        pressed = driver.execute_script(BO_PLANS_BUTTON_JS, BACKOFFICE['crawl_bo_plans'].pattern)
+        if not pressed:
+            return
+        time.sleep(1.5)
+        if driver.current_url != here and not looks_logged_out(driver):
+            site_evidence.add_page(driver.page_source, driver.current_url, 'account', count=False)
+            logging.info(f"HYIP check: pressed {pressed!r}, which opened {driver.current_url}; read it")
+            driver.get(here)
+            dismiss_blocking_popups(driver)
+            return
+        site_evidence.add_backoffice(driver.execute_script(
+            "return Array.from(document.querySelectorAll('a[href]')).map(a => [a.href, (a.innerText || '').trim()]);") or [], here)
+        logging.info(f"HYIP check: pressed the {pressed!r} menu button; plans link now "
+                     f"{site_evidence.backoffice.get('crawl_bo_plans') or 'still not found'}")
+    except Exception as e:
+        logging.info(f"HYIP check: could not open the plans menu: {str(e).splitlines()[0] if str(e) else e!r}")
+
 def read_backoffice_plans(driver):
+    if not site_evidence.backoffice.get('crawl_bo_plans'):
+        open_plans_menu(driver)
     href = site_evidence.backoffice.get('crawl_bo_plans')
     if not href or not href.startswith('http') or not site_evidence.is_onsite(href) or SESSION_END_RE.search(href):
         return
@@ -2180,6 +2494,7 @@ def crawl_logged_in(driver, folder_url, base_domain, original_window):
     logged_in = True
     dismiss_blocking_popups(driver)  # before the links are read: an overlay can hide or replace them
     pass_profile_gate(driver)
+    pass_setup_choice_gate(driver)
     site_evidence.add('crawl_logged_in', folder_url, site_evidence.is_onsite(folder_url))
     try:  # the page after login and the back-office pages it links to (deposit, withdraw, referral, plans)
         site_evidence.add_page(driver.page_source, driver.current_url, 'account', count=False)
@@ -2220,6 +2535,9 @@ def crawl_if_already_logged_in(driver, where):
 LANGUAGE_LINK_RE = re.compile(r"/(locale|lang|language)/[a-z]{2}([_-][a-z]{2})?/?$|[?&](lang|locale|hl|language)="
                               r"|^https?://[^/]+/(en|de|fr|es|it|pt|ru|ar|zh|ja|ko|tr|nl|pl|hi|id|vi|th|fa|ur|bn|sv|no|da|fi"
                               r"|cs|sk|ro|hu|el|bg|uk|he|ms|tl|sw)([_-][a-z]{2})?/?$", re.I)
+# A path that is only a locale: /mx/, /en-mena/, /zh-hans/ (cn-zfx.asia, Nov 6). Skipped only when a page
+# has three or more such links (a language/region switcher), so a lone /fx or /ai page is still followed.
+LOCALE_PATH_RE = re.compile(r"^/[a-z]{2}([_-][a-z]{2,4})?/?$", re.I)
 
 # Links that end the session. Only "logout" and "signout" were skipped, and fxtastytrades.com's
 # /user/logoff logged the crawl out: every page saved after it was the "Sign In" page.
@@ -2413,6 +2731,36 @@ def wallets_in(text, window=300, keyed=False):
 # address/wallet key counts: coinprofx.live's /deposit carries all its wallets in Next.js data
 # ("asset":"BTC","network":"Bitcoin","address":"bc1qsz24...") and shows one only once a coin
 # is picked, so its three wallets were missed (Oct 30).
+# Deposit addresses that load late (Nov 7): earn-way.com's crypto checkout shows "Send To This Address:
+# Loading..." with a per-user address fetched afterwards (James's screenshot; in his browser it never
+# came). The deposit step read the page at once and saw no address. Now it waits for the address while
+# the page says Loading/Generating next to an address or wallet label, and logs when it never came.
+ADDRESS_WAIT_SECONDS = 15
+ADDRESS_LOADING_JS = r"""
+const leaf = Array.from(document.querySelectorAll('input, textarea, code, pre, span, div, p, td'))
+  .filter(e => (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA' || e.children.length === 0) && (e.offsetWidth || e.offsetHeight));
+return leaf.some(e => /^(loading|generating|fetching)( address)?\s*(\.\.\.|…)?$/i.test(((e.value !== undefined && e.tagName !== 'DIV' ? e.value : '') || e.textContent || '').trim())
+  && /address|wallet/i.test(((e.closest('div, section, form') || document.body).textContent || '').slice(0, 2000)));
+"""
+
+def wait_for_address(driver, where=''):
+    try:
+        if not driver.execute_script(ADDRESS_LOADING_JS):
+            return
+    except Exception:
+        return
+    start = time.time()
+    while time.time() - start < ADDRESS_WAIT_SECONDS and should_continue:
+        time.sleep(1)
+        try:
+            if (wallet_like(driver.page_source + " " + (driver.execute_script(INPUT_VALUES_JS) or ""))
+                    or not driver.execute_script(ADDRESS_LOADING_JS)):
+                logging.info(f"Deposit address loaded {time.time() - start:.0f} s later{where}")
+                return
+        except Exception:
+            return
+    logging.info(f"Deposit address never loaded{where}: the page still says Loading after {ADDRESS_WAIT_SECONDS} s")
+
 def wallet_like(html_content):
     scripts = re.findall(r"<script\b[^>]*>(.*?)</script>", html_content, flags=re.S | re.I)
     visible = re.sub(r"<(script|style)\b.*?</\1>", " ", html_content, flags=re.S | re.I)
@@ -2755,11 +3103,15 @@ CHOICE_WAIT = 2
 DEPOSIT_HELPERS_JS = r"""
 const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
 const clean = s => (s || '').replace(/\s+/g, ' ').trim();
-const BOX_BUTTON = /deposit|proceed|pay|continue|submit|fund|confirm/i;
+const BOX_BUTTON = /deposit|proceed|pay|continue|submit|fund|confirm|next/i;
+// A menu is a nav/header/aside/footer or an element whose class says sidebar/menu/navbar, but not <html>
+// or <body>: sterlingtradingoption.com has <html class="sidebar-color">, which made every element of
+// the page "in a menu" and dropped its deposit method cards (Nov 1).
+const inMenu = b => { const m = b.closest('nav, header, aside, footer, [class*=sidebar], [class*=menu], [class*=navbar]'); return !!m && m !== document.body && m !== document.documentElement; };
 function depositBox() {
   const buttons = Array.from(document.querySelectorAll('button, [role=button], input[type=button], input[type=submit]'))
     .filter(b => vis(b) && BOX_BUTTON.test(clean(b.innerText || b.value))
-            && !b.closest('form, nav, header, aside, footer, [class*=sidebar], [class*=menu], [class*=navbar]'));
+            && !b.closest('form') && !inMenu(b));
   for (const b of buttons) {
     let box = b.parentElement;
     for (let i = 0; box && i < 6; i++, box = box.parentElement) {
@@ -2794,7 +3146,7 @@ function methodButtons(form) {
   const clean = s => (s || '').replace(/\s+/g, ' ').trim();
   const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
   const LABEL = /^(deposit|deposit now|select|choose|pay|pay now|use|use this|proceed|continue|fund)$/i;
-  const outside = b => !b.closest('nav, header, aside, footer, [class*=sidebar], [class*=menu], [class*=navbar]');
+  const outside = b => { const m = b.closest('nav, header, aside, footer, [class*=sidebar], [class*=menu], [class*=navbar]'); return !m || m === document.body || m === document.documentElement; };
   const fnOf = b => ((b.getAttribute('onclick') || '').match(/^\s*([\w$.]+)\s*\(/) || [])[1];
   let cands = Array.from(document.querySelectorAll('button, a, [role=button], input[type=button]')).filter(b =>
       vis(b) && !(form && form.contains(b) && (b.type || '').toLowerCase() === 'submit') && LABEL.test(clean(b.innerText || b.value))
@@ -2868,7 +3220,7 @@ function openers(f) {
   const clean = s => (s || '').replace(/\s+/g, ' ').trim();
   const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
   const box = f.closest('.modal, [role=dialog], [class*=modal], [id*=modal], [class*=popup]') || f;
-  const outside = b => !b.closest('nav, header, aside, footer, [class*=sidebar], [class*=menu], [class*=navbar]');
+  const outside = b => { const m = b.closest('nav, header, aside, footer, [class*=sidebar], [class*=menu], [class*=navbar]'); return !m || m === document.body || m === document.documentElement; };
   const cands = Array.from(document.querySelectorAll('button, a, [role=button], input[type=button]'))
       .filter(b => vis(b) && !box.contains(b) && outside(b));
   let found = [];
@@ -3240,6 +3592,58 @@ if (window.jQuery) { try { window.jQuery(s).trigger('change'); } catch (e) {} }
 return {picked: clean(o.text).slice(0, 60), value: s.value};
 """
 
+# Coin and network chosen with rows of buttons ("chips"), no form and no <select> (Nov 7):
+# marketprimetrade.com's /deposit.html has asset buttons (button.asset-chip data-asset="USDT", USDC,
+# BTC, ETH), network buttons (button.chip data-network="BSC", Ethereum, Polygon, Tron, Solana), an
+# amount box and a "Generate" button that asks the server for the deposit invoice. DEPOSIT_FORM_JS
+# found no form, so 0 passes ran (Oct 30). A chip group is two or more short sibling buttons, outside
+# menus, of which at least two name a coin or network (text or data-* attributes). The first group is
+# the coin, the second (if any) the network. arguments: [action, group, label, amount].
+CHIP_GROUPS_JS = DEPOSIT_HELPERS_JS + r"""
+const COINS = /\b(usdt|usdc|btc|bitcoin|eth|ether|ethereum|ltc|litecoin|trx|tron|trc-?20|bnb|bsc|bep-?20|erc-?20|sol|solana|polygon|matic|doge|dogecoin|xrp|ripple|ton|arbitrum|avax|bch|dash|tether)\b/i;
+const GEN = /generate|(get|show|create|view)( (the|my|deposit|wallet))* (address|invoice|wallet)|^(make )?deposit( now)?$|^(pay|proceed|continue|confirm|next)\b/i;
+const labelOf = b => clean(b.innerText || b.value) || clean(Object.values(b.dataset || {}).join(' '));
+const groups = () => {
+  const byParent = new Map();
+  Array.from(document.querySelectorAll('button, [role=tab], [role=radio], [role=button]'))
+    .filter(b => vis(b) && !inMenu(b) && (b.getAttribute('type') || 'button').toLowerCase() !== 'submit' && labelOf(b).length <= 40)
+    .forEach(b => { if (!byParent.has(b.parentElement)) byParent.set(b.parentElement, []); byParent.get(b.parentElement).push(b); });
+  return Array.from(byParent.values()).filter(g => g.length >= 2
+      && g.filter(b => COINS.test(labelOf(b) + ' ' + Object.values(b.dataset || {}).join(' '))).length >= 2);
+};
+const [action, group, label, amount] = arguments;
+const gs = groups();
+if (action === 'describe') {
+  if (!gs.length) return null;
+  const all = gs.flat();
+  const gen = Array.from(document.querySelectorAll('button, [role=button], input[type=button], input[type=submit], a'))
+    .find(b => vis(b) && !all.includes(b) && !inMenu(b) && GEN.test(labelOf(b)));
+  return {groups: gs.slice(0, 2).map(g => g.map(labelOf)), button: gen ? labelOf(gen).slice(0, 40) : null};
+}
+if (action === 'pick') {
+  const b = (gs[group] || []).find(x => labelOf(x) === label);
+  if (!b) return false;
+  b.click();
+  return true;
+}
+// action 'generate': fill the amount box next to the chips, then press the button (after returning).
+const all = gs.flat();
+const a = Array.from(document.querySelectorAll('input')).find(e => vis(e) && ['number', 'text', 'tel'].includes(e.type)
+    && /amount|sum|usd|value|dep/i.test([e.name, e.id, e.placeholder, e.getAttribute('aria-label')].join(' ')))
+  || Array.from(document.querySelectorAll('input[type=number]')).find(vis);
+let set = null;
+if (a && !(parseFloat(a.value) > 0)) {
+  const min = parseFloat(a.min || a.getAttribute('data-min') || '0');
+  setValue(a, String(min > amount ? min : amount));
+  ['input', 'change', 'keyup', 'blur'].forEach(t => a.dispatchEvent(new Event(t, {bubbles: true})));
+  set = a.value;
+}
+const gen = Array.from(document.querySelectorAll('button, [role=button], input[type=button], input[type=submit], a'))
+  .find(b => vis(b) && !all.includes(b) && !inMenu(b) && GEN.test(labelOf(b)));
+if (gen) setTimeout(() => gen.click(), 0);
+return {amount: set, button: gen ? labelOf(gen).slice(0, 40) : null};
+"""
+
 # Deposit pages already run through the deposit step for the current site. aziminer.com's
 # /deposits/create was run twice: once as a link from /deposits, once as a dashboard link.
 deposit_pages_opened = set()
@@ -3269,6 +3673,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
         """Wallet-like strings the page shows once a payment option is chosen, before the submit
         (see CHOICE_WAIT); the page is saved as deposit_page_<href>_<counter>_chosen when there are any."""
         time.sleep(CHOICE_WAIT)
+        wait_for_address(driver, f" after choosing {what}")
         found_now = wallet_like(driver.page_source + " " + (driver.execute_script(INPUT_VALUES_JS) or ""))
         if found_now:
             capture(f"{counter}_chosen")
@@ -3328,6 +3733,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                 time.sleep(1)
                 accept_alert("after submitting")
                 wait_for_page()
+                wait_for_address(driver, f" on pass {counter}")
                 capture(counter)
                 passes += 1
                 found_wallets = wallet_like(driver.page_source + " " + (driver.execute_script(INPUT_VALUES_JS) or ""))
@@ -3367,6 +3773,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                     logging.info(f"Deposit pick {counter} on {href}: {(picked or {}).get('error', 'the dropdown is gone')}, stopping")
                     break
                 time.sleep(2)  # the page fetches or reveals the address
+                wait_for_address(driver, f" on pick {counter}")
                 capture(counter)
                 found_wallets = wallet_like(driver.page_source + " " + (driver.execute_script(INPUT_VALUES_JS) or ""))
                 wallets.update(found_wallets)
@@ -3378,6 +3785,67 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
         logging.info(f"Deposit page {href}: {len(labels)} coin picks, {len(wallets)} distinct wallet-like strings")
         return True
 
+    def reload_for_pass(counter, what):
+        """The deposit page loaded fresh for the next pass; False when the session is lost."""
+        driver.get(href)
+        wait_for_page()
+        if looks_logged_out(driver):
+            if not relogin_here(driver):
+                logging.info(f"Deposit page {href}: the session is lost, stopping the {what}")
+                return False
+            driver.get(href)
+            wait_for_page()
+        return True
+
+    def chip_group_passes():
+        """One pass per coin (and network) button of a chip group; see CHIP_GROUPS_JS. False when the page has none."""
+        found = driver.execute_script(CHIP_GROUPS_JS, 'describe', 0, '', CUSTOM_DROPDOWN_AMOUNT)
+        if not found:
+            return False
+        coins = found['groups'][0]
+        # The networks offered can depend on the coin (USDT on five networks, BTC on one), so each
+        # coin is clicked and its network buttons read. Passes go network by network, so every coin
+        # gets its first network before any coin gets a second, within MAX_DEPOSIT_PASSES.
+        networks = {}
+        for coin in coins:
+            driver.execute_script(CHIP_GROUPS_JS, 'pick', 0, coin, 0)
+            time.sleep(0.7)
+            now = driver.execute_script(CHIP_GROUPS_JS, 'describe', 0, '', 0) or {'groups': []}
+            networks[coin] = now['groups'][1] if len(now['groups']) > 1 else [None]
+        combos = [(c, networks[c][j]) for j in range(max(len(v) for v in networks.values())) for c in coins if j < len(networks[c])]
+        logging.info(f"Deposit page {href}: no deposit form, but coin buttons {coins}" +
+                     (f" and network buttons {networks}" if any(v != [None] for v in networks.values()) else "") +
+                     f"; button {found['button']!r}; {min(len(combos), MAX_DEPOSIT_PASSES)} of {len(combos)} combinations planned")
+        wallets = set()
+        for counter, (coin, network) in enumerate(combos[:MAX_DEPOSIT_PASSES], start=1):
+            what = f"{coin} / {network}" if network else coin
+            try:
+                if counter > 1 and not reload_for_pass(counter, "chip passes"):
+                    break
+                if not driver.execute_script(CHIP_GROUPS_JS, 'pick', 0, coin, 0):
+                    logging.info(f"Deposit pass {counter} on {href}: coin button {coin!r} is not on the reloaded page, skipped")
+                    continue
+                time.sleep(0.7)
+                if network and not driver.execute_script(CHIP_GROUPS_JS, 'pick', 1, network, 0):
+                    logging.info(f"Deposit pass {counter} on {href}: network button {network!r} is not there after {coin!r}, skipped")
+                    continue
+                wallets.update(wallets_before_submit(counter, what))
+                pressed = driver.execute_script(CHIP_GROUPS_JS, 'generate', 0, '', CUSTOM_DROPDOWN_AMOUNT)
+                time.sleep(1)
+                accept_alert("after pressing the button")
+                wait_for_page()
+                wait_for_address(driver, f" on pass {counter}")
+                capture(counter)
+                found_wallets = wallet_like(driver.page_source + " " + (driver.execute_script(INPUT_VALUES_JS) or ""))
+                wallets.update(found_wallets)
+                site_evidence.add_wallets(found_wallets, href)
+                logging.info(f"Deposit pass {counter} on {href}: {what}; amount {pressed.get('amount')!r}, pressed {pressed.get('button')!r}; "
+                             f"url {driver.current_url}, wallet-like strings {found_wallets or 'none'}")
+            except UnexpectedAlertPresentException:
+                accept_alert(f"during pass {counter}")
+        logging.info(f"Deposit page {href}: {min(len(combos), MAX_DEPOSIT_PASSES)} chip passes, {len(wallets)} distinct wallet-like strings")
+        return True
+
     driver.execute_script("window.open(arguments[0]);", href)
     driver.switch_to.window(driver.window_handles[-1])
     prepare_tab(driver)
@@ -3386,6 +3854,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
         dismiss_blocking_popups(driver)
         # The page as the site serves it, before anything is filled in. Some sites show their
         # wallet addresses here already, and it shows what the form offered if the passes fail.
+        wait_for_address(driver, f" on {href}")
         capture(0)
         shown = wallet_like(driver.page_source)
         if shown:
@@ -3400,7 +3869,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
         if form:
             site_evidence.add_deposit(href, plan, payment)
         if not form:
-            if custom_dropdown_passes() or coin_select_passes():
+            if custom_dropdown_passes() or coin_select_passes() or chip_group_passes():
                 return
             logging.info(f"Deposit page {href}: no deposit form ({found.get('forms', 0)} form(s) on the page, "
                          f"none with an amount field or a choice control and a submit button); 0 passes planned")
@@ -3491,6 +3960,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                 time.sleep(1)
                 accept_alert("after submitting")
                 wait_for_page()
+                wait_for_address(driver, f" on pass {counter}")
                 capture(counter)
                 passes += 1
                 found_wallets = wallet_like(driver.page_source)
@@ -3519,13 +3989,19 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
         driver.close()
         driver.switch_to.window(original_window)
 
-# Sign-up form with timeout
-def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=300):
+# Sign-up form with timeout. 8 minutes since Nov 7 (was 5). On the Nov 6 blind run 13 of 146 sites hit
+# the 5-minute limit: 2 in the middle of their deposit passes (accurate-trader.net with 3 wallets found,
+# primefx.royalinvestment.net logged in), 3 with a sign-up form found, 8 still walking pages in search
+# of a sign-up page (34 to 592 pages each; the longer limit does not help those).
+SITE_TIME_LIMIT_SECONDS = 480
+
+def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=SITE_TIME_LIMIT_SECONDS):
     global should_continue, form_filled, logged_in, email_used, password_used, relogins_done, session_lost, site_evidence, username_used
-    global key_page_links
+    global key_page_links, forced_signup_email, issued_login_id
     should_continue = True
     form_filled = False
     key_page_links = []
+    forced_signup_email = issued_login_id = None
     logged_in = False
     email_used = None  # else a previous site's address leaked into this site's result
     username_used = None
@@ -3625,7 +4101,11 @@ def find_login_url_with_single_password_field(driver, start_url, signup_url=None
             for href, link_text in links:
                 if not href or href.startswith(('javascript:', 'mailto:', 'tel:')):
                     continue
-                absolute_link = urljoin(current_url, href)
+                try:  # a malformed href skips only that link (see the sign-up search)
+                    absolute_link = urljoin(current_url, href)
+                    urlparse(absolute_link).netloc
+                except ValueError:
+                    continue
                 if (not same_site(absolute_link, base_domain) or absolute_link in visited_urls or LANGUAGE_LINK_RE.search(absolute_link)
                         or SESSION_END_RE.search(absolute_link)
                         or absolute_link in urls_to_check or is_blacklisted(absolute_link)):
@@ -3710,6 +4190,28 @@ def _mailinator_code(inbox, msg_id, params):
             return match.group(1)
     return None
 
+# Login IDs the site makes up and e-mails (Nov 7): capitalmarketfx.com's welcome mail reads "Your Login
+# Details: User ID CM345996 Password ... Transaction Password 1609 Sponsor AM905633"; the crawler typed
+# the e-mail address at the login and failed. The ID is kept and used at the login (login_and_take_screenshot).
+issued_login_id = None
+# The ID must contain a digit, so prose such as "enter your username below" is not taken for one.
+LOGIN_ID_RE = re.compile(r"\b(?:user ?id|login ?id|member ?id|client ?id|account (?:id|no\.?|number)|user ?name|username)\b\s*[:#\-]?\s*((?=[A-Za-z0-9_.\-]*\d)[A-Za-z0-9][A-Za-z0-9_.\-]{2,39})", re.I)
+
+def remember_issued_login_id(inbox, msg_id, params, email_address):
+    global issued_login_id
+    try:
+        resp = curl_requests.get(f"{MAILINATOR_API}/inboxes/{inbox}/messages/{msg_id}", params=params, timeout=15)
+        resp.raise_for_status()
+        for part in resp.json().get('parts', []):
+            text = html.unescape(re.sub(r"<(style|script)\b.*?</\1>|<[^>]+>", " ", part.get('body', ''), flags=re.S | re.I))
+            m = LOGIN_ID_RE.search(re.sub(r"\s+", " ", text))
+            if m and m.group(1).lower() not in (email_address.lower(), inbox.lower(), 'password', 'and', 'is', 'your'):
+                issued_login_id = m.group(1)
+                logging.info(f"Mailinator: the welcome e-mail gives the login ID {issued_login_id}")
+                return
+    except Exception as e:
+        logging.info(f"Mailinator: could not read the message for a login ID: {str(e).splitlines()[0] if str(e) else e!r}")
+
 # Returns (whether a link was clicked, the verification code found or None). With want_code
 # (the page after sign-up asks for a code) it keeps polling until a code turns up, not just
 # until the first link is clicked: swantradecapital.com sends a welcome e-mail with a link
@@ -3750,6 +4252,7 @@ def check_mailinator_inbox_and_click_links(api_key, driver, email_address, signu
                     continue
                 seen.add(msg['id'])
                 logging.info(f"Mailinator: '{msg.get('subject', '')}' arrived for {email_address}")
+                remember_issued_login_id(inbox, msg['id'], params, email_address)
                 if want_code and not code:
                     code = _mailinator_code(inbox, msg['id'], params)
                     if code:
@@ -3821,6 +4324,83 @@ def enter_email_code(driver, code, code_page_url):
                  f"{after['passwords']} visible password field(s)" + ("; Logout link" if after['logout'] else "")
                  + (f"; messages: {' | '.join(new_errors(before, after))[:200]}" if new_errors(before, after) else ""))
     return after, code_url
+
+# --- E-mail code first (Nov 7) ---------------------------------------------------------------------
+# my.mondfx.com/sign-up opens with only an e-mail box and "Send code" ("We'll send a 6-digit code to
+# confirm it's yours"); the password form comes after the code. The crawler waited for a password field
+# that never came. Here: type a new address, press the button, read the code from Mailinator (no e-mail
+# links are clicked, so the browser stays on the code page), type it, and wait for the password form;
+# the sign-up form is then filled with that same address (forced_signup_email).
+EMAIL_FIRST_JS = r"""
+const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+if (Array.from(document.querySelectorAll('input[type=password]')).some(vis)) return null;
+if (!/\bcode\b|verif/i.test(document.body.innerText || '')) return null;
+const hint = e => [e.type, e.name, e.id, e.placeholder, e.getAttribute('autocomplete'), e.getAttribute('aria-label')].join(' ').toLowerCase();
+const email = Array.from(document.querySelectorAll('input')).find(e => vis(e) && (e.type === 'email' || /e-?mail/.test(hint(e))));
+if (!email) return null;
+const box = email.form || email.closest('div, section') || document.body;
+const label = b => (b.innerText || b.value || '').trim();
+const button = Array.from(box.querySelectorAll('button, input[type=submit]')).filter(vis)
+  .find(b => /send( me)?( the)?( verification)? code|get( a| the)? code|verify( my)? e-?mail|^continue$|^next$|^sign ?up$/i.test(label(b)));
+return button ? [email, button, label(button)] : null;
+"""
+forced_signup_email = None
+
+def wait_for_mailinator_code(email_address, since, seconds=MAILINATOR_WAIT_SECONDS):
+    """Poll the address's Mailinator inbox for a verification code, without opening any links."""
+    inbox, params = email_address.split('@')[0], {"token": MAILINATOR_API_KEY}
+    deadline, seen = time.time() + seconds, set()
+    while time.time() < deadline and should_continue:
+        try:
+            resp = curl_requests.get(f"{MAILINATOR_API}/inboxes/{inbox}", params={**params, "limit": 10, "sort": "descending"}, timeout=15)
+            resp.raise_for_status()
+            for msg in resp.json().get('msgs', []):
+                if msg['id'] in seen or msg.get('time', 0) < (since - 30) * 1000:
+                    continue
+                seen.add(msg['id'])
+                code = _mailinator_code(inbox, msg['id'], params)
+                logging.info(f"Mailinator: '{msg.get('subject', '')}' arrived for {email_address}" + (f"; code {code}" if code else ""))
+                if code:
+                    return code
+        except Exception as e:
+            logging.error(f"Error checking Mailinator inbox {inbox}: {e}")
+        time.sleep(5)
+    return None
+
+def email_code_first_signup(driver):
+    """True when an e-mail-then-code first step was passed and a password form is now on the page."""
+    global forced_signup_email
+    try:
+        found = driver.execute_script(EMAIL_FIRST_JS)
+    except Exception:
+        return False
+    if not found or not MAILINATOR_API_KEY:
+        return False
+    email_box, button, label = found
+    email = f"{generate_random_string().lower()}{random.randint(60, 99)}@{EMAIL_DOMAIN}"
+    try:
+        email_box.clear()
+        email_box.send_keys(email)
+        since = time.time()
+        driver.execute_script("arguments[0].click();", button)
+    except Exception as e:
+        logging.info(f"E-mail-first sign-up: could not send the code: {str(e).splitlines()[0] if str(e) else e!r}")
+        return False
+    logging.info(f"E-mail-first sign-up on {driver.current_url}: typed {email}, pressed {label!r}; waiting for the code")
+    code = wait_for_mailinator_code(email, since)
+    if not code:
+        logging.info("E-mail-first sign-up: no code arrived")
+        return False
+    after, _ = enter_email_code(driver, code, driver.current_url)
+    if after is None:
+        return False
+    waited = wait_for_password_fields(driver, SIGNUP_FORM_SECONDS, want=1)
+    if waited is None:
+        logging.info(f"E-mail-first sign-up: code accepted, but no password form on {driver.current_url}")
+        return False
+    forced_signup_email = email
+    logging.info(f"E-mail-first sign-up: password form shown on {driver.current_url}; the sign-up uses {email}")
+    return True
 
 # Main function
 def main():
