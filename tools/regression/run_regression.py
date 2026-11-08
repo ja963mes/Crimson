@@ -43,7 +43,7 @@ CRAWLER = os.path.join(HERE, '..', 'authentication_crawling', 'crawler_script.py
 RUNS = os.path.join(HERE, '..', 'runs')
 RESULTS = os.path.join(HERE, 'results')
 SITES = os.path.join(HERE, 'sites.csv')
-SITE_TIMEOUT = 15 * 60  # hard cap per site on top of the crawler's own limit
+SITE_TIMEOUT = 10 * 60  # hard cap per site on top of the crawler's own limit (15 min until Nov 8; James: 10)
 
 LEVELS = ['ERROR', 'CLASSIFIED_B', 'NO_SIGNUP', 'BLOCKED', 'SIGNUP_FOUND', 'SIGNED_UP', 'LOGGED_IN', 'WALLET']
 WALLET_LIST_RE = re.compile(r"wallet-like strings (?:on the page as served: )?(\[[^\]]*\])")

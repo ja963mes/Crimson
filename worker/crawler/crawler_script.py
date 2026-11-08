@@ -3993,7 +3993,8 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
 # the 5-minute limit: 2 in the middle of their deposit passes (accurate-trader.net with 3 wallets found,
 # primefx.royalinvestment.net logged in), 3 with a sign-up form found, 8 still walking pages in search
 # of a sign-up page (34 to 592 pages each; the longer limit does not help those).
-SITE_TIME_LIMIT_SECONDS = 480
+# Nov 8: back to 5 minutes (James).
+SITE_TIME_LIMIT_SECONDS = 300
 
 def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=SITE_TIME_LIMIT_SECONDS):
     global should_continue, form_filled, logged_in, email_used, password_used, relogins_done, session_lost, site_evidence, username_used
@@ -4163,16 +4164,37 @@ def same_site(url, site_domain):
     d = get_base_domain(url)
     return d == site_domain or d.endswith('.' + site_domain) or site_domain.endswith('.' + d)
 
-def _mailinator_links(inbox, msg_id, params, site_domain=None):
-    base = f"{MAILINATOR_API}/inboxes/{inbox}/messages/{msg_id}"
-    resp = curl_requests.get(f"{base}/links", params=params, timeout=15)
-    resp.raise_for_status()
-    links = resp.json().get('links', [])
-    if not links:  # fall back to the hrefs in the message body
-        resp = curl_requests.get(base, params=params, timeout=15)
+# One API read per message (Nov 8). Mailinator counts every message read against the plan's 60 reads
+# a day (and counts each API read under both "Web" and "API"). On Nov 8 the login-ID read (Nov 7),
+# the /links read and the code read each fetched the same message: 15 reads for 7 e-mails, against
+# about 1 per e-mail before Nov 7. The message is now fetched once per crawl and the login ID, the
+# code and the links are all taken from that copy; the /links endpoint is no longer used.
+_mailinator_messages = {}
+URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"'<>]+")
+HREF_RE = re.compile(r"""href\s*=\s*["'](https?://[^"']+)["']""", re.I)
+
+def _mailinator_message(inbox, msg_id, params):
+    """The whole message as the API returns it ({"parts": [{"body": ...}], ...}), read once."""
+    if msg_id not in _mailinator_messages:
+        resp = curl_requests.get(f"{MAILINATOR_API}/inboxes/{inbox}/messages/{msg_id}", params=params, timeout=15)
         resp.raise_for_status()
-        for part in resp.json().get('parts', []):
-            links += [html.unescape(l) for l in re.findall(r'https?://[^\s"\'<>]+', part.get('body', ''))]
+        _mailinator_messages[msg_id] = resp.json()
+        logging.info(f"Mailinator: message read ({len(_mailinator_messages)} this site)")
+    return _mailinator_messages[msg_id]
+
+def _message_links(msg):
+    """Links in a message: anchor hrefs first, then bare URLs in the text (tags, <style> and <script>
+    removed, so image and stylesheet addresses are not taken), in the order they appear."""
+    links = []
+    for part in msg.get('parts', []):
+        body = part.get('body', '') or ''
+        links += [html.unescape(h) for h in HREF_RE.findall(body)]
+        text = re.sub(r"<(style|script)\b.*?</\1>|<[^>]+>", " ", body, flags=re.S | re.I)
+        links += [html.unescape(u).rstrip('.,;:!?)]}') for u in URL_IN_TEXT_RE.findall(text)]
+    return links
+
+def _mailinator_links(inbox, msg_id, params, site_domain=None):
+    links = _message_links(_mailinator_message(inbox, msg_id, params))
     # Confirmation-looking links first, unsubscribe links never, each link once.
     links = [l for l in dict.fromkeys(links) if 'unsubscribe' not in l.lower() and not ASSET_LINK_RE.search(urlparse(l).path)]
     if site_domain:
@@ -4181,9 +4203,7 @@ def _mailinator_links(inbox, msg_id, params, site_domain=None):
 
 def _mailinator_code(inbox, msg_id, params):
     """The verification code in a message's text, or None."""
-    resp = curl_requests.get(f"{MAILINATOR_API}/inboxes/{inbox}/messages/{msg_id}", params=params, timeout=15)
-    resp.raise_for_status()
-    for part in resp.json().get('parts', []):
+    for part in _mailinator_message(inbox, msg_id, params).get('parts', []):
         text = html.unescape(re.sub(r"<(style|script)\b.*?</\1>|<[^>]+>", " ", part.get('body', ''), flags=re.S | re.I))
         match = EMAIL_CODE_RE.search(re.sub(r"\s+", " ", text))
         if match:
@@ -4200,9 +4220,7 @@ LOGIN_ID_RE = re.compile(r"\b(?:user ?id|login ?id|member ?id|client ?id|account
 def remember_issued_login_id(inbox, msg_id, params, email_address):
     global issued_login_id
     try:
-        resp = curl_requests.get(f"{MAILINATOR_API}/inboxes/{inbox}/messages/{msg_id}", params=params, timeout=15)
-        resp.raise_for_status()
-        for part in resp.json().get('parts', []):
+        for part in _mailinator_message(inbox, msg_id, params).get('parts', []):
             text = html.unescape(re.sub(r"<(style|script)\b.*?</\1>|<[^>]+>", " ", part.get('body', ''), flags=re.S | re.I))
             m = LOGIN_ID_RE.search(re.sub(r"\s+", " ", text))
             if m and m.group(1).lower() not in (email_address.lower(), inbox.lower(), 'password', 'and', 'is', 'your'):
