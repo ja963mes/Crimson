@@ -15,8 +15,13 @@ given, and writes wallets.csv next to this script:
     address          the wallet address
     ioc_type         iocsearcher's type: a format, not an asset. "tron" is TRX or
                      USDT-TRC20; "ethereum" is ETH, or USDT/USDC on any EVM chain.
-    suggested_type   the ScamBusters form option the label points to, or blank if
-                     it doesn't say. A guess from the label; check before submitting.
+    suggested_type   the ScamBusters form option for this address, or blank if nothing
+                     named it. Taken from crawl_method when the crawler recorded one,
+                     otherwise guessed from the label.
+    crawl_method     the payment option the crawler had selected when the address
+                     appeared ("USDT / TRC20", "Bitcoin", ...), straight from the page.
+                     This is what settles ethereum and tron, whose address formats
+                     name no asset; blank for pages served without a coin choice.
     label            the page text just before the address, e.g. "USDT_TRC20 Wallet
                      Address:", which is what settles the asset and network
     pages_seen       how many saved pages show the address
@@ -32,6 +37,8 @@ whole file each time, so it is safe to run by hand too.
 """
 import csv
 import datetime
+import glob
+import json
 import os
 import re
 import socket
@@ -85,6 +92,38 @@ def suggest_type(ioc_type, label):
         if pattern is None or re.search(pattern, text):
             return option
     return ""
+
+
+def crawl_methods(pattern=None):
+    """{domain: {address: method}} from the crawler's hyip_evidence_*.json files.
+
+    The crawler records the payment option it had selected when each address appeared
+    (SiteEvidence.add_wallets). That is the page's own statement of what to send, and it is
+    strictly better than label_before(): on "ethereum" and "tron" the address format cannot
+    name the asset at all, and on a logged-in dashboard the text around the address is usually
+    the sidebar nav rather than a coin label.
+
+    Missing or unreadable files are not an error -- the caller just falls back to the label.
+    """
+    out = {}
+    for path in glob.glob(pattern or os.path.join(HERE, "hyip_evidence*.json")):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                ev = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"[wallets] WARN: could not read {path}: {e}", file=sys.stderr)
+            continue
+        dom = (ev.get("domain") or "").strip().lower()
+        methods = ev.get("wallet_methods") or {}
+        if not dom or not isinstance(methods, dict):
+            continue
+        # Several evidence files can name the same domain (a re-crawl); keep the first
+        # non-empty method recorded for each address.
+        bucket = out.setdefault(dom, {})
+        for addr, method in methods.items():
+            if method and not bucket.get(addr):
+                bucket[addr] = method
+    return out
 
 
 def parse_iocs_results(path):
@@ -215,14 +254,25 @@ def main():
                          "is_deposit": is_deposit}
 
     vm = socket.gethostname()
+    methods = crawl_methods()
     out_rows = []
+    from_method = 0
     for key, r in rows.items():
         first = min(os.path.getmtime(p) for p in pages[key])
+        # What the crawler had selected on screen when this address appeared, if it recorded it.
+        method = methods.get((r["domain"] or "").strip().lower(), {}).get(r["address"], "")
+        # The crawl-time method wins; the scraped label is the fallback. For a single-asset chain
+        # both agree anyway, because FORM_RULES resolves those from the format alone.
+        by_method = suggest_type(r["ioc_type"], method) if method else ""
+        suggested = by_method or suggest_type(r["ioc_type"], r["label"])
+        if by_method:
+            from_method += 1
         out_rows.append({
             "domain": r["domain"],
             "address": r["address"],
             "ioc_type": r["ioc_type"],
-            "suggested_type": suggest_type(r["ioc_type"], r["label"]),
+            "suggested_type": suggested,
+            "crawl_method": method,
             "label": r["label"],
             "pages_seen": len(pages[key]),
             "page": os.path.relpath(r["page"], HERE),
@@ -236,12 +286,16 @@ def main():
     tmp = OUT + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(out_rows[0].keys()) if out_rows else
-                           ["domain", "address", "ioc_type", "suggested_type", "label", "pages_seen",
-                            "page", "screenshot", "domain_source", "first_seen_utc", "vm"])
+                           ["domain", "address", "ioc_type", "suggested_type", "crawl_method",
+                            "label", "pages_seen", "page", "screenshot", "domain_source",
+                            "first_seen_utc", "vm"])
         w.writeheader()
         w.writerows(out_rows)
     os.replace(tmp, OUT)
+    blank = sum(1 for r in out_rows if not r["suggested_type"])
     print(f"[wallets] {len(out_rows)} wallet(s) from {len({r['domain'] for r in out_rows})} site(s) -> {OUT}")
+    print(f"[wallets] coin/network: {from_method} named by the crawl-time payment method, "
+          f"{len(out_rows) - blank - from_method} from the page label, {blank} still unknown")
 
 
 if __name__ == "__main__":

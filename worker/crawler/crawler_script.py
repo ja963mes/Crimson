@@ -61,6 +61,64 @@ MAILINATOR_API_KEY =  "<MAILINATOR_API_KEY>"
 # "private" addresses the account's private domain (EMAIL_DOMAIN) in the v2 API.
 MAILINATOR_API = 'https://api.mailinator.com/api/v2/domains/private'
 MAILINATOR_WAIT_SECONDS = 60   # how long to poll the sign-up inbox for a confirmation email
+# --- Mailinator plan limits (checked against the dashboard and /api/v2/team on Nov 13) --------
+# The VerifiedPro plan allows, per day:
+#     Messages Reads Per Day    60   -> the dashboard's "Messages Consumed" total
+#     Message Sends Per Day    120   -> "Messages Incoming": mail the sites send us
+#     API Calls Per Day        120   -> the dashboard's Inbox/Message/Delete/Totp/Errors columns
+#
+# An earlier note here claimed the API-call columns were uncapped because 429 inbox listings went
+# through on Nov 11 with nothing refused. That inference was wrong and has been removed: requests
+# not being refused is not the same as being allowed, and running past the published figure risks
+# the account rather than an error. All three columns are treated as hard caps.
+#
+# Opening one message costs TWO of the 60: it increments both "Web" and "API" (Nov 10, one
+# message call -> Web 1, API 1, Total 2; Nov 11, 14 calls -> 28). The plan's 60 is really 30
+# message reads a day, which is what MAILINATOR_READ_COST accounts for.
+MAILINATOR_TEAM_API = 'https://api.mailinator.com/api/v2'
+MAILINATOR_READ_COST = 2
+# --- One account, three VMs: every cap below is a PER-VM share of an ACCOUNT-WIDE allowance ---
+# The plan's allowances belong to the whole Mailinator account, but the three Crimson VMs all draw
+# on it. Each VM is given a fixed share, counted locally in MAILINATOR_USAGE_FILE, and the
+# account's own figure is kept as a ceiling on top of that share (see mailinator_reads_left()).
+# The crimson-crawler.service unit sets, on each VM:
+#     MAILINATOR_API_CALLS_PER_DAY=40   -> 3 x 40 = the account's 120
+#     MAILINATOR_READS_PER_DAY=20       -> 3 x 20 = the account's 60 read units, 10 reads each
+# The defaults here are the whole-account figures, for a single machine running on its own.
+MAILINATOR_READS_PER_DAY = int(os.environ.get("MAILINATOR_READS_PER_DAY") or 60)
+# Whether the read cap above was set deliberately. mailinator_load_plan() reads the account's own
+# email_reads_per_day at start-up, which is the ACCOUNT total (60) -- applying it to a VM that was
+# given a 20-unit share would hand that VM the entire account's allowance, so an explicit setting
+# wins and the plan figure only fills in the account ceiling.
+MAILINATOR_READS_PER_DAY_EXPLICIT = bool(os.environ.get("MAILINATOR_READS_PER_DAY"))
+MAILINATOR_ACCOUNT_READS_PER_DAY = int(os.environ.get("MAILINATOR_ACCOUNT_READS_PER_DAY") or 60)
+MAILINATOR_SENDS_PER_DAY = int(os.environ.get("MAILINATOR_SENDS_PER_DAY") or 120)
+# Head-room left unspent, so a site already under way when the check passed cannot take the
+# account over the cap. 6 read units = 3 message reads, about one site's worth.
+MAILINATOR_READS_RESERVE = int(os.environ.get("MAILINATOR_READS_RESERVE") or 6)
+MAILINATOR_SENDS_RESERVE = int(os.environ.get("MAILINATOR_SENDS_RESERVE") or 5)
+# The dashboard's "API Calls" columns (Inbox, Message, Delete, Totp, Errors), capped at 120 a day.
+# Unlike the reads, this one CANNOT be read back from the account: /api/v2/team/stats reports only
+# retrieved{} and sent{}, with no API-call figures at all. So it is counted locally, in a file
+# keyed by the UTC day, because run_batch.py starts a fresh process for every site and an
+# in-memory counter would reset 60 times a pass.
+MAILINATOR_API_CALLS_PER_DAY = int(os.environ.get("MAILINATOR_API_CALLS_PER_DAY") or 120)
+MAILINATOR_API_CALLS_RESERVE = int(os.environ.get("MAILINATOR_API_CALLS_RESERVE") or 5)
+MAILINATOR_USAGE_FILE = os.environ.get("MAILINATOR_USAGE_FILE") or os.path.join(HERE, 'mailinator_usage.json')
+# How often the sign-up inbox is asked for new mail. The old 5 s cost up to 12 Inbox calls for
+# every site that opened an inbox, which is what ran the count to 51 on Nov 13; at 15 s it is 4.
+# Long-polling would have been better still, but the inbox endpoint answers 400 to wait= in every
+# documented form (plain seconds, milliseconds and "20s", checked Nov 13), so the OpenAPI spec's
+# WaitParam is not available on this plan and the interval is the only lever.
+MAILINATOR_POLL_INTERVAL = int(os.environ.get("MAILINATOR_POLL_INTERVAL") or 15)
+# Hard cap on how many sites one pass crawls, so a single pass cannot run for days
+# or drain the Mailinator plan (a pass averages ~8.6 API calls per site that reaches
+# the e-mail step). Counted over sites actually attempted this pass, not the lines
+# skipped while seeking the crawled_urls.txt checkpoint, so each pass crawls a fresh
+# batch and the next one resumes where this one stopped. 0 means no cap.
+# Each Crimson VM feeds itself from its own worker's results (crimson-crawler.service),
+# so the three sets are disjoint; CRAWL_SITE_LIMIT=33 there keeps one round under 100.
+CRAWL_SITE_LIMIT = int(os.environ.get("CRAWL_SITE_LIMIT") or 100)
 # The password every sign-up form gets, and therefore the one login must use.
 # Login used to send the literal string "PASSWORD", so no login could succeed.
 # 'Pass@1234' was refused as too weak by sign-up checks against breached-password
@@ -1751,47 +1809,107 @@ def fill_sign_up_form(driver, start_url):
                                 logging.info(f"Sign-up succeeded with {email_used or username_used}")
                             else:
                                 logging.info(f"Sign-up submitted with {email_used or username_used}, but the page gave no sign of success; trying to log in anyway")
+                            # Login before e-mail (Nov 13, James). Sites very often say the address must be
+                            # verified and then either never send the mail or never enforce it, so the 60 s
+                            # inbox poll and its message reads were spent for nothing. A login attempt costs
+                            # no Mailinator quota at all, so it is tried first: if it works the inbox is
+                            # never opened, and if it is refused nothing is lost but the attempt.
+                            #
+                            # signup_at is taken here, not at the e-mail step: the login attempt in between
+                            # takes tens of seconds, and check_mailinator_inbox_and_click_links() skips
+                            # messages older than signup_time, so passing time.time() at that point would
+                            # filter out the very confirmation mail it is looking for.
+                            signup_at = time.time()
+                            # Read on the page the sign-up landed on, before any login navigates away from it.
                             want_code = bool(driver.execute_script(CODE_INPUTS_JS))
+                            email_checked, email_code, mail_read = False, None, False
+
+                            # The one case that cannot wait for a login: the page is sitting on a code field,
+                            # so the account is held behind the code and there is nothing to log in to yet.
                             if want_code:
                                 logging.info(f"The page after sign-up ({driver.current_url}) asks for a code; waiting for it by e-mail")
-                            email_checked, email_code = check_mailinator_inbox_and_click_links(
-                                MAILINATOR_API_KEY, driver, email_used, signup_time=time.time(),
-                                site_url=form_url, want_code=want_code)
-                            if email_checked:
-                                logging.info("Successfully interacted with new email.")
-                            elif MAILINATOR_API_KEY and MAILINATOR_API_KEY != "YOUR_API_KEY" and not email_code:
-                                logging.info(f"No confirmation email clicked within {MAILINATOR_WAIT_SECONDS} seconds.")
-                            if email_code:
-                                code_state, code_url = enter_email_code(driver, email_code, after_submit["url"])
-                                if code_state:
-                                    email_checked = True
-                                    if code_state["logout"] or (code_state["url"] != code_url and not code_state["passwords"]):
-                                        # The code page let go of the session: the account is in, no login needed.
-                                        logging.info(f"E-mail code accepted; logged in at {code_state['url']}")
-                                        crawl_logged_in(driver, code_state["url"], get_base_domain(code_state["url"]),
-                                                        driver.current_window_handle)
-                                        break
-                                    after_submit = code_state  # the login search starts where the code step ended
-                            if not email_checked and (VERIFY_EMAIL_RE.search(after_submit["text"]) or VERIFY_EMAIL_RE.search(after_submit["url"])):
-                                # The login used to be skipped here, since cryptocoinprop.com (/verify-email/)
-                                # and swifttradinginc.live refuse it until the address is confirmed. But
-                                # itrademagnet.com asked for verification, sent no e-mail at all and let the
-                                # account log in without it (Oct 29), so the login is tried; a refusal shows
-                                # up as "Login result: failed".
-                                logging.info("The page asks for e-mail verification and no confirmation link was clicked; trying to log in anyway")
+                                email_checked, email_code = check_mailinator_inbox_and_click_links(
+                                    MAILINATOR_API_KEY, driver, email_used, signup_time=signup_at,
+                                    site_url=form_url, want_code=True)
+                                mail_read = True
+                                if email_checked:
+                                    logging.info("Successfully interacted with new email.")
+                                elif MAILINATOR_API_KEY and MAILINATOR_API_KEY != "YOUR_API_KEY" and not email_code:
+                                    logging.info(f"No confirmation email clicked within {MAILINATOR_WAIT_SECONDS} seconds.")
+                                if email_code:
+                                    code_state, code_url = enter_email_code(driver, email_code, after_submit["url"])
+                                    if code_state:
+                                        email_checked = True
+                                        if code_state["logout"] or (code_state["url"] != code_url and not code_state["passwords"]):
+                                            # The code page let go of the session: the account is in, no login needed.
+                                            logging.info(f"E-mail code accepted; logged in at {code_state['url']}")
+                                            crawl_logged_in(driver, code_state["url"], get_base_domain(code_state["url"]),
+                                                            driver.current_window_handle)
+                                            break
+                                        after_submit = code_state  # the login search starts where the code step ended
+                            elif VERIFY_EMAIL_RE.search(after_submit["text"]) or VERIFY_EMAIL_RE.search(after_submit["url"]):
+                                # Said, not enforced. itrademagnet.com asked for verification, sent no e-mail
+                                # at all and let the account log in (Oct 29). cryptocoinprop.com
+                                # (/verify-email/), swifttradinginc.live and duduinvest.com ("Email not
+                                # confirmed") do refuse it; those show up as "Login result: failed" and the
+                                # inbox is read below, one login attempt later.
+                                logging.info("The page asks for e-mail verification; trying the login first and reading the inbox only if it fails")
 
                             if crawl_if_already_logged_in(driver, "after sign-up"):
                                 break
                             login_url, logged_in_url = find_login_url_with_single_password_field(
                                 driver, current_url, signup_url=form_url, landed_url=after_submit["url"])
                             if login_url:
-                                login_and_take_screenshot(driver, login_url, password_used, email_used)
+                                login_outcome = login_and_take_screenshot(driver, login_url, password_used, email_used)
+                                # The login was refused, so the inbox is now worth its reads: click the
+                                # confirmation links, type an e-mailed code, and try the login once more.
+                                if login_outcome == "failed" and not mail_read:
+                                    logging.info("Login failed; reading the inbox now to confirm the address")
+                                    email_checked, email_code = check_mailinator_inbox_and_click_links(
+                                        MAILINATOR_API_KEY, driver, email_used, signup_time=signup_at,
+                                        site_url=form_url, want_code=False)
+                                    mail_read = True
+                                    if email_checked:
+                                        logging.info("Successfully interacted with new email.")
+                                    elif MAILINATOR_API_KEY and MAILINATOR_API_KEY != "YOUR_API_KEY" and not email_code:
+                                        logging.info(f"No confirmation email clicked within {MAILINATOR_WAIT_SECONDS} seconds.")
+                                    if email_code:
+                                        code_state, code_url = enter_email_code(driver, email_code, after_submit["url"])
+                                        if code_state:
+                                            email_checked = True
+                                            if code_state["logout"] or (code_state["url"] != code_url and not code_state["passwords"]):
+                                                logging.info(f"E-mail code accepted; logged in at {code_state['url']}")
+                                                crawl_logged_in(driver, code_state["url"], get_base_domain(code_state["url"]),
+                                                                driver.current_window_handle)
+                                                break
+                                            after_submit = code_state
+                                    if email_checked or email_code:
+                                        logging.info(f"Trying the login again after the e-mail step: {login_url}")
+                                        login_outcome = login_and_take_screenshot(driver, login_url, password_used, email_used)
+                                # Subject first (Nov 8): e-mails not opened (welcome mails) are opened only
+                                # now, when the login has failed even after the inbox was read; a login ID
+                                # or a link in them gets one more login attempt.
+                                if login_outcome == "failed" and read_deferred_mail(driver, form_url):
+                                    logging.info(f"Trying the login again after reading the e-mails left unread: {login_url}")
+                                    login_and_take_screenshot(driver, login_url, password_used, email_used)
                             elif logged_in_url:
                                 # find_login_url_with_single_password_field() saw a Logout link, or a login
                                 # page that sends the browser on to an account page; the driver is there.
                                 logging.info(f"Already logged in (during the login search): {logged_in_url}")
                                 crawl_logged_in(driver, logged_in_url, get_base_domain(logged_in_url), driver.current_window_handle)
                             else:
+                                # No login page at all. The confirmation link can still open a session of its
+                                # own (sites that log the account in when it is clicked), which the old
+                                # e-mail-first order caught before the login search ran; so the inbox is read
+                                # here rather than not at all.
+                                if not mail_read:
+                                    logging.info("No login URL found; reading the inbox in case a confirmation link opens the account")
+                                    email_checked, email_code = check_mailinator_inbox_and_click_links(
+                                        MAILINATOR_API_KEY, driver, email_used, signup_time=signup_at,
+                                        site_url=form_url, want_code=False)
+                                    mail_read = True
+                                    if email_checked and crawl_if_already_logged_in(driver, "after the confirmation link"):
+                                        break
                                 # break, not return False: the account exists, so the site's result
                                 # line should say "Signed up but not logged in", not "failure".
                                 logging.info("Could not find a login URL to proceed with login.")
@@ -2071,28 +2189,53 @@ def log_hyip_verdict(url):
         logging.error(f"HYIP check failed for {url}: {e}")
 
 # Process URLs from a list
-def fill_sign_up_urls_in_list(urls_file_path, last_processed_file_path):
-    global current_site_url
+def fill_sign_up_urls_in_list(urls_file_path, last_processed_file_path, site_limit=None):
+    """One pass over urls.txt from the resume checkpoint, at most site_limit sites.
+
+    site_limit defaults to CRAWL_SITE_LIMIT; 0 or None means crawl to the end of the
+    file. Stopping on the limit is not an error: save_last_processed_url has already
+    recorded the last finished site, so the next pass starts at the one after it.
+    """
+    global current_site_url, mailinator_site_mode
     if not os.path.exists(urls_file_path):
         logging.info(f"No {urls_file_path} yet (feeder.py has not added any domains); nothing to crawl.")
         return
+    if site_limit is None:
+        site_limit = CRAWL_SITE_LIMIT
     last_processed_url = get_last_processed_url(last_processed_file_path)
     start_processing = last_processed_url is None
+    crawled = 0
+    logging.info(f"Crawl pass starting{'' if start_processing else f' after {last_processed_url}'}; "
+                 f"site limit {site_limit or 'none'}")
 
     with open(urls_file_path, 'r') as file:
         for line in file:
             url = line.strip()
             if start_processing:
+                if site_limit and crawled >= site_limit:
+                    logging.info(f"Site limit reached ({crawled} site(s) this pass); stopping before {url}. "
+                                 f"The next pass resumes here.")
+                    break
+                # The account's own figures, re-read before every site (the stats call is free).
+                mailinator_site_mode, why = mailinator_budget_before_site()
+                if mailinator_site_mode == 'stop':
+                    logging.warning(f"Mailinator budget: {why}; stopping the pass before {url}. "
+                                    "The next pass resumes here.")
+                    mailinator_site_mode = 'ok'
+                    break
+                logging.info(f"Mailinator budget: {why}")
                 try:
                     current_site_url = url
                     email_used = fill_sign_up_form_with_timeout(driver, url)
                     log_site_result(url, email_used)
                     save_last_processed_url(last_processed_file_path, url)
+                    crawled += 1
                 except Exception as e:
                     logging.error(f"An error occurred while processing {url}: {e}")
                     break
             if url == last_processed_url:
                 start_processing = True
+    logging.info(f"Crawl pass finished: {crawled} site(s) crawled")
 
 # Check for single password field on the page the caller has just loaded. A login keyword
 # anywhere in the URL used to be enough on its own, without looking at the page, and the
@@ -2220,7 +2363,7 @@ def login_and_take_screenshot(driver, login_url, predicted_password, email_used)
         logging.info(f"Login result: {outcome} - {evidence}")
         if outcome == "failed":
             save_failed_page(driver, "login_failed")
-            return
+            return "failed"  # the caller may open the e-mails left unread and try once more (Nov 8)
         crawl_logged_in(driver, login_url, base_domain, original_window)
     except NoSuchElementException as e:
         logging.error(f"Element not found during login process: {e}")
@@ -2973,7 +3116,7 @@ def deposit_passes_in_dialog(driver, start_url, label, directory_name, stem):
         before = wallet_like(driver.page_source + " " + (driver.execute_script(INPUT_VALUES_JS) or ""))
         if before:
             save_page(driver, directory_name, f"{stem}_{counter}_chosen")
-            site_evidence.add_wallets(before, start_url)
+            site_evidence.add_wallets(before, start_url, (option or {}).get('label'))
             logging.info(f"Deposit button {label!r} pass {counter}: after choosing {(option or {}).get('label', 'site default')!r}, "
                          f"before submitting: wallet-like strings {before}")
         how = driver.execute_script(DEPOSIT_SUBMIT_JS, form['index'])
@@ -3677,7 +3820,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
         found_now = wallet_like(driver.page_source + " " + (driver.execute_script(INPUT_VALUES_JS) or ""))
         if found_now:
             capture(f"{counter}_chosen")
-            site_evidence.add_wallets(found_now, href)
+            site_evidence.add_wallets(found_now, href, what)
             logging.info(f"Deposit pass {counter} on {href}: after choosing {what!r}, before submitting: wallet-like strings {found_now}")
         return set(found_now)
 
@@ -3738,7 +3881,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                 passes += 1
                 found_wallets = wallet_like(driver.page_source + " " + (driver.execute_script(INPUT_VALUES_JS) or ""))
                 wallets.update(found_wallets)
-                site_evidence.add_wallets(found_wallets, href)
+                site_evidence.add_wallets(found_wallets, href, label)
                 logging.info(f"Deposit pass {counter} on {href}: option {label!r}; set {state}; "
                              f"result title {driver.title[:60]!r}, url {driver.current_url}, wallet-like strings {found_wallets or 'none'}")
             except UnexpectedAlertPresentException:
@@ -3777,7 +3920,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                 capture(counter)
                 found_wallets = wallet_like(driver.page_source + " " + (driver.execute_script(INPUT_VALUES_JS) or ""))
                 wallets.update(found_wallets)
-                site_evidence.add_wallets(found_wallets, href)
+                site_evidence.add_wallets(found_wallets, href, label)
                 logging.info(f"Deposit pick {counter} on {href}: option {label!r} (picked {picked.get('picked')!r}); "
                              f"url {driver.current_url}, wallet-like strings {found_wallets or 'none'}")
             except UnexpectedAlertPresentException:
@@ -3838,7 +3981,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                 capture(counter)
                 found_wallets = wallet_like(driver.page_source + " " + (driver.execute_script(INPUT_VALUES_JS) or ""))
                 wallets.update(found_wallets)
-                site_evidence.add_wallets(found_wallets, href)
+                site_evidence.add_wallets(found_wallets, href, what)
                 logging.info(f"Deposit pass {counter} on {href}: {what}; amount {pressed.get('amount')!r}, pressed {pressed.get('button')!r}; "
                              f"url {driver.current_url}, wallet-like strings {found_wallets or 'none'}")
             except UnexpectedAlertPresentException:
@@ -3965,7 +4108,7 @@ def process_deposit_page(driver, href, directory_name, original_window, depth=0)
                 passes += 1
                 found_wallets = wallet_like(driver.page_source)
                 wallets.update(found_wallets)
-                site_evidence.add_wallets(found_wallets, href)
+                site_evidence.add_wallets(found_wallets, href, option['label'] if option else None)
                 result = driver.execute_script(DEPOSIT_RESULT_JS, form['amount'], form['index'])
                 logging.info(
                     f"Deposit pass {counter} on {href}: payment {option['label'] if option else 'site default'!r}"
@@ -4009,6 +4152,7 @@ def fill_sign_up_form_with_timeout(driver, url, timeout_seconds=SITE_TIME_LIMIT_
     password_used = ACCOUNT_PASSWORD
     relogins_done, session_lost = 0, False
     deposit_pages_opened.clear()
+    deferred_mail.clear()  # e-mails left unopened belong to this site's account only
     site_evidence = SiteEvidence(url)
 
     def target():
@@ -4173,13 +4317,242 @@ _mailinator_messages = {}
 URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"'<>]+")
 HREF_RE = re.compile(r"""href\s*=\s*["'](https?://[^"']+)["']""", re.I)
 
+# --- Staying inside the plan's daily limits --------------------------------------------------
+# /api/v2/team/stats reports the day's usage and is itself free: 11 calls in a row on Nov 13 left
+# the dashboard's API-call counters untouched (Inbox stayed at 3), and it is not one of the
+# metered endpoints. So the budget is re-read from the account before every site instead of being
+# guessed, and the figures below are the account's real ones, not this process's idea of them.
+#
+# The stats row for today maps onto the dashboard like this (verified against Nov 11: Consumed
+# Web 14 + API 14 = 28, Incoming Email 46):
+#     retrieved.web_private + web_public + api_email  -> "Messages Consumed" total, cap 60
+#     sent.email + sent.sms                           -> "Messages Incoming",      cap 120
+#
+# reads_since is the backstop: stats may lag a read or two, and it counts what this process has
+# spent since the last refresh so the cap holds even between checks.
+_mailinator_quota = {'reads': 0, 'sends': 0, 'date': None, 'reads_since': 0, 'fresh': False}
+# Per-site verdict from mailinator_budget_before_site(): 'ok' or 'no_email'.
+mailinator_site_mode = 'ok'
+
+def _today_utc():
+    """The day the stats rows are keyed by ("20261113")."""
+    return time.strftime('%Y%m%d', time.gmtime())
+
+# --- API calls: counted here, because the account will not tell us ---------------------------
+# /api/v2/team/stats carries retrieved{} and sent{} only; the Inbox/Message/Delete/Totp/Errors
+# figures on the dashboard are not in it, and there is no other endpoint that reports them. So
+# this is the one budget that has to be tracked locally rather than read back. The count is kept
+# in MAILINATOR_USAGE_FILE against the UTC day, so it survives the per-site processes.
+#
+# It counts from the first call this file sees today, so a day whose earlier calls were made by
+# something else (another VM on the same account, or a run before this file existed) starts low.
+# MAILINATOR_API_CALLS_SEED sets a starting figure for that case.
+_rollover_logged = None  # the day a rollover was last reported, so it is said once per process
+
+def _usage_load():
+    """Today's API-call count. Every budget resets at 00:00 UTC, which is the boundary Mailinator's
+    own stats rows are keyed by, so a file written on an earlier day counts for nothing."""
+    global _rollover_logged
+    today = _today_utc()
+    try:
+        with open(MAILINATOR_USAGE_FILE) as f:
+            d = json.load(f)
+        if d.get('date') == today:
+            d.setdefault('read_units', 0)  # absent in files written before read units were counted
+            return d
+        # 00:00 UTC has passed since that file was written: the day's allowances are back to full.
+        # The seed is NOT reapplied here. It describes calls already made on the day an operator
+        # set it, so carrying it into a new day (it lives in the environment, and on the VMs in a
+        # systemd EnvironmentFile) would start every day pre-charged for calls nobody made.
+        if _rollover_logged != today:
+            _rollover_logged = today
+            logging.info(f"Mailinator: UTC day rolled over {d.get('date')} -> {today}; "
+                         f"this VM's counts reset from {d.get('api_calls')} API call(s) and "
+                         f"{d.get('read_units', 0)} read unit(s) to 0")
+        return {'date': today, 'api_calls': 0, 'read_units': 0}
+    except FileNotFoundError:
+        pass  # first run on this machine: an operator-supplied seed applies
+    except Exception as e:
+        logging.warning(f"Mailinator: could not read {MAILINATOR_USAGE_FILE} "
+                        f"({str(e).splitlines()[0] if str(e) else e!r}); starting the count over")
+    return {'date': today, 'api_calls': int(os.environ.get("MAILINATOR_API_CALLS_SEED") or 0),
+            'read_units': int(os.environ.get("MAILINATOR_READ_UNITS_SEED") or 0)}
+
+def _usage_save(d):
+    try:  # written through a temp file so a killed process cannot leave half a line behind
+        tmp = MAILINATOR_USAGE_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f)
+        os.replace(tmp, MAILINATOR_USAGE_FILE)
+    except Exception as e:
+        logging.warning(f"Mailinator: could not write the API-call count to {MAILINATOR_USAGE_FILE} "
+                        f"({str(e).splitlines()[0] if str(e) else e!r})")
+
+def mailinator_api_calls_used():
+    return _usage_load()['api_calls']
+
+def mailinator_api_calls_left():
+    return MAILINATOR_API_CALLS_PER_DAY - MAILINATOR_API_CALLS_RESERVE - mailinator_api_calls_used()
+
+def _mailinator_get(url, params, timeout=15, what="call"):
+    """Every metered Mailinator request goes through here, so the day's count is exact and the
+    120 cannot be passed. Returns None when the budget is gone; callers treat that as 'no mail'.
+
+    The team endpoints are deliberately NOT routed through this: 11 calls to /team/stats on
+    Nov 13 left the dashboard's Inbox count at 3, so they are not metered and counting them
+    would spend budget that was never charged."""
+    if mailinator_api_calls_left() <= 0:
+        logging.warning(f"Mailinator: skipping the {what}, the day's API-call budget is spent "
+                        f"({mailinator_api_calls_used()}/{MAILINATOR_API_CALLS_PER_DAY} calls)")
+        return None
+    d = _usage_load()
+    d['api_calls'] += 1
+    _usage_save(d)
+    return curl_requests.get(url, params=params, timeout=timeout)
+
+def mailinator_account_reads_used():
+    """Read units the WHOLE ACCOUNT has spent today: its own figure plus what this process has
+    spent since that figure was read.
+
+    Every count here is for the current UTC day only. At 00:00 UTC reads, sends and the local
+    tally all go back to zero, matching both the plan's daily allowances and the day key on the
+    stats rows; a pass running across midnight picks the new day up on its next check."""
+    today = _today_utc()
+    if _mailinator_quota['date'] != today:
+        if _mailinator_quota['date'] is not None:
+            logging.info(f"Mailinator: UTC day rolled over {_mailinator_quota['date']} -> {today}; "
+                         f"reads and sends reset to 0")
+        _mailinator_quota.update(reads=0, sends=0, date=today, reads_since=0, fresh=False)
+    return _mailinator_quota['reads'] + _mailinator_quota['reads_since'] * MAILINATOR_READ_COST
+
+def mailinator_reads_used():
+    """Read units THIS VM has spent today, from its own file.
+
+    The account's figure (mailinator_account_reads_used()) is accurate but covers all three VMs,
+    which is the wrong granularity for a per-VM share: with a 20-unit share each, comparing 20
+    against the account total would stop every VM as soon as the first had spent its 20. So the
+    share is counted here, per machine, and the account figure is applied as a ceiling instead.
+    File-based rather than in-memory because the count has to survive a restart mid-day (and
+    run_batch.py starts a fresh process per site)."""
+    mailinator_account_reads_used()  # rolls the day over if needed
+    return _usage_load()['read_units']
+
+def mailinator_reads_left():
+    """Read units still spendable: the smaller of this VM's remaining share and the account's
+    remaining allowance, keeping MAILINATOR_READS_RESERVE back from each.
+
+    The account ceiling costs nothing to apply (the stats endpoint is not metered) and covers
+    what a local counter alone cannot: a usage file lost to a redeploy, a hand-run test on the
+    same account, or any fourth consumer appearing later."""
+    mine = MAILINATOR_READS_PER_DAY - MAILINATOR_READS_RESERVE - mailinator_reads_used()
+    account = (MAILINATOR_ACCOUNT_READS_PER_DAY - MAILINATOR_READS_RESERVE
+               - mailinator_account_reads_used())
+    return min(mine, account)
+
+def mailinator_sends_left():
+    mailinator_account_reads_used()  # rolls the day over if needed
+    return MAILINATOR_SENDS_PER_DAY - MAILINATOR_SENDS_RESERVE - _mailinator_quota['sends']
+
+def mailinator_load_plan():
+    """Take the read cap from the plan itself rather than trusting the constant. Free, once a run."""
+    global MAILINATOR_READS_PER_DAY, MAILINATOR_ACCOUNT_READS_PER_DAY
+    if not MAILINATOR_API_KEY or MAILINATOR_API_KEY == "YOUR_API_KEY":
+        return
+    try:
+        resp = curl_requests.get(f"{MAILINATOR_TEAM_API}/team", params={"token": MAILINATOR_API_KEY}, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        cap = (data.get('plan_data') or {}).get('email_reads_per_day')
+        if cap:
+            # The plan figure is the ACCOUNT's allowance, so it sets the ceiling. It replaces this
+            # VM's share only when no share was set for it, otherwise a 20-unit VM would be handed
+            # all 60.
+            MAILINATOR_ACCOUNT_READS_PER_DAY = int(cap)
+            if not MAILINATOR_READS_PER_DAY_EXPLICIT:
+                MAILINATOR_READS_PER_DAY = int(cap)
+        logging.info(f"Mailinator plan {data.get('plan', '?')}: account "
+                     f"{MAILINATOR_ACCOUNT_READS_PER_DAY} read units/day, this VM's share "
+                     f"{MAILINATOR_READS_PER_DAY} (= {MAILINATOR_READS_PER_DAY // MAILINATOR_READ_COST} "
+                     f"message reads at {MAILINATOR_READ_COST} each), "
+                     f"{MAILINATOR_SENDS_PER_DAY} incoming messages/day, "
+                     f"{MAILINATOR_API_CALLS_PER_DAY} API calls/day")
+    except Exception as e:
+        logging.warning(f"Mailinator: could not read the plan limits ({str(e).splitlines()[0] if str(e) else e!r}); "
+                        f"using {MAILINATOR_READS_PER_DAY} read units and {MAILINATOR_SENDS_PER_DAY} sends")
+
+def mailinator_refresh_quota():
+    """Today's usage from the free stats endpoint. False when it could not be read, in which case
+    the local count from the last good refresh still applies."""
+    if not MAILINATOR_API_KEY or MAILINATOR_API_KEY == "YOUR_API_KEY":
+        return False
+    try:
+        resp = curl_requests.get(f"{MAILINATOR_TEAM_API}/team/stats",
+                                 params={"token": MAILINATOR_API_KEY}, timeout=15)
+        resp.raise_for_status()
+        today = _today_utc()
+        row = next((s for s in resp.json().get('stats', []) if s.get('date') == today), None)
+        got, sent = (row or {}).get('retrieved') or {}, (row or {}).get('sent') or {}
+        _mailinator_quota.update(
+            reads=got.get('web_private', 0) + got.get('web_public', 0) + got.get('api_email', 0),
+            sends=sent.get('email', 0) + sent.get('sms', 0),
+            date=today, reads_since=0, fresh=True)
+        return True
+    except Exception as e:
+        # Not fatal: reads_since keeps counting from the last good figure, so the cap still holds.
+        logging.warning(f"Mailinator: could not read the usage stats "
+                        f"({str(e).splitlines()[0] if str(e) else e!r}); using the local count")
+        _mailinator_quota['fresh'] = False
+        return False
+
+def mailinator_budget_before_site():
+    """Checked before each site. Returns (mode, why):
+        'stop'     - the day's incoming mail is spent; a sign-up now would only send mail the
+                     account cannot receive, so the pass ends here and resumes next time.
+        'no_email' - no read units left: sign up and try the login, but never open the inbox.
+        'ok'       - normal.
+    """
+    mailinator_refresh_quota()
+    reads, sends, calls = mailinator_reads_left(), mailinator_sends_left(), mailinator_api_calls_left()
+    used = (f"{mailinator_api_calls_used()}/{MAILINATOR_API_CALLS_PER_DAY} API calls, "
+            f"{mailinator_reads_used()}/{MAILINATOR_READS_PER_DAY} read units this VM "
+            f"(account {mailinator_account_reads_used()}/{MAILINATOR_ACCOUNT_READS_PER_DAY}), "
+            f"{_mailinator_quota['sends']}/{MAILINATOR_SENDS_PER_DAY} incoming messages"
+            + ("" if _mailinator_quota['fresh'] else ", reads counted locally (stats unavailable)"))
+    # API calls first: it is the budget that runs out soonest and the only one that is counted
+    # here rather than read from the account, so it is the one worth being strict about.
+    # A site needs a few calls to be worth starting, not just one.
+    if calls < 3:
+        return 'no_email', f"the day's API-call budget is spent, the inbox stays shut for this site ({used})"
+    if sends <= 0:
+        return 'stop', f"the day's incoming mail is spent ({used})"
+    if reads < MAILINATOR_READ_COST:
+        return 'no_email', f"no message reads left, the inbox stays shut for this site ({used})"
+    return 'ok', (f"{calls} API call(s), {reads // MAILINATOR_READ_COST} message read(s) and "
+                  f"{sends} incoming message(s) left ({used})")
+
 def _mailinator_message(inbox, msg_id, params):
-    """The whole message as the API returns it ({"parts": [{"body": ...}], ...}), read once."""
+    """The whole message as the API returns it ({"parts": [{"body": ...}], ...}), read once.
+    Returns {} rather than raising when the day's read budget is gone, so every caller simply
+    finds nothing in it and the crawl carries on without the e-mail."""
     if msg_id not in _mailinator_messages:
-        resp = curl_requests.get(f"{MAILINATOR_API}/inboxes/{inbox}/messages/{msg_id}", params=params, timeout=15)
+        if mailinator_reads_left() < MAILINATOR_READ_COST:
+            logging.warning(f"Mailinator: not opening the message, the day's read budget is spent "
+                            f"({mailinator_reads_used()}/{MAILINATOR_READS_PER_DAY} read units)")
+            return {}
+        resp = _mailinator_get(f"{MAILINATOR_API}/inboxes/{inbox}/messages/{msg_id}", params=params,
+                               timeout=15, what="message read")
+        if resp is None:
+            return {}
         resp.raise_for_status()
         _mailinator_messages[msg_id] = resp.json()
-        logging.info(f"Mailinator: message read ({len(_mailinator_messages)} this site)")
+        _mailinator_quota['reads_since'] += 1
+        # This VM's own share, charged at MAILINATOR_READ_COST per message opened and kept in the
+        # usage file so it survives a restart and the per-site processes run_batch.py spawns.
+        d = _usage_load()
+        d['read_units'] = d.get('read_units', 0) + MAILINATOR_READ_COST
+        _usage_save(d)
+        logging.info(f"Mailinator: message read ({len(_mailinator_messages)} this site, "
+                     f"{mailinator_reads_used()}/{MAILINATOR_READS_PER_DAY} read units used today)")
     return _mailinator_messages[msg_id]
 
 def _message_links(msg):
@@ -4230,6 +4603,70 @@ def remember_issued_login_id(inbox, msg_id, params, email_address):
     except Exception as e:
         logging.info(f"Mailinator: could not read the message for a login ID: {str(e).splitlines()[0] if str(e) else e!r}")
 
+# Subject first (Nov 8, James: "ok proceed"). Opening a message costs one of the plan's 60 daily reads
+# (shown as 2 on the dashboard); listing the inbox is free and already gives each message's subject.
+# Of the 22 e-mails opened on Nov 8, 14 were welcome / "Registration Info" mails of sites that logged
+# in anyway. Now a message is opened at once only when its subject reads like a verification (verify,
+# confirm, activate, code ...); a code in the subject itself ("Your 7M Trades verification code: 3057")
+# is taken from the subject without opening anything. Other messages are kept in deferred_mail and
+# opened only if the login then fails (read_deferred_mail), so a login ID the site e-mails
+# (capitalmarketfx.com) or an activation link in a welcome mail is still found, one login attempt later.
+# A page that waits for a code opens them once MAILINATOR_EXTRA_WAIT s pass without a code.
+VERIFY_SUBJECT_RE = re.compile(r"verif|confirm|activat|validat|authenticat|\bcode\b|\botp\b|\bpin\b|passcode|one[- ]time", re.I)
+SUBJECT_CODE_RE = re.compile(r"\b(\d{4,8})\b[^0-9]{0,30}?\b(?:is )?(?:your )?(?:\w+ )?(?:code|otp|pin|passcode)\b", re.I)
+deferred_mail = []  # [{'inbox', 'id', 'subject', 'email'}] left unopened for the current site
+
+def code_in_subject(subject):
+    m = EMAIL_CODE_RE.search(subject or '') or SUBJECT_CODE_RE.search(subject or '')
+    return m.group(1) if m else None
+
+def defer_mail(inbox, msg, email_address, why):
+    if not any(m['id'] == msg['id'] for m in deferred_mail):
+        deferred_mail.append({'inbox': inbox, 'id': msg['id'], 'subject': msg.get('subject', ''), 'email': email_address})
+    logging.info(f"Mailinator: '{msg.get('subject', '')}' not opened ({why}); it is opened only if the login fails")
+
+def open_deferred_for_code(params):
+    """A code page is waiting and no verification e-mail brought a code: open the unopened messages,
+    oldest first, until one holds a code. They stay in deferred_mail (a second read is free)."""
+    for m in list(deferred_mail):
+        try:
+            code = _mailinator_code(m['inbox'], m['id'], params)
+        except Exception as e:
+            logging.error(f"Error checking Mailinator inbox {m['inbox']}: {e}")
+            continue
+        if code:
+            logging.info(f"Mailinator: verification code {code} in '{m['subject']}' (opened after no verification e-mail came)")
+            return code
+    return None
+
+def read_deferred_mail(driver, site_url):
+    """The login failed: open the e-mails left unread after sign-up, take a login ID the site sent and
+    open their links, as was done for every e-mail before Nov 8. True when that gave something new to
+    try (a login ID or a clicked link), so the login is worth one more attempt."""
+    if not deferred_mail:
+        return False
+    if mailinator_site_mode == 'no_email' or mailinator_reads_left() < MAILINATOR_READ_COST:
+        logging.info(f"Mailinator: leaving the {len(deferred_mail)} unread e-mail(s) shut, "
+                     f"the day's read budget is spent ({mailinator_reads_used()}/{MAILINATOR_READS_PER_DAY} read units)")
+        return False
+    logging.info(f"Login failed; opening the {len(deferred_mail)} e-mail(s) left unread after sign-up")
+    site_domain = get_base_domain(site_url) if site_url else None
+    params = {"token": MAILINATOR_API_KEY}
+    before, clicked = issued_login_id, 0
+    for m in list(deferred_mail):
+        deferred_mail.remove(m)
+        remember_issued_login_id(m['inbox'], m['id'], params, m['email'])
+        try:
+            for link in _mailinator_links(m['inbox'], m['id'], params, site_domain)[:MAILINATOR_MAX_CLICKS]:
+                driver.get(link)
+                clicked += 1
+                logging.info(f"Clicked link in email: {link}")
+        except (curl_requests.exceptions.RequestException, ValueError, KeyError) as e:
+            logging.error(f"Error checking Mailinator inbox {m['inbox']}: {e}")
+        except WebDriverException as e:
+            logging.error(f"Error opening a link from the Mailinator inbox {m['inbox']}: {e}")
+    return clicked > 0 or issued_login_id != before
+
 # Returns (whether a link was clicked, the verification code found or None). With want_code
 # (the page after sign-up asks for a code) it keeps polling until a code turns up, not just
 # until the first link is clicked: swantradecapital.com sends a welcome e-mail with a link
@@ -4238,6 +4675,11 @@ def check_mailinator_inbox_and_click_links(api_key, driver, email_address, signu
                                            wait_seconds=MAILINATOR_WAIT_SECONDS, site_url=None, want_code=False):
     if not api_key or api_key == "YOUR_API_KEY":
         logging.info("Mailinator API key not configured; skipping email-confirmation step.")
+        return False, None
+    if mailinator_site_mode == 'no_email':
+        # Not even the free inbox listing: without a read there is no link to click and no code to
+        # take from a body, so the 60 s poll would only cost time.
+        logging.info("Mailinator: the inbox is not opened for this site, the day's read budget is spent.")
         return False, None
     if not email_address or not email_address.endswith(f"@{EMAIL_DOMAIN}"):
         logging.info(f"Sign-up email {email_address!r} is not on {EMAIL_DOMAIN}; skipping email-confirmation step.")
@@ -4248,28 +4690,46 @@ def check_mailinator_inbox_and_click_links(api_key, driver, email_address, signu
     since_ms = (signup_time - 30) * 1000  # small allowance for clock skew
     seen, clicked, code = set(), 0, None
     confirm_clicked, first_click_at, extra_wait_logged = False, None, False
+    first_deferred_at = None  # when the first message left unopened (not a verification subject) came
     deadline = time.time() + wait_seconds
 
     # Without a code to wait for, stop once a confirmation-looking link was opened, or
     # MAILINATOR_EXTRA_WAIT seconds after the first click. duduinvest.com sent "Welcome" (home and
     # login links) and "Confirm your email" (supabase.co/auth/v1/verify) in the same second; the
     # first poll only had the welcome mail, the loop stopped after clicking it, and the login then
-    # failed with "Email not confirmed".
+    # failed with "Email not confirmed". Only unopened mail so far (Nov 8): the same
+    # MAILINATOR_EXTRA_WAIT seconds after it came, for a verification e-mail to follow.
     def done():
         if want_code:
             return bool(code)
-        return confirm_clicked or (clicked and time.time() - first_click_at >= MAILINATOR_EXTRA_WAIT)
+        if confirm_clicked or (clicked and time.time() - first_click_at >= MAILINATOR_EXTRA_WAIT):
+            return True
+        return bool(first_deferred_at) and not clicked and time.time() - first_deferred_at >= MAILINATOR_EXTRA_WAIT
 
     while time.time() < deadline and should_continue and not done():
         try:
-            resp = curl_requests.get(f"{MAILINATOR_API}/inboxes/{inbox}",
-                                params={**params, "limit": 10, "sort": "descending"}, timeout=15)
+            resp = _mailinator_get(f"{MAILINATOR_API}/inboxes/{inbox}",
+                                   params={**params, "limit": 10, "sort": "descending"},
+                                   timeout=15, what="inbox listing")
+            if resp is None:
+                break
             resp.raise_for_status()
             for msg in resp.json().get('msgs', []):
                 if msg['id'] in seen or msg.get('time', 0) < since_ms:
                     continue
                 seen.add(msg['id'])
-                logging.info(f"Mailinator: '{msg.get('subject', '')}' arrived for {email_address}")
+                subject = msg.get('subject', '') or ''
+                logging.info(f"Mailinator: '{subject}' arrived for {email_address}")
+                subject_code = code_in_subject(subject)
+                if want_code and not code and subject_code:
+                    code = subject_code
+                    logging.info(f"Mailinator: verification code {code} in the subject '{subject}' (message not opened)")
+                    continue
+                if subject_code or not VERIFY_SUBJECT_RE.search(subject):
+                    defer_mail(inbox, msg, email_address,
+                               "code in the subject and no code field" if subject_code else "not a verification e-mail")
+                    first_deferred_at = first_deferred_at or time.time()
+                    continue
                 remember_issued_login_id(inbox, msg['id'], params, email_address)
                 if want_code and not code:
                     code = _mailinator_code(inbox, msg['id'], params)
@@ -4284,12 +4744,16 @@ def check_mailinator_inbox_and_click_links(api_key, driver, email_address, signu
                 if clicked and not confirm_clicked and not want_code and not extra_wait_logged:
                     extra_wait_logged = True
                     logging.info(f"No confirmation link among the clicked e-mail links; checking the inbox up to {MAILINATOR_EXTRA_WAIT} s more")
+            if want_code and not code and first_deferred_at and time.time() - first_deferred_at >= MAILINATOR_EXTRA_WAIT:
+                code = open_deferred_for_code(params)
         except (curl_requests.exceptions.RequestException, ValueError, KeyError) as e:
             logging.error(f"Error checking Mailinator inbox {inbox}: {e}")
         except WebDriverException as e:
             logging.error(f"Error opening a link from the Mailinator inbox {inbox}: {e}")
         if not done():
-            time.sleep(5)
+            time.sleep(MAILINATOR_POLL_INTERVAL)
+    if want_code and not code and deferred_mail and should_continue:
+        code = open_deferred_for_code(params)
     return clicked > 0, code
 
 # --- Verification codes ------------------------------------------------------------------------
@@ -4366,23 +4830,46 @@ forced_signup_email = None
 
 def wait_for_mailinator_code(email_address, since, seconds=MAILINATOR_WAIT_SECONDS):
     """Poll the address's Mailinator inbox for a verification code, without opening any links."""
+    if mailinator_site_mode == 'no_email':
+        logging.info("Mailinator: not waiting for a code, the day's read budget is spent.")
+        return None
     inbox, params = email_address.split('@')[0], {"token": MAILINATOR_API_KEY}
-    deadline, seen = time.time() + seconds, set()
+    deadline, seen, first_deferred_at = time.time() + seconds, set(), None
     while time.time() < deadline and should_continue:
         try:
-            resp = curl_requests.get(f"{MAILINATOR_API}/inboxes/{inbox}", params={**params, "limit": 10, "sort": "descending"}, timeout=15)
+            resp = _mailinator_get(f"{MAILINATOR_API}/inboxes/{inbox}",
+                                   params={**params, "limit": 10, "sort": "descending"},
+                                   timeout=15, what="inbox listing")
+            if resp is None:
+                break
             resp.raise_for_status()
             for msg in resp.json().get('msgs', []):
                 if msg['id'] in seen or msg.get('time', 0) < (since - 30) * 1000:
                     continue
                 seen.add(msg['id'])
+                subject = msg.get('subject', '') or ''
+                code = code_in_subject(subject)
+                if code:  # subject first (Nov 8): no read needed
+                    logging.info(f"Mailinator: '{subject}' arrived for {email_address}; code {code} (from the subject, message not opened)")
+                    return code
+                if not VERIFY_SUBJECT_RE.search(subject):
+                    logging.info(f"Mailinator: '{subject}' arrived for {email_address}")
+                    defer_mail(inbox, msg, email_address, "not a verification e-mail")
+                    first_deferred_at = first_deferred_at or time.time()
+                    continue
                 code = _mailinator_code(inbox, msg['id'], params)
-                logging.info(f"Mailinator: '{msg.get('subject', '')}' arrived for {email_address}" + (f"; code {code}" if code else ""))
+                logging.info(f"Mailinator: '{subject}' arrived for {email_address}" + (f"; code {code}" if code else ""))
+                if code:
+                    return code
+            if first_deferred_at and time.time() - first_deferred_at >= MAILINATOR_EXTRA_WAIT:
+                code = open_deferred_for_code(params)
                 if code:
                     return code
         except Exception as e:
             logging.error(f"Error checking Mailinator inbox {inbox}: {e}")
-        time.sleep(5)
+        time.sleep(MAILINATOR_POLL_INTERVAL)
+    if deferred_mail and should_continue:
+        return open_deferred_for_code(params)
     return None
 
 def email_code_first_signup(driver):
@@ -4422,7 +4909,7 @@ def email_code_first_signup(driver):
 
 # Main function
 def main():
-    global driver, current_site_url, use_xvfb, classify_only, single_site
+    global driver, current_site_url, use_xvfb, classify_only, single_site, mailinator_site_mode
     # --url crawls one site without reading urls.txt or touching the crawled_urls.txt
     # checkpoint, for testing a single site; --show-browser shows the Chrome window on a
     # Linux desktop instead of drawing it on Xvfb (on Windows the window is always shown).
@@ -4431,6 +4918,8 @@ def main():
     parser.add_argument('--show-browser', action='store_true', help="on Linux, use the real display instead of Xvfb")
     parser.add_argument('--classify-only', action='store_true',
                         help="read the start page and the sign-up search's pages for the HYIP verdict; never sign up")
+    parser.add_argument('--limit', type=int, default=None, metavar='N',
+                        help=f"crawl at most N sites this pass (default {CRAWL_SITE_LIMIT} from CRAWL_SITE_LIMIT; 0 = no cap)")
     args = parser.parse_args()
     if args.show_browser:
         use_xvfb = False
@@ -4440,12 +4929,19 @@ def main():
         console.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logging.getLogger().addHandler(console)
 
+    mailinator_load_plan()  # free; replaces the read cap with the plan's own figure
     start_virtual_display()
     driver = initialize_driver()
     handle_alert(driver)  # Handle initial alerts right after the driver is initialized
     try:
         if args.url:
             current_site_url = args.url
+            # --url is a single site, so a spent budget only shuts the inbox; it never
+            # refuses the crawl the way a pass over urls.txt stops at 'stop'.
+            mailinator_site_mode, why = mailinator_budget_before_site()
+            if mailinator_site_mode == 'stop':
+                mailinator_site_mode = 'ok'
+            logging.info(f"Mailinator budget: {why}")
             log_site_result(args.url, fill_sign_up_form_with_timeout(driver, args.url))
             return
         list_of_urls_file = URLS_FILE #List of URLs (produced by feeder.py from pipeline results)
@@ -4453,7 +4949,7 @@ def main():
         # Login happens per site inside fill_sign_up_form(). A second login search
         # used to run here from start_url, which is always '', so it only logged
         # an "invalid argument" error.
-        fill_sign_up_urls_in_list(list_of_urls_file, last_processed_file_path)
+        fill_sign_up_urls_in_list(list_of_urls_file, last_processed_file_path, site_limit=args.limit)
     except Exception as e:
         logging.error(f"An error occurred in the main loop: {e}")
         driver = ensure_driver(driver)  # Ensures the driver is responsive and handles re-initialization if needed

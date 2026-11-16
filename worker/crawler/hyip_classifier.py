@@ -238,6 +238,12 @@ def title_feats(title, domain):
         f['title_glyph'] = 1
     if re.search(r'\b(ai|bot|algorithm|automated)\b', title, re.I):
         f['title_ai_bot'] = 1
+    # Nov 7 exclusions (precise versions; title_official_country/title_year/title_glyph above are loose:
+    # they fire on any year or a trademark sign). "Official site/website" is the call-center template.
+    if re.search(r'official (web)?site', title, re.I):
+        f['excl_official_site'] = 1
+    if re.search(r'\breview(s|ed)?\b|\bbest\b.{0,40}\b20\d\d\b|\btop \d+\b|\bvs\.?\b|\bcompar(e|ison)\b|\bnews\b|\bblog\b', title, re.I):
+        f['excl_review_title'] = 1
     if re.search(r'\b(ltd|limited|llc|inc|corp|plc|group|holdings?)\b', title + ' ' + re.sub(r'[-.]', ' ', domain), re.I):
         f['name_corporate_suffix'] = 1
     if re.search(r'capital|invest|trade|asset|financ|fund|wealth|profit|crypto|coin|mining|bit', domain):
@@ -290,6 +296,63 @@ def offer_feats(text):
     return f
 
 
+# ---- Nov 7: the positive-evidence rule's text signals and the precise exclusions --------------------
+# Measured offline on James's labels (Nov 5-7): with these, "exclusion -> B; sign-up form + deposit and
+# withdraw wording + a plan offer -> A; else B" matched 102 of 120 judged sites of confirmed-2026-11-02
+# (crawler before: 89) and cut wrong YES calls from 25 to 8.
+PCT_PERIOD_ANY_RE = re.compile(
+    r'(\d+(?:\.\d+)?)\s?%\s*(?:/\s*)?(daily|a day|per day|each day|every day|hourly|per hour|weekly|per week|monthly|per month|after (\d+) ?(hours?|days?|weeks?)|for (\d+) ?(hours?|days?|weeks?)|roi\b|profit|return)'
+    r'|(daily|hourly|weekly|monthly|roi|profit|return|interest)\s*(?:profit|return|roi|interest|income|rate)?\s*[:\-]?\s*(?:up to )?(\d+(?:\.\d+)?)\s?%', re.I)
+MONEY_RE = re.compile(r'(\$|usd|usdt|€|£|₹)\s?\d[\d,.]*|\d[\d,.]*\s?(\$|usd|usdt|€|£)', re.I)
+PLAN_WORD_RE = re.compile(r'\b(plan|package|tier|account)\b', re.I)
+STEP_ACC_RE = re.compile(r'(create|open|register|sign ?up|registration|set up)\s+(an |your |a free |a )?(account|profile)|\bsign ?up\b|\bregister\b|\bregistration\b|\bjoin (us|now)\b', re.I)
+STEP_FUND_RE = re.compile(r'\bdeposit\b|fund (your )?(account|wallet)|add funds|top ?up|make (a |your )?(first )?deposit|choose (a |an |your )?(investment )?plan|select (a |an |your )?(investment )?plan', re.I)
+STEP_EARN_RE = re.compile(r'\bearn(ing|ings)?\b|\bprofits?\b|\bwithdraw\b|get paid|\binvest(ing)?\b|start (trading|investing|earning)|\btrade\b|explore (the )?markets|returns?\b|grow your', re.I)
+EXCL_TEXT = {
+    'excl_prop': re.compile(r'prop(rietary)?[- ]?(trading )?firms?\b|funded trader program|(evaluation|trading) challenge\b|pass (the|our|your) (evaluation|challenge)|profit split', re.I),
+    'excl_simulation': re.compile(r'exclusively (using|with) virtual|simulated (trading )?environment|no real (money|funds|capital) (is |are )?(ever )?(used|involved|at risk)|all trad(es|ing) (is |are )?simulated|simulated trading programs?|paper[- ]trading (platform|only|account)', re.I),
+    'excl_faucet': re.compile(r'\bfaucet\b|claim (free )?(btc|bitcoin|litecoin|ltc|crypto|satoshis?)\b|(bitcoin|btc|crypto|usdt) (generator|flasher)|private key (generator|finder)|double your (bitcoin|btc|crypto)', re.I),
+    'excl_crypto_loan': re.compile(r'crypto[- ]backed loans?|borrow (against|using) (your )?(crypto|bitcoin|btc)|loan[- ]to[- ]value|\bltv\b', re.I),
+}
+
+def _high_return(text):
+    for m in PCT_PERIOD_ANY_RE.finditer(text):
+        g = m.groups()
+        pct, period, n = float(g[0] or g[7] or 0), (g[1] or g[6] or '').lower(), g[2] or g[4]
+        if 'hour' in period or (('daily' in period or ('day' in period and 'after' not in period and 'for' not in period)) and pct >= 1):
+            return True
+        if ('week' in period and pct >= 5) or ('month' in period and pct >= 15) or (period == 'roi' and pct >= 100):
+            return True
+        if n and ('after' in period or 'for' in period):
+            unit = (g[3] or g[5] or '').lower()
+            days = int(n) / 24 if 'hour' in unit else int(n) * (7 if 'week' in unit else 1)
+            if days <= 30 and pct >= 10:
+                return True
+    return False
+
+def rule_feats(text):
+    f = {}
+    if PCT_PERIOD_ANY_RE.search(text):
+        f['pct_return_any'] = 1
+    for m in PLAN_WORD_RE.finditer(text):
+        window = text[m.start(): m.end() + 250]
+        if MONEY_RE.search(window) and DURATION_RE.search(window):
+            f['plan_duration_money'] = 1
+            break
+    for a in STEP_ACC_RE.finditer(text):  # account -> (verify) -> fund -> earn/trade/invest within 900 characters
+        window = text[a.end(): a.end() + 900]
+        fund = STEP_FUND_RE.search(window)
+        if fund and STEP_EARN_RE.search(window, fund.end()):
+            f['flow_steps'] = 1
+            break
+    if _high_return(text):
+        f['high_return'] = 1
+    for k, rx in EXCL_TEXT.items():
+        if rx.search(text):
+            f[k] = 1
+    return f
+
+
 def button_feats(soup):
     """Login/sign-up controls that are buttons rather than links (dead ones included)."""
     for b in soup.find_all(['button', 'input']) + soup.find_all(attrs={'role': 'button'}):
@@ -312,6 +375,10 @@ LABELS = {
     'crawl_bo_referral': 'back office: referral page', 'crawl_bo_plans': 'back office: plans/invest page',
     'crawl_bo_challenge': 'back office: challenges page',
     'deposit_word': 'deposit wording', 'withdraw_word': 'withdraw wording',
+    'pct_return_any': '% returns', 'plan_duration_money': 'a plan with $ and a duration', 'flow_steps': 'account -> deposit -> earn steps',
+    'high_return': 'very high returns', 'excl_official_site': '"official site" title', 'excl_review_title': 'review/news title',
+    'excl_prop': 'prop-firm wording', 'excl_simulation': 'simulation wording', 'excl_faucet': 'faucet/generator wording',
+    'excl_crypto_loan': 'crypto-loan wording',
     'plan_tiers': 'named plan tiers', 'plan_card_txt': 'plan cards with % or duration and a $ range', 'min_max_deposit': 'min/max deposit',
     'pct_per_period': '"% per day/hour" returns', 'principal_return': 'capital back / principal returned', 'last_tx_table': 'last deposits/withdrawals table',
     'goldcoders_hscript': 'HYIP script URLs (?a=signup)', 'viserlab_hyiplab': 'HyipLab template', 'signup_wallet_fields': 'sign-up asks for payout wallets',
@@ -369,8 +436,28 @@ FAMILY_WEIGHTS = {fam: {k: _log_ratio(*r['fam'][fam], *r['O']) for k, r in RATES
 
 
 def host_of(url):
-    host = (urlparse(url if '://' in url else 'https://' + url).hostname or '').lower()
+    try:
+        host = (urlparse(url if '://' in url else 'https://' + url).hostname or '').lower()
+    except ValueError:  # e.g. a bracketed host that is not an IP address
+        return ''
     return host[4:] if host.startswith('www.') else host
+
+
+def _join(base, href):
+    """urljoin that gives '' instead of raising. A page's links can hold text urllib refuses:
+    a WordPress page on the 10-31 CSV links to "//[xoo_el_inline_form active=login]", and the
+    ValueError ("does not appear to be an IPv4 or IPv6 address") lost the whole page (Nov 7)."""
+    try:
+        return urljoin(base, href)
+    except ValueError:
+        return ''
+
+
+def _path(href):
+    try:
+        return urlparse(href or '').path
+    except ValueError:
+        return ''
 
 
 class SiteEvidence:
@@ -391,6 +478,7 @@ class SiteEvidence:
         self.signup_fields = []   # hints of the chosen sign-up form's inputs
         self.deposit = []         # {'url', 'plan', 'payment'} per deposit page
         self.wallets = []
+        self.wallet_methods = {}  # address -> the payment option chosen when it appeared
         self.backoffice = {}      # back-office feature -> link
 
     def add(self, feature, source, onsite=True):
@@ -452,7 +540,7 @@ class SiteEvidence:
         for k, pat in JS.items():
             if re.search(pat, srcs) or (k in INLINE_JS and re.search(pat, inline)):
                 found.add(k)
-        for feats in (form_feats(soup, kind), tech(raw_html), button_feats(soup), offer_feats(text)):
+        for feats in (form_feats(soup, kind), tech(raw_html), button_feats(soup), offer_feats(text), rule_feats(text)):
             found.update(feats)
         page_host = host_of(url)
         hrefs = []
@@ -464,7 +552,7 @@ class SiteEvidence:
                 found.add('login_link')
             if REG_RE.search(t):
                 found.add('register_link')
-                h = host_of(urljoin(url, href)) if href.startswith(('http', '//')) else page_host
+                h = host_of(_join(url, href)) if href.startswith(('http', '//')) else page_host
                 if (h and h != page_host and not h.endswith('.' + self.domain) and not page_host.endswith('.' + h)
                         and not re.search(r'google|apple|facebook|t\.me|whatsapp|twitter|instagram', h)):
                     found.add('register_offsite')
@@ -478,7 +566,7 @@ class SiteEvidence:
             if any(re.search(pat, h, re.I) for h in hrefs):
                 found.add(k)
         if kind == 'home':
-            ext = {host_of(urljoin(url, h)) for h in hrefs if h.startswith(('http', '//'))}
+            ext = {host_of(_join(url, h)) for h in hrefs if h.startswith(('http', '//'))}
             if len({h for h in ext if h and h != page_host and self.domain not in h}) >= 15:
                 found.add('many_external_links')
             if soup.find('article') or soup.find(attrs={'itemprop': 'author'}) or soup.find('time'):
@@ -506,10 +594,32 @@ class SiteEvidence:
         self.deposit.append({'url': url, 'plan': [o['label'] for o in plan['options']] if plan else [],
                              'payment': [o['label'] for o in payment['options']] if payment else []})
 
-    def add_wallets(self, wallets, url):
+    def add_wallets(self, wallets, url, method=None):
+        """Wallet-like strings found on url.
+
+        method is the payment option the crawler had selected when they appeared -- "Bitcoin",
+        "USDT / TRC20", "Tether (ERC20)" and so on. It is the page's own statement of what to
+        send, and it is the only reliable way to tell USDT from ETH on an 0x... address or TRX
+        from USDT-TRC20 on a Tron one: the address format cannot. build_wallets.py prefers it
+        over the text it scrapes from around the address, which on a logged-in dashboard is
+        usually the sidebar nav rather than a coin name.
+
+        Recorded per address in wallet_methods. self.wallets stays a plain list of addresses so
+        everything that already reads it is unaffected.
+        """
+        label = (method or '').strip()
+        # 'site default' means no payment control was chosen, so it names no coin.
+        if label.lower() in ('site default', 'none'):
+            label = ''
         for w in wallets:
             if w not in self.wallets:
                 self.wallets.append(w)
+            # First non-empty label wins: it belongs to the option that was selected when the
+            # address first showed up. Later passes on the same page choose OTHER options, and
+            # the address usually changes with them -- but when a site reuses one address for
+            # every coin, the first label is the one that was actually on screen with it.
+            if label and not self.wallet_methods.get(w):
+                self.wallet_methods[w] = label[:60]
         if wallets:
             self.add('crawl_wallets', url, self.is_onsite(url))
 
@@ -517,7 +627,7 @@ class SiteEvidence:
         """Links of the page after login (url): [(href, text)]. Records which back-office pages exist."""
         for href, text in links:
             for k, rx in BACKOFFICE.items():
-                if k not in self.backoffice and (rx.search(text or '') or rx.search(urlparse(href or '').path)):
+                if k not in self.backoffice and (rx.search(text or '') or rx.search(_path(href))):
                     self.backoffice[k] = href
                     self.add(k, href, self.is_onsite(url))
 
@@ -526,7 +636,10 @@ class SiteEvidence:
                 'pages_read': self.pages, 'unreachable': self.unreachable, 'parked': self.parked,
                 'stopped_early': self.stopped_early, 'features': self.features,
                 'offsite_features': sorted(set(self.features) - self.onsite), 'signup_fields': self.signup_fields,
-                'deposit_pages': self.deposit, 'wallets': self.wallets, 'backoffice': self.backoffice}
+                'deposit_pages': self.deposit, 'wallets': self.wallets,
+                # address -> the payment option selected when it appeared; build_wallets.py reads
+                # this to name the coin/network instead of guessing from the surrounding text.
+                'wallet_methods': self.wallet_methods, 'backoffice': self.backoffice}
 
 # ---- The decision -------------------------------------------------------------------------------
 
@@ -545,56 +658,60 @@ def _best_family(ev):
 
 
 def hard_b(ev, whole_site=True):
-    """(family, reasons) when the site sells another product or hands the visitor off and shows no
-    HYIP plan offer, else None.
+    """(family, reasons) when the site shows another scam's sign, else None (Nov 7 exclusions).
 
-    The two rules built on something missing (no account of its own, no controls at all) need the
-    whole sign-up search, so whole_site=False (the early stop) leaves them out: a start page with
-    no login link is not yet a site without one. The off-site rule counts early once the crawler
-    has followed a sign-up link off the site, which it does only after the site's own pages ran out.
-    It was "an article page whose sign-up is off-site" in the plan; article layout and wording did
-    not separate the families in the research (40 HYIP vs 14 other sites had them next to an
-    off-site sign-up link), while an off-site sign-up with no login or password of the site's own
-    did (6 HYIP vs 13 other, of 758 and 187 live sites)."""
-    if ev.has(*OFFER_STRONG):
-        return None
-    own_account = bool(ev.onsite.intersection(ACCOUNT))
+    Measured on James's labels across all CSVs, each of these hits at most ~1% of his HYIPs (prop and
+    simulation hit none on his current labels). The older rules that also rejected HYIPs were dropped:
+    hash-rate offers (7% of his HYIPs; alnoortrade, jetwayassetminers, cryptovista), off-site sign-up
+    (investorassetmanagement, whiteoakcapital), monthly subscription pricing, "no controls", and the
+    loose prop_challenge / title_official_country features (expertoptionplus's "properly funded account",
+    any title with a year or a trademark sign). whole_site is kept for the callers; every exclusion is
+    a positive sign, so it counts as soon as it is seen."""
     if ev.has(*LEAD) and not ev.has(*PASSWORD):
         return 'call-center', (['a name/e-mail + phone form and no password field on any page read']
-                               + _why(ev, *LEAD, 'lead_form_first_last', 'intl_tel_input', 'txt_callback', 'title_official_country'))
-    if ev.has('prop_challenge', 'crawl_bo_challenge'):
-        return 'other investment', (['sells prop-firm trading challenges, not deposit plans']
-                                    + _why(ev, 'prop_challenge', 'crawl_bo_challenge', 'crawl_logged_in', 'pct_per_period'))
-    if ev.has('subscription_pricing'):
-        return 'malware', (['sells monthly subscriptions, not deposit plans']
-                           + _why(ev, 'subscription_pricing', 'plan_tiers', 'copy_ai_bot', 'account_button'))
-    if ev.has('hashrate_offer'):
-        return 'mining/generator', (['sells hash rate / mining contracts, not % deposit plans']
-                                    + _why(ev, 'hashrate_offer', 'cloud_mining', 'crawl_logged_in'))
-    if (whole_site or ev.has('crawl_offsite_signup')) and ev.has(*OFFSITE) and not own_account:
-        return ('news/review funnel' if ev.has(*ARTICLE) else _best_family(ev)), (
-            ['sign-up is on another site and the site has no login or password field of its own']
-            + _why(ev, *OFFSITE, *ARTICLE, limit=3))
-    if whole_site and not ev.has(*CONTROLS):
-        return _best_family(ev), ([f"no login or register control on the {ev.read} page(s) read"]
-                                  + _why(ev, 'contact_form', 'contact_link', 'txt_callback', 'lead_form_phone', limit=2))
+                               + _why(ev, *LEAD, 'lead_form_first_last', 'intl_tel_input', 'txt_callback'))
+    for feature, family, why in (('excl_official_site', 'call-center', '"official site/website" in the title (call-center template)'),
+                                 ('excl_prop', 'other investment', 'sells prop-firm challenges / funded accounts'),
+                                 ('excl_simulation', 'other investment', 'simulated trading with virtual money'),
+                                 ('excl_faucet', 'mining/generator', 'faucet / crypto generator'),
+                                 ('excl_crypto_loan', 'other investment', 'crypto-backed loans'),
+                                 ('excl_review_title', 'news/review funnel', 'review / news site title')):
+        if ev.has(feature):
+            return family, [why] + _why(ev, feature)
     return None
 
 
 def clear_b(ev):
-    """Reasons to stop before signing up (hard-B evidence on the pages read so far), else None."""
+    """Reasons to stop before signing up (an exclusion on the pages read so far), else None."""
     found = hard_b(ev, whole_site=False)
     return found[1] if found else None
 
 
 def score(ev):
-    """Log-likelihood ratio HYIP : other over the features present, and the per-feature terms."""
+    """Log-likelihood ratio HYIP : other over the features present, and the per-feature terms (reported only)."""
     terms = [(k, WEIGHTS[k]) for k in ev.features if k in WEIGHTS]
     return sum(w for _, w in terms), terms
 
 
+SIGNUP_FORM = PASSWORD                      # a real sign-up/login form with a password, or the crawler logged in
+DEPOSIT_WORDS = ('deposit_word', 'deposit_withdraw_ui', 'amount_form')
+WITHDRAW_WORDS = ('withdraw_word', 'deposit_withdraw_ui', 'instant_withdraw')
+MONEY_IN = ('crawl_deposit_form', 'crawl_bo_deposit', 'crawl_wallets')
+PLAN_OFFER = ('pct_per_period', 'plan_card_txt', 'pct_return_any', 'plan_duration_money', 'flow_steps', 'high_return')
+
+
+def properties(ev):
+    """The three HYIP properties: (sign-up form, money goes in, plan offer)."""
+    return (ev.has(*SIGNUP_FORM),
+            (ev.has(*DEPOSIT_WORDS) and ev.has(*WITHDRAW_WORDS)) or ev.has(*MONEY_IN),
+            ev.has(*PLAN_OFFER))
+
+
 def classify(ev):
-    """{'verdict': 'A' | 'B' | 'none', 'family', 'family_name', 'step', 'score', 'reasons'}."""
+    """{'verdict': 'A' | 'B' | 'none', 'family', 'family_name', 'step', 'score', 'reasons'}.
+
+    Nov 7: another scam's sign -> B; all three HYIP properties (a real sign-up form, deposit and
+    withdraw wording or a deposit page, a plan offer) -> A; anything else -> B."""
     total, terms = score(ev)
 
     def result(verdict, family, step, reasons):
@@ -607,25 +724,15 @@ def classify(ev):
         return result('none', '', 'unreachable', [why])
     found = hard_b(ev)
     if found:
-        return result('B', found[0], 'hard B', found[1])
-    # Hard A needs a real plan offer (OFFER_STRONG), not account controls next to "% daily", a min/max
-    # deposit, "principal" or a payouts table: on the Nov 1 blind run that pairing made 7 YES labels on
-    # sites James labelled NO (brokers, bots, a simulator, a news site, a real-estate token).
-    if ev.has(*ACCOUNT) and ev.has(*OFFER_STRONG):
-        return result('A', 'HYIP', 'hard A', ['account controls and an HYIP plan offer']
-                      + _why(ev, *ACCOUNT, limit=2) + _why(ev, *OFFER_STRONG, 'crawl_wallets', limit=3))
-    # Everything else goes to the score. A "no plan offer seen -> B" rule sat here on Nov 2 (blind set
-    # 81% -> 84%) and was dropped on Nov 3: on the regression set of 33 known HYIPs it called 8 of
-    # them B (17 of 33 YES, against 25 without it), digital4xtrade and minnercoinex among them, both of
-    # which gave wallets; the plan-card check misses many sites' plans, so "not seen" is not "not there".
-    a = total > 0 or (total == 0 and ev.has(*ACCOUNT))
-    side = sorted((t for t in terms if (t[1] > 0) == a and t[1] != 0), key=lambda t: -abs(t[1]))[:5]
-    reasons = [f"no hard rule applies; score {total:+.1f} over {len(terms)} features"
-               + ('' if ev.has(*OFFER) else '; no plan offer seen') + ('' if ev.has(*ACCOUNT) else '; no account controls seen')]
-    reasons += [f"{LABELS.get(k, k.replace('_', ' '))} ({w:+.1f}, {ev.features[k]})" for k, w in side]
-    if a:
-        return result('A', 'HYIP', 'score', reasons)
-    return result('B', _best_family(ev), 'score', reasons)
+        return result('B', found[0], 'exclusion', found[1])
+    form, money, offer = properties(ev)
+    if form and money and offer:
+        return result('A', 'HYIP', 'properties', ['sign-up form, deposit and withdraw wording, and a plan offer']
+                      + _why(ev, *SIGNUP_FORM, limit=1) + _why(ev, *MONEY_IN, *DEPOSIT_WORDS, limit=1)
+                      + _why(ev, *PLAN_OFFER, limit=2))
+    missing = [name for name, ok in (('a sign-up form', form), ('deposit and withdraw wording', money), ('a plan offer', offer)) if not ok]
+    return result('B', _best_family(ev), 'properties', [f"HYIP properties not all seen: missing {', '.join(missing)}"]
+                  + _why(ev, *SIGNUP_FORM, *MONEY_IN, *DEPOSIT_WORDS, *PLAN_OFFER, limit=3))
 
 
 def verdict_line(v):
