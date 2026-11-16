@@ -13,13 +13,39 @@ WorkingDirectory=/home/ubuntu/crimson/src/authentication_crawling
 # links (crawler_script.py skips the email step when they are missing).
 EnvironmentFile=/home/ubuntu/.crimson_env.systemd
 Environment="PYTHONUNBUFFERED=1"
+
+# --- Daily budgets -------------------------------------------------------------------------
+# Every figure below is this VM's SHARE of one Mailinator account and one daily site quota.
+# Three VMs run one pass each per day (crimson-crawler.timer, staggered), so each share is a
+# third of the fleet allowance and the three passes never overlap on the shared account.
+#
+#   sites        33 x 3 = 99      under the 100/day ceiling
+#   API calls    40 x 3 = 120     the account's published daily cap
+#   read units   20 x 3 = 60      the account's "Messages Consumed" cap
+#
+# Read units are charged at MAILINATOR_READ_COST (2) per message opened, so 20 units is 10
+# opens, 14 after the reserve = 7 opens. crawler_script.py counts both the API calls and the
+# read units per VM in mailinator_usage.json, keyed by the UTC day, and additionally holds the
+# whole account's figure as a ceiling -- so a usage file lost to a redeploy, or a hand-run test
+# on the same account, still cannot take the account over its cap.
+#
+# All budgets reset at 00:00 UTC, which is the boundary Mailinator's own stats are keyed by and
+# why every pass is scheduled after it, inside the same UTC day.
+Environment="CRAWL_SITE_LIMIT=33"
+Environment="MAILINATOR_API_CALLS_PER_DAY=40"
+Environment="MAILINATOR_READS_PER_DAY=20"
+
 # Each VM crawls the scams its own worker confirmed. feeder.py expands the glob
 # itself and only appends new domains to urls.txt, so the crawler's resume
 # checkpoint (crawled_urls.txt) stays valid between runs.
 ExecStartPre=/usr/bin/python3 feeder.py --results /home/ubuntu/crimson/src/results/*/results.log.*
 # One pass over urls.txt; the crawler logs to logs/logfile.log next to itself.
 ExecStart=/usr/bin/python3 crawler_script.py
-TimeoutStartSec=0
+# A pass is bounded so it cannot run into the next VM's slot and race it on the shared account.
+# 33 sites x SITE_TIME_LIMIT_SECONDS (300) = 2h45m is the worst case, and the tightest gap
+# between two VMs is 3h (08:00 -> 11:00 UTC). Only ExecStart spends Mailinator budget, so the
+# ExecStopPost steps below may overlap the next VM harmlessly.
+TimeoutStartSec=2h45m
 # Then pull wallet addresses (and the other IOCs) out of the pages the crawl saved,
 # the step the original ran by hand with iocs_searcher.sh. Results accumulate in
 # iocs_results next to the crawler; iocs_results.log lists pages already searched,
@@ -28,5 +54,23 @@ TimeoutStartSec=0
 # install, hence the PATH; the first run reads every page saved so far, hence the
 # longer stop timeout.
 Environment="PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStopPost=/bin/bash iocs_searcher.sh /home/ubuntu/crimson/src/authentication_crawling
+ExecStopPost=-/bin/bash iocs_searcher.sh /home/ubuntu/crimson/src/authentication_crawling
+# Rebuild wallets.csv from iocs_results: one row per (domain, wallet) with the page's
+# label for the address, for submitting wallets with their sites.
+ExecStopPost=-/usr/bin/python3 build_wallets.py
+# ScamBusters: read this pass's hyip_evidence_*.json verdicts and wallets.csv, and report every
+# verdict-A site to the form, up to three wallets per submission. Submissions are recorded in
+# scambusters_submitted.csv so the next pass does not repeat them, and --history-dir holds the
+# hand-made hyip-submissions-batch*.csv files so sites already reported by hand are left alone.
+#
+# NOTE: this posts to a shared team form and a submission cannot be withdrawn, so it ships as a
+# DRY RUN -- it logs each submission it would make and sends nothing. Add --submit to this line
+# once a pass's log looks right. A wallet whose coin/network could not be read from the page is
+# never guessed at; those go to scambusters_review.csv for a check against the deposit
+# screenshot. Add --submit-all to send them regardless.
+ExecStopPost=-/usr/bin/python3 submit_scambusters.py --history-dir /home/ubuntu/crimson/submissions-history
+# Copy it to the broker next to the collected results, named after this host (%H).
+# rsync-path creates the folder first. "-" so an unreachable broker never fails
+# the unit, and --timeout so it can't hang the way recv.py's sync once did.
+ExecStopPost=-/usr/bin/rsync -az --timeout=60 -e "ssh -i /home/ubuntu/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o ConnectTimeout=20" --rsync-path="mkdir -p /home/ubuntu/crimson/collected_results/wallets && rsync" wallets.csv ubuntu@<BROKER_IP>:/home/ubuntu/crimson/collected_results/wallets/%H.csv
 TimeoutStopSec=1h

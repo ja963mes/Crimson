@@ -3,12 +3,26 @@ Description=Periodically run the Crimson authenticated crawler
 Documentation=https://github.com/ja963mes/Crimson
 
 [Timer]
-# First run 10 min after boot, then every 6h measured from the end of the
-# previous run. systemd won't start a second pass while one is still running,
-# so long crawls can never overlap.
-OnBootSec=10min
-OnUnitActiveSec=6h
+# ONE pass per VM per UTC day, staggered across the three VMs so that no two passes ever draw on
+# the shared Mailinator account at the same time. The account's budgets reset at 00:00 UTC, so
+# every slot sits after that boundary and inside the same UTC day:
+#
+#     crimson-1   03:00 UTC   (10pm EST the evening before)   this file, the default
+#     crimson-2   08:00 UTC   (3am EST)                       timer.d/crimson-2.conf
+#     crimson-3   11:00 UTC   (6am EST)                       timer.d/crimson-3.conf
+#
+# The VMs run on Etc/UTC, so these are read as UTC with no timezone suffix and no DST shift.
+#
+# This replaces OnUnitInactiveSec=6h, which fired up to four passes a day: with CRAWL_SITE_LIMIT
+# at 33 that was ~132 sites per VM (~396 fleet-wide) against a 100/day ceiling. CRAWL_SITE_LIMIT
+# bounds a PASS, so the daily figure is set here, by how often a pass runs.
+OnCalendar=*-*-* 03:00:00
+# A pass missed because the VM was down (or the timer was disabled) runs once on the next start
+# instead of being skipped for the day. The budgets are per UTC day, so a late pass still gets
+# that day's full share.
 Persistent=true
+# No RandomizedDelaySec: the point of the stagger is that the slots are exact.
+RandomizedDelaySec=0
 Unit=crimson-crawler.service
 
 [Install]
