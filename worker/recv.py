@@ -122,6 +122,19 @@ def extract_dom_text(html_content):
     except Exception:
         return ""
 
+
+def extract_title(html_content):
+    """The <title> text on its own, for the title-only exclusions.
+
+    extract_dom_text() keeps the title but flattens it into the body text, where
+    it can no longer be told apart -- and the review/news rule is only safe on a
+    title (see title_exclusions)."""
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        return soup.title.get_text(strip=True) if soup.title else ""
+    except Exception:
+        return ""
+
 # ---------------------------------------------------------------------------
 # CONTENT FILTER -- restored from the published Crimson artifact.
 #
@@ -257,6 +270,109 @@ gambling_words = {name: re.compile(p) for name, p in (
     ('odds', r'\bodds\b'),
 )}
 
+# --- Nov 15: the crawler classifier's cheap exclusions ------------------------
+#
+# Ported from crawler-test/authentication_crawling/hyip_classifier.py, to cut the
+# non-HYIP pages reaching the LLM. The filter was barely selective before this:
+# it passed 89.6% of HYIPs but also 82.0% of other-scam and 35.3% of not-scam
+# pages (HYIP:other ratio 1.09).
+#
+# The classifier's FULL exclusion set is not ported. It costs 15.0% of HYIPs on a
+# single landing page, against ~1% on the full crawls it was measured on, because
+# most of its rules need evidence a landing page does not carry. Only the rules
+# that pay for themselves in ABSOLUTE counts are taken.
+#
+# Measured on the 1,252 labelled landing pages in ~/hyip-feature-research on VM1
+# (864 HYIP / 255 other-scam / 133 not-scam), home.html only -- one page per
+# site, which is what check() sees:
+#
+#     rule                   HYIPs lost   other scams removed
+#     excl_review_title           6              28            taken
+#     excl_faucet                 2               5            taken
+#     excl_crypto_loan            4               5            taken
+#     excl_official_site         19              11            rejected, net loss
+#     excl_prop                  51              27            rejected, net loss
+#     lead_form_no_password      60              38            rejected, net loss
+#     excl_simulation            29               1            rejected, net loss
+#
+# Each rejected rule costs more real targets than it removes noise on one page's
+# evidence. They stay in the crawler, where the crawl supplies what they were
+# built on. The Nov 7 1-for-1 check shows the same from the other side: these are
+# the recurring reasons the classifier wrongly said NO on a confirmed HYIP
+# (tegasfx.com, phantomtrader.tech, metagoldglobal.com, mondfx.com).
+#
+# A page dropped here is never crawled again, while a page wrongly passed costs
+# one Ollama call. That asymmetry is why this list is short.
+#
+# MEASURED as a combined gate on the same 1,252 pages (not as summed columns),
+# conditioned on the pages the old filter already passed -- 774 HYIP, 209
+# other-scam, 47 not-scam:
+#
+#     gate        HYIP           other scam      not-scam      HYIP:other
+#     before      774/864 89.6%  209/255 82.0%   47/133 35.3%  1.09
+#     after       763/864 88.3%  178/255 69.8%   40/133 30.1%  1.27
+#
+# Cost 11 HYIPs (1.4% of what the filter was passing) to remove 31 other-scam
+# pages (14.8%) and 7 not-scam pages. Part of that cost is label noise: trade.com
+# and investingoal.com are broker-comparison sites labelled HYIP in the research
+# set, and the rule is right about them.
+text_exclusions_nov15 = {name: re.compile(p) for name, p in (
+    ('faucet', r'\bfaucet\b|claim (free )?(btc|bitcoin|litecoin|ltc|crypto|satoshis?)\b'
+               r'|(bitcoin|btc|crypto|usdt) (generator|flasher)'
+               r'|private key (generator|finder)|double your (bitcoin|btc|crypto)'),
+    ('crypto loan', r'crypto[- ]backed loans?|borrow (against|using) (your )?(crypto|bitcoin|btc)'
+                    r'|loan[- ]to[- ]value|\bltv\b'),
+)}
+# A fourth rule was written for the affiliate / rebate pages among Nov 7's false
+# positives (kaigaifx-cashback.com, quotex-trading.com, mt2trading.com) and then
+# REJECTED on measurement: cashback and rebate wording near broker/spread/lot/fx
+# cost 19 HYIPs to remove 11 other-scam pages, because the fake brokers in this
+# population advertise rebates and tight spreads exactly as the real ones do
+# (primexbt.pro, sgfx.com, fxcentrum.com, dmacapitals.com, ztradex.com...). The
+# signal that actually separates that family -- a sign-up form hosted on a real
+# broker's domain -- is a link-target rule, not a text rule, and is not here.
+
+# Applied to the <title> ONLY, never the body. In the body "review", "news" and
+# "blog" fire on any site with a testimonials or news section, which is most
+# HYIPs. In the title they mark a review funnel or a news site. The pattern is
+# verbatim from hyip_classifier.title_feats()'s excl_review_title, which is the
+# one rule in the table above that is unambiguously worth taking.
+title_exclusions = {name: re.compile(p, re.I) for name, p in (
+    ('review title', r'\breview(s|ed)?\b|\bbest\b.{0,40}\b20\d\d\b|\btop \d+\b|\bvs\.?\b'
+                     r'|\bcompar(e|ison)\b|\bnews\b|\bblog\b'),
+)}
+
+# A real broker's own site is not an HYIP; Nov 7 had about.etrade.com passing as
+# YES. The match must be on the REGISTRABLE domain and exact. HYIPs put real
+# brand names in their hostnames constantly, and one of the Oct 29 HYIPs is
+# admin.coinbasellyinvest.live -- a substring test for 'coinbase' would drop it.
+brand_domains = frozenset((
+    'etrade.com', 'fidelity.com', 'schwab.com', 'robinhood.com', 'webull.com',
+    'interactivebrokers.com', 'tdameritrade.com', 'vanguard.com',
+    'etoro.com', 'plus500.com', 'ig.com', 'cmcmarkets.com', 'oanda.com',
+    'forex.com', 'xm.com', 'fxpro.com', 'exness.com', 'icmarkets.com',
+    'pepperstone.com', 'avatrade.com', 'octafx.com', 'deriv.com', 'quotex.io',
+    'pocketoption.com', 'tradingview.com', 'metaquotes.net',
+    'binance.com', 'coinbase.com', 'kraken.com', 'bybit.com', 'okx.com',
+    'kucoin.com', 'gemini.com', 'bitstamp.net', 'crypto.com', 'blockchain.com',
+))
+# Registrable domain, approximated without the public-suffix list: the last two
+# labels, or three when the last two are a known two-part suffix.
+_two_part_suffix = frozenset((
+    'co.uk', 'org.uk', 'com.au', 'co.nz', 'co.za', 'com.br', 'co.jp', 'co.in',
+    'com.sg', 'com.hk', 'com.mx', 'com.tr', 'co.kr',
+))
+
+
+def registrable(host):
+    """The registrable part of a hostname, lowercased ('' if there is none)."""
+    labels = [x for x in (host or '').lower().strip().strip('.').split('.') if x]
+    if len(labels) < 2:
+        return '.'.join(labels)
+    if len(labels) >= 3 and '.'.join(labels[-2:]) in _two_part_suffix:
+        return '.'.join(labels[-3:])
+    return '.'.join(labels[-2:])
+
 
 def has_hyip_phrase(clean_text):
     return any(rx.search(clean_text) for rx in hyip_phrases)
@@ -266,9 +382,19 @@ def has_hyip_marker(clean_text):
     return any(rx.search(clean_text) for rx in hyip_markers)
 
 
-def content_exclusions(clean_text):
-    """Names of the exclusion words found in clean_text ([] if none)."""
+def content_exclusions(clean_text, title='', domain=''):
+    """Names of the exclusion words found in clean_text ([] if none).
+
+    title and domain are optional: without them only the body-text rules run, so
+    existing one-argument calls keep their pre-Nov-15 behaviour plus the two new
+    body rules. check() passes both.
+    """
     found = [name for name, rx in exclusion_phrases.items() if rx.search(clean_text)]
+    found += [name for name, rx in text_exclusions_nov15.items() if rx.search(clean_text)]
+    if title:
+        found += [name for name, rx in title_exclusions.items() if rx.search(title)]
+    if domain and registrable(domain) in brand_domains:
+        found.append('known broker domain')
     gambling = [name for name, rx in gambling_words.items() if rx.search(clean_text)]
     return found + gambling if len(gambling) >= 2 else found
 
@@ -299,12 +425,15 @@ def table11_filter(clean_text):
                 and len(matches[2]) and len(matches[1]))
 
 
-def content_filter(clean_text):
+def content_filter(clean_text, title='', domain=''):
     """True if the page should go to the LLM: it passes table11_filter(), has an
-    HYIP phrase or marker, and has no exclusion words."""
+    HYIP phrase or marker, and has no exclusion words.
+
+    title is the page's <title> and domain its hostname; both are optional and
+    only the Nov 15 exclusions use them."""
     return (table11_filter(clean_text)
             and (has_hyip_phrase(clean_text) or has_hyip_marker(clean_text))
-            and not content_exclusions(clean_text))
+            and not content_exclusions(clean_text, title, domain))
 
 # --- OLLAMA LOCAL EVALUATOR (primary verdict; escalates the unsure cases to OpenAI) ---
 
@@ -879,6 +1008,8 @@ def check(url_name, curr_date):
     # against 3.2s per page on VM2, Oct 9) but blind to pitches held in images.
     # As in the artifact, a page whose screenshot or OCR fails is dropped.
     dom_text = sanitize_text(extract_dom_text(html_content))
+    # Kept separate from dom_text: the review/news exclusion is title-only.
+    page_title = extract_title(html_content)
 
     start = time.time()
     try:
@@ -904,14 +1035,14 @@ def check(url_name, curr_date):
     # pages. As in the artifact's OCR(), it reads the OCR text and the HTML text
     # combined; the LLM gets the OCR text only.
     filter_text = f"{clean_text} {dom_text}"
-    if content_filter(filter_text):
+    if content_filter(filter_text, page_title, url_name):
         evaluation = evaluate_hybrid(clean_text, url_name, curr_date)
     else:
         # Pages that pass Table 11 but are dropped here are logged with the exclusion
         # words they contain, or 'no_hyip_phrase' if they have neither a phrase nor
         # a marker, so an HYIP lost here can be found and its wording added.
         if table11_filter(filter_text):
-            log(f"{url_name},{'+'.join(content_exclusions(filter_text)) or 'no_hyip_phrase'}",
+            log(f"{url_name},{'+'.join(content_exclusions(filter_text, page_title, url_name)) or 'no_hyip_phrase'}",
                 curr_date, 'content_excluded.txt', 'a')
         evaluation = {"is_scam": False, "confidence": 0, "reason": "Cleared_By_Content_Filter"}
 
