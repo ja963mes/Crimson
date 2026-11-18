@@ -15,15 +15,18 @@ batches were sent to by hand (build_scambusters_batch.py builds the manual pages
 WHAT IT WILL NOT SUBMIT BY ITSELF
     A wallet whose "suggested_type" is empty is one whose coin/network could not be read from the
     page text next to the address. Those were always settled by eye against the deposit screenshot
-    before going in, so they are written to scambusters_review.csv instead of being guessed at --
+    before going in, so those addresses (only those -- the site and its other wallets are still
+    sent) are written to scambusters_review.csv instead of being guessed at --
     submitting a Tron address labelled as BEP20 puts bad data in a shared team form. Pass
     --submit-all to send them anyway (the address is still correct; only the network may be wrong).
 
 DE-DUPLICATION
     Every submission is appended to scambusters_submitted.csv next to this script, and that file
     plus any hyip-submissions-batch*.csv in --history-dir are read first. A domain already sent is
-    skipped unless this pass found wallets for it that were not in an earlier submission, which is
-    the RESUBMIT case the manual batches used.
+    skipped only when there is nothing new to send: no wallets at all, or only addresses this VM
+    already submitted for it. The hand-made batches record the site but not its addresses, so any
+    wallet found for one of those sites is sent (RESUBMIT). Failed posts are not counted as sent,
+    so the next pass retries them.
 
     The three VMs crawl disjoint domain sets (each feeds from its own worker), so per-VM history is
     enough to stop repeats between passes. The 34 hand-made batches in vm-results/ do overlap with
@@ -59,6 +62,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # exist. If the form ever changes, change both.
 FORM_ID = '<SCAMBUSTERS_FORM_ID>'
 POST_URL = f'https://docs.google.com/forms/d/e/{FORM_ID}/formResponse'
+VIEW_URL = f'https://docs.google.com/forms/d/e/{FORM_ID}/viewform'
+RECORDED = 'Your response has been recorded'
 REPORTER = '<REPORTER_NAME>'
 TEAM = '<TEAM_NAME>'
 E_NAME, E_TEAM, E_URL, E_HAS = 'entry.875276213', 'entry.412962342', 'entry.1657083940', 'entry.2055547632'
@@ -123,13 +128,15 @@ def history(history_dirs, submitted_path):
     addr_known is the subset of domains whose ADDRESSES are on record. The manual
     hyip-submissions-batch*.csv files are "index,url,recorded,timestamp" -- they name the site but
     not what was sent with it -- so for those domains there is no way to tell a new wallet from one
-    already submitted. Such a domain is held rather than resubmitted: ~1,000 of them are in the
-    batches and already sit in urls.txt, and guessing "new wallet" for each would post a duplicate
-    for every one."""
+    already submitted. ~1,000 of them are in the batches and already sit in urls.txt. Such a domain
+    is resubmitted whenever wallets were found for it (the batches mostly went out without any); a
+    repeat of the bare URL adds nothing, so that alone is skipped."""
     domains, addrs, addr_known = set(), defaultdict(set), set()
     if os.path.exists(submitted_path):
         with open(submitted_path, newline='', encoding='utf-8-sig') as f:
             for row in csv.DictReader(f):
+                if (row.get('status') or '').startswith('FAILED'):
+                    continue              # not sent; the next pass retries it
                 d = bare(row.get('domain'))
                 if d:
                     domains.add(d)
@@ -156,7 +163,18 @@ def payload(domain, wallets, part, parts):
         slot_addr, slot_type, slot_more = SLOTS[i]
         q += [(slot_addr, addr), (slot_type, option),
               (slot_more, 'Yes' if i + 1 < len(wallets) else 'No')]
+    # Each wallet is its own form section; without the section path the form drops their answers.
+    q += [('fvv', '1'), ('pageHistory', ','.join(str(n) for n in range(len(wallets) + 1)))]
     return q
+
+
+def fresh_fbzx():
+    """The per-load token the form expects back with a response."""
+    r = http.get(VIEW_URL, timeout=30, **_IMPERSONATE)
+    m = re.search(r'name="fbzx" value="([^"]+)"', r.text)
+    if not m:
+        raise RuntimeError(f'no fbzx on the form page (HTTP {r.status_code})')
+    return m.group(1)
 
 
 def main():
@@ -189,20 +207,24 @@ def main():
     for domain, _path in sites:
         found = wallets.get(domain, [])
         resubmit = domain in done_domains
-        if resubmit and domain not in addr_known:
-            # Sent by hand in one of the numbered batches; what went with it is not recorded, so a
-            # resubmit here cannot be told apart from a duplicate. Held for a human to decide.
-            skipped.append((domain, 'submitted by hand in an earlier batch; addresses not on '
-                                    'record, so nothing is resubmitted automatically'))
+        if resubmit and not found:
+            skipped.append((domain, 'already submitted, no wallets found'))
             continue
-        if resubmit and not ({a for a, _ in found} - done_addrs.get(domain, set())):
+        sent_before = done_addrs.get(domain, set())
+        new = [(a, opt) for a, opt in found if a not in sent_before]   # resend only what is new
+        if resubmit and not new:
             skipped.append((domain, 'already submitted, no new wallets'))
             continue
-        flagged = [a for a, opt in found if not opt]
+        flagged = [a for a, opt in new if not opt]
         if flagged and not args.submit_all:
-            review.append((domain, found, flagged))
-            continue
-        groups = [found[i:i + PER_FORM] for i in range(0, len(found), PER_FORM)] or [[]]
+            # Only the addresses whose coin/network is unknown wait for a check; the site and its
+            # other wallets still go out now.
+            review.append((domain, new, flagged))
+            new = [(a, opt) for a, opt in new if opt]
+            if resubmit and not new:
+                skipped.append((domain, 'new wallets all need a coin/network check'))
+                continue
+        groups = [new[i:i + PER_FORM] for i in range(0, len(new), PER_FORM)] or [[]]
         for n, group in enumerate(groups, 1):
             queued.append((domain, group, n, len(groups), resubmit))
 
@@ -242,9 +264,9 @@ def main():
                 continue
             status = ''
             try:
-                r = http.post(POST_URL, data=body, timeout=30, **_IMPERSONATE)
-                status = str(r.status_code)
-                ok = r.status_code in (200, 302)
+                r = http.post(POST_URL, data=body + [('fbzx', fresh_fbzx())], timeout=30, **_IMPERSONATE)
+                ok = r.status_code == 200 and RECORDED in r.text
+                status = 'recorded' if ok else f'HTTP {r.status_code}, no confirmation'
             except Exception as e:
                 status = f"error: {str(e).splitlines()[0] if str(e) else e!r}"
                 ok = False
