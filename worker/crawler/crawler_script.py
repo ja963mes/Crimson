@@ -2203,7 +2203,12 @@ def fill_sign_up_urls_in_list(urls_file_path, last_processed_file_path, site_lim
     if site_limit is None:
         site_limit = CRAWL_SITE_LIMIT
     last_processed_url = get_last_processed_url(last_processed_file_path)
-    start_processing = last_processed_url is None
+    if last_processed_url:
+        with open(urls_file_path) as queue:
+            if not any(line.strip() == last_processed_url for line in queue):
+                logging.warning("Crawl checkpoint is absent from the queue; starting at the first URL.")
+                last_processed_url = None
+    start_processing = not last_processed_url
     crawled = 0
     logging.info(f"Crawl pass starting{'' if start_processing else f' after {last_processed_url}'}; "
                  f"site limit {site_limit or 'none'}")

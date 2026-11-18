@@ -72,5 +72,4 @@ ExecStopPost=-/usr/bin/python3 submit_scambusters.py --submit --history-dir /hom
 # Copy it to the broker next to the collected results, named after this host (%H).
 # rsync-path creates the folder first. "-" so an unreachable broker never fails
 # the unit, and --timeout so it can't hang the way recv.py's sync once did.
-ExecStopPost=-/usr/bin/rsync -az --timeout=60 -e "ssh -i /home/ubuntu/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o ConnectTimeout=20" --rsync-path="mkdir -p /home/ubuntu/crimson/collected_results/wallets && rsync" wallets.csv ubuntu@<BROKER_IP>:/home/ubuntu/crimson/collected_results/wallets/%H.csv
 TimeoutStopSec=1h
