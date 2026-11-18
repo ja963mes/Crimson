@@ -68,7 +68,7 @@ ExecStopPost=-/usr/bin/python3 build_wallets.py
 # once a pass's log looks right. A wallet whose coin/network could not be read from the page is
 # never guessed at; those go to scambusters_review.csv for a check against the deposit
 # screenshot. Add --submit-all to send them regardless.
-ExecStopPost=-/usr/bin/python3 submit_scambusters.py --history-dir /home/ubuntu/crimson/submissions-history
+ExecStopPost=-/usr/bin/python3 submit_scambusters.py --submit --history-dir /home/ubuntu/crimson/submissions-history
 # Copy it to the broker next to the collected results, named after this host (%H).
 # rsync-path creates the folder first. "-" so an unreachable broker never fails
 # the unit, and --timeout so it can't hang the way recv.py's sync once did.
