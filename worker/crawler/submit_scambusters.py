@@ -89,7 +89,10 @@ def verdict_a_domains(pattern):
         except Exception as e:
             print(f"[sb] WARN: cannot read {path}: {e}", file=sys.stderr)
             continue
-        if (ev.get('verdict') or '').upper() != 'A':
+        v = ev.get('verdict')
+        if isinstance(v, dict):  # the crawler writes the classifier's whole verdict dict
+            v = v.get('verdict')
+        if str(v or '').upper() != 'A':
             continue
         dom = bare(ev.get('domain') or ev.get('url'))
         if dom:
