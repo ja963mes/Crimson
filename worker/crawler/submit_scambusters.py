@@ -67,10 +67,40 @@ RECORDED = 'Your response has been recorded'
 REPORTER = '<REPORTER_NAME>'
 TEAM = '<TEAM_NAME>'
 E_NAME, E_TEAM, E_URL, E_HAS = 'entry.875276213', 'entry.412962342', 'entry.1657083940', 'entry.2055547632'
-# (address, type, "another wallet?") for each of the form's three wallet slots.
-SLOTS = [('entry.1873532104', 'entry.544785560', 'entry.86695500'),
-         ('entry.697521327', 'entry.194979260', 'entry.699771877'),
-         ('entry.149874880', 'entry.376372511', 'entry.2013994313')]
+# (address, type, "another wallet?") for each wallet section.
+# The final section ends at Submit and has no continuation field.
+SLOTS = [
+    ('entry.1873532104', 'entry.544785560', 'entry.86695500'),
+    ('entry.697521327', 'entry.194979260', 'entry.699771877'),
+    ('entry.149874880', 'entry.376372511', 'entry.2013994313'),
+    ('entry.488196448', 'entry.1371270006', 'entry.1636015098'),
+    ('entry.1739772075', 'entry.539561973', 'entry.302920822'),
+    ('entry.1055357440', 'entry.1615734467', 'entry.1367092717'),
+    ('entry.1165621432', 'entry.1701123728', 'entry.1010853385'),
+    ('entry.1365485564', 'entry.2094161748', 'entry.1929787519'),
+    ('entry.869050649', 'entry.324099120', 'entry.1824683539'),
+    ('entry.878031999', 'entry.1211640999', 'entry.1010972670'),
+    ('entry.655030584', 'entry.695406805', 'entry.644779567'),
+    ('entry.1190001002', 'entry.801151560', 'entry.43047289'),
+    ('entry.833047747', 'entry.1416597159', 'entry.1597865358'),
+    ('entry.575248873', 'entry.864876887', 'entry.1675642471'),
+    ('entry.492936210', 'entry.195594857', 'entry.1381569709'),
+    ('entry.139479398', 'entry.1797015394', 'entry.287137048'),
+    ('entry.985540116', 'entry.1481416730', 'entry.728559200'),
+    ('entry.1409144259', 'entry.417783461', 'entry.1555785146'),
+    ('entry.648532023', 'entry.1676771200', 'entry.117761167'),
+    ('entry.618179007', 'entry.1414015831', 'entry.1540095334'),
+    ('entry.586322776', 'entry.620710113', 'entry.1251589751'),
+    ('entry.653453372', 'entry.1079379058', 'entry.20938337'),
+    ('entry.1991102856', 'entry.65023672', 'entry.2136565313'),
+    ('entry.1977595112', 'entry.1530409790', 'entry.1274461823'),
+    ('entry.557990384', 'entry.735821422', 'entry.1498520906'),
+    ('entry.1460807599', 'entry.695304425', 'entry.1082727240'),
+    ('entry.2068169538', 'entry.590264443', 'entry.342267688'),
+    ('entry.1548272503', 'entry.1452879095', 'entry.2143577029'),
+    ('entry.1481889921', 'entry.34456929', 'entry.1559181563'),
+    ('entry.1838978892', 'entry.613191902', None),
+]
 PER_FORM = len(SLOTS)
 
 SUBMITTED = os.path.join(HERE, 'scambusters_submitted.csv')
@@ -156,13 +186,14 @@ def history(history_dirs, submitted_path):
 
 
 def payload(domain, wallets, part, parts):
-    """The POST body for one submission: a site and up to three of its wallets."""
+    """The POST body for one submission: a site and up to 30 of its wallets."""
     q = [(E_NAME, REPORTER), (E_TEAM, TEAM), (E_URL, f'https://{domain}/'),
          (E_HAS, 'Yes' if wallets else 'No')]
     for i, (addr, option) in enumerate(wallets):
         slot_addr, slot_type, slot_more = SLOTS[i]
-        q += [(slot_addr, addr), (slot_type, option),
-              (slot_more, 'Yes' if i + 1 < len(wallets) else 'No')]
+        q += [(slot_addr, addr), (slot_type, option)]
+        if slot_more is not None:
+            q.append((slot_more, 'Yes' if i + 1 < len(wallets) else 'No'))
     # Each wallet is its own form section; without the section path the form drops their answers.
     q += [('fvv', '1'), ('pageHistory', ','.join(str(n) for n in range(len(wallets) + 1)))]
     return q
