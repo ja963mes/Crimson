@@ -9,7 +9,7 @@ reads what the pass already wrote next to the crawler:
   * wallets.csv                  -- one row per (domain, address) from build_wallets.py, with the
                                     form option for the address in "suggested_type"
 
-and submits every verdict-A site, with up to three wallets per submission, to the same form the
+and submits every verdict-A site, with up to 30 wallets per submission, to the same form the
 batches were sent to by hand (build_scambusters_batch.py builds the manual pages).
 
 WHAT IT WILL NOT SUBMIT BY ITSELF
@@ -19,19 +19,6 @@ WHAT IT WILL NOT SUBMIT BY ITSELF
     sent) are written to scambusters_review.csv instead of being guessed at --
     submitting a Tron address labelled as BEP20 puts bad data in a shared team form. Pass
     --submit-all to send them anyway (the address is still correct; only the network may be wrong).
-
-DE-DUPLICATION
-    Every submission is appended to scambusters_submitted.csv next to this script, and that file
-    plus any hyip-submissions-batch*.csv in --history-dir are read first. A domain already sent is
-    skipped only when there is nothing new to send: no wallets at all, or only addresses this VM
-    already submitted for it. The hand-made batches record the site but not its addresses, so any
-    wallet found for one of those sites is sent (RESUBMIT). Failed posts are not counted as sent,
-    so the next pass retries them.
-
-    The three VMs crawl disjoint domain sets (each feeds from its own worker), so per-VM history is
-    enough to stop repeats between passes. The 34 hand-made batches in vm-results/ do overlap with
-    what is already in urls.txt, so ship those to --history-dir once or the first pass will
-    resubmit sites sent weeks ago.
 
     python3 submit_scambusters.py --dry-run          # print what would be sent, post nothing
     python3 submit_scambusters.py --submit           # actually post
@@ -114,10 +101,12 @@ def bare(host):
     return host[4:] if host.startswith('www.') else host.strip('.')
 
 
-def verdict_a_domains(pattern):
+def verdict_a_domains(pattern, since_ns):
     """[(domain, path)] for every hyip_evidence_*.json whose verdict is A, oldest file first."""
     out = []
     for path in sorted(glob.glob(pattern), key=os.path.getmtime):
+        if since_ns is not None and os.stat(path).st_mtime_ns < since_ns:
+            continue
         try:
             with open(path, encoding='utf-8', errors='replace') as f:
                 ev = json.load(f)
@@ -152,39 +141,6 @@ def wallets_by_domain(path):
     return out
 
 
-def history(history_dirs, submitted_path):
-    """(domains, addrs, addr_known) from this VM's log and the hand-made batches.
-
-    addr_known is the subset of domains whose ADDRESSES are on record. The manual
-    hyip-submissions-batch*.csv files are "index,url,recorded,timestamp" -- they name the site but
-    not what was sent with it -- so for those domains there is no way to tell a new wallet from one
-    already submitted. ~1,000 of them are in the batches and already sit in urls.txt. Such a domain
-    is resubmitted whenever wallets were found for it (the batches mostly went out without any); a
-    repeat of the bare URL adds nothing, so that alone is skipped."""
-    domains, addrs, addr_known = set(), defaultdict(set), set()
-    if os.path.exists(submitted_path):
-        with open(submitted_path, newline='', encoding='utf-8-sig') as f:
-            for row in csv.DictReader(f):
-                if (row.get('status') or '').startswith('FAILED'):
-                    continue              # not sent; the next pass retries it
-                d = bare(row.get('domain'))
-                if d:
-                    domains.add(d)
-                    addr_known.add(d)
-                    addrs[d] |= {a for a in (row.get('addresses') or '').split() if a}
-    for folder in history_dirs:
-        for path in glob.glob(os.path.join(folder, 'hyip-submissions-batch*.csv')):
-            with open(path, newline='', encoding='utf-8-sig') as f:
-                for row in csv.reader(f):
-                    for cell in row:
-                        cell = cell.strip()
-                        if cell.startswith('http'):
-                            d = bare(cell)
-                            if d:
-                                domains.add(d)
-    return domains, addrs, addr_known
-
-
 def payload(domain, wallets, part, parts):
     """The POST body for one submission: a site and up to 30 of its wallets."""
     q = [(E_NAME, REPORTER), (E_TEAM, TEAM), (E_URL, f'https://{domain}/'),
@@ -213,8 +169,6 @@ def main():
     ap.add_argument('--evidence', default=os.path.join(HERE, 'hyip_evidence_*.json'),
                     help='glob for the crawler\'s per-site verdict files')
     ap.add_argument('--wallets', default=os.path.join(HERE, 'wallets.csv'))
-    ap.add_argument('--history-dir', action='append', default=[],
-                    help='folder holding hyip-submissions-batch*.csv (repeatable)')
     ap.add_argument('--submit', action='store_true', help='actually POST (otherwise this is a dry run)')
     ap.add_argument('--submit-all', action='store_true',
                     help='also submit wallets whose coin/network could not be read from the page')
@@ -224,48 +178,32 @@ def main():
     ap.add_argument('--state-dir', default=HERE,
                     help='where scambusters_submitted.csv and scambusters_review.csv live '
                          '(default: next to this script)')
+    ap.add_argument('--since-file', help='select evidence from the current crawl pass')
     args = ap.parse_args()
 
     submitted_path = os.path.join(args.state_dir, os.path.basename(SUBMITTED))
     review_path = os.path.join(args.state_dir, os.path.basename(REVIEW))
     post = args.submit and not args.dry_run
     vm = os.uname().nodename if hasattr(os, 'uname') else ''
-    done_domains, done_addrs, addr_known = history(args.history_dir, submitted_path)
+    since_ns = os.stat(args.since_file).st_mtime_ns if args.since_file else None
+    sites = verdict_a_domains(args.evidence, since_ns)
     wallets = wallets_by_domain(args.wallets)
-    sites = verdict_a_domains(args.evidence)
-
-    queued, review, skipped = [], [], []
+    queued, review = [], []
     for domain, _path in sites:
         found = wallets.get(domain, [])
-        resubmit = domain in done_domains
-        if resubmit and not found:
-            skipped.append((domain, 'already submitted, no wallets found'))
-            continue
-        sent_before = done_addrs.get(domain, set())
-        new = [(a, opt) for a, opt in found if a not in sent_before]   # resend only what is new
-        if resubmit and not new:
-            skipped.append((domain, 'already submitted, no new wallets'))
-            continue
-        flagged = [a for a, opt in new if not opt]
+        flagged = [addr for addr, option in found if not option]
         if flagged and not args.submit_all:
-            # Only the addresses whose coin/network is unknown wait for a check; the site and its
-            # other wallets still go out now.
-            review.append((domain, new, flagged))
-            new = [(a, opt) for a, opt in new if opt]
-            if resubmit and not new:
-                skipped.append((domain, 'new wallets all need a coin/network check'))
-                continue
-        groups = [new[i:i + PER_FORM] for i in range(0, len(new), PER_FORM)] or [[]]
+            review.append((domain, found, flagged))
+            found = [(addr, option) for addr, option in found if option]
+        groups = [found[i:i + PER_FORM] for i in range(0, len(found), PER_FORM)] or [[]]
         for n, group in enumerate(groups, 1):
-            queued.append((domain, group, n, len(groups), resubmit))
+            queued.append((domain, group, n, len(groups)))
 
     if args.limit:
         queued = queued[:args.limit]
 
     print(f"[sb] {len(sites)} verdict-A site(s); {len(queued)} submission(s) queued, "
-          f"{len(review)} held for review, {len(skipped)} skipped")
-    for domain, why in skipped:
-        print(f"[sb]   skip {domain}: {why}")
+          f"{len(review)} site(s) with wallets held for review")
 
     if review:
         with open(review_path, 'w', newline='', encoding='utf-8') as f:
@@ -287,9 +225,9 @@ def main():
         w = csv.DictWriter(f, fieldnames=SUBMITTED_FIELDS)
         if new_file:
             w.writeheader()
-        for domain, group, part, parts, resubmit in queued:
+        for domain, group, part, parts in queued:
             body = payload(domain, group, part, parts)
-            tag = f"{domain} [{part} of {parts}]" + (' RESUBMIT' if resubmit else '')
+            tag = f"{domain} [{part} of {parts}]"
             if not post:
                 print(f"[sb] DRY-RUN would submit {tag}: {' '.join(a for a, _ in group) or 'no wallets'}")
                 continue
@@ -309,7 +247,7 @@ def main():
                 print(f"[sb] FAILED {tag} ({status})", file=sys.stderr)
             w.writerow({'submitted_utc': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime()),
                         'domain': domain, 'part': part, 'parts': parts,
-                        'resubmit': 'yes' if resubmit else '',
+                        'resubmit': '',
                         'addresses': ' '.join(a for a, _ in group), 'vm': vm,
                         'status': status if ok else f'FAILED {status}'})
             f.flush()

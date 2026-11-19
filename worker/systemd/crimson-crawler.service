@@ -40,6 +40,7 @@ Environment="MAILINATOR_READS_PER_DAY=20"
 # checkpoint (crawled_urls.txt) stays valid between runs.
 ExecStartPre=/usr/bin/python3 feeder.py --results /home/ubuntu/crimson/src/results/*/results.log.*
 # One pass over urls.txt; the crawler logs to logs/logfile.log next to itself.
+ExecStartPre=/usr/bin/touch .scambusters-crawl-start
 ExecStart=/usr/bin/python3 crawler_script.py
 # A pass is bounded so it cannot run into the next VM's slot and race it on the shared account.
 # 33 sites x SITE_TIME_LIMIT_SECONDS (300) = 2h45m is the worst case, and the tightest gap
@@ -68,7 +69,7 @@ ExecStopPost=-/usr/bin/python3 build_wallets.py
 # once a pass's log looks right. A wallet whose coin/network could not be read from the page is
 # never guessed at; those go to scambusters_review.csv for a check against the deposit
 # screenshot. Add --submit-all to send them regardless.
-ExecStopPost=-/usr/bin/python3 submit_scambusters.py --submit --history-dir /home/ubuntu/crimson/submissions-history
+ExecStopPost=-/usr/bin/python3 submit_scambusters.py --submit --since-file .scambusters-crawl-start
 # Copy it to the broker next to the collected results, named after this host (%H).
 # rsync-path creates the folder first. "-" so an unreachable broker never fails
 # the unit, and --timeout so it can't hang the way recv.py's sync once did.
