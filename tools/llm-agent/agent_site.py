@@ -219,11 +219,32 @@ SUBMIT_TEXT_RE = re.compile(r'sign ?up|register|create|open (an |a )?account|sub
 FORM_CHECK_JS = r"""(xp) => {
   const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length) && getComputedStyle(e).visibility !== 'hidden';
   const FIELD = 'input, select, textarea, [role=combobox]:not(input)';
+  // Fields a person cannot see (Nov 22). flowtradeai.biz hides bot-trap fields website / homepage / url in
+  // <div aria-hidden="true" style="position:absolute;left:-9999px;opacity:0;height:0;width:0;overflow:hidden">;
+  // check_form listed them as EMPTY and the agent spent all 40 steps trying to fill them. Checkboxes and
+  // radios keep only the aria-hidden test: sites often hide the real box (opacity 0, off-screen) behind a
+  // drawn one, and the terms box must stay in the list.
+  const unseen = e => {
+    if (e.parentElement && e.parentElement.closest('[aria-hidden="true"]')) return true;
+    const type = (e.type || '').toLowerCase();
+    if (type === 'checkbox' || type === 'radio') return false;
+    const r = e.getBoundingClientRect();
+    if (r.right + scrollX <= 0 || r.bottom + scrollY <= 0) return true;   // placed off the page
+    for (let p = e; p && p !== document.body; p = p.parentElement) {
+      const s = getComputedStyle(p);
+      if (parseFloat(s.opacity) === 0) return true;
+      if (p !== e && s.overflow === 'hidden') {
+        const pr = p.getBoundingClientRect();
+        if (pr.width < 2 || pr.height < 2) return true;                    // inside a zero-size clipping box
+      }
+    }
+    return false;
+  };
   const isField = e => {
     if (e.tagName === 'INPUT' && ['hidden','submit','button','image','reset','file','search'].includes((e.type || 'text').toLowerCase())) return false;
     // page widgets that are not part of any form (rubixlimited.pages.dev, Nov 14: Google Translate's select)
     if (e.classList.contains('goog-te-combo') || e.closest('#google_translate_element, .skiptranslate, .goog-te-gadget, [class*="gtranslate"]')) return false;
-    return vis(e) && !e.disabled;
+    return vis(e) && !e.disabled && !unseen(e);
   };
   const count = el => [...el.querySelectorAll(FIELD)].filter(isField).length;
   let anchor = null;
@@ -362,10 +383,16 @@ async def form_check(run, browser_session, xpath=None, why='check'):
         # (smg-trade.com took it as success and never read the site's phone-number error).
         state = 'EMPTY' if is_empty_field(f) else ('empty (optional)' if not f['filled'] else f'filled: {f["value"]}')
         lines.append(f"{i}. {f['label']} ({f['kind']}{', required' if f['required'] else ''}): {state}")
-    text = ('Form check (the attached picture shows the form; every EMPTY required field is outlined in red):\n'
+    # Nov 22: only fields the site itself marks required (required attribute, aria-required or a * in the
+    # label) are called required. Before, every empty field was listed as "Empty required fields", which
+    # turned flowtradeai.biz's unmarked bot-trap fields into apparent requirements.
+    req = [f['label'] for f in empty if f['required']]
+    other = [f['label'] for f in empty if not f['required']]
+    text = ('Form check (the attached picture shows the form; every EMPTY field is outlined in red):\n'
             + '\n'.join(lines)
-            + ('\nEmpty required fields: ' + '; '.join(f['label'] for f in empty) + '.'
-               if empty else '\nNo empty required fields.'))
+            + ('\nEmpty fields the site marks required: ' + '; '.join(req) + '.' if req else '')
+            + ('\nEmpty fields not marked required: ' + '; '.join(other) + '.' if other else '')
+            + ('' if empty else '\nNo empty fields.'))
     (fdir / f'{stem}.txt').write_text(info['url'] + '\n' + text, encoding='utf-8')
     run.form_log.append({'n': run.form_checks, 'why': why, 'url': info['url'], 'fields': len(info['fields']),
                          'empty': [f['label'] for f in empty], 'picture': f'forms/{stem}.png' if png else ''})
@@ -745,8 +772,12 @@ def build_tools(run: SiteRun) -> Tools:
     tools = Tools(exclude_actions=['search'])
     params = {'token': cb.MAILINATOR_API_KEY}
 
+    # Nov 22: ends the step (terminates_sequence). Called in the same step as the form inputs, the values
+    # were not known yet and the agent typed placeholders ("{new_identity.username}", "<new_identity.email>",
+    # "{identity.firstname}") on 6 of 20 sites; jifutrades.com kept "{identity.firstname}" as the account's name.
     @tools.action(description='Get the throwaway identity for this site (name, username, e-mail, password, '
-                              'second_password, phone, country, address, date of birth). Call once and reuse the values.')
+                              'second_password, phone, country, address, date of birth). Call once and reuse the values.',
+                  terminates_sequence=True)
     async def new_identity() -> ActionResult:
         if run.identity is None:
             email = cb.generate_random_email()
@@ -895,7 +926,8 @@ def build_tools(run: SiteRun) -> Tools:
         return await tools.registry.execute_action('navigate', {'url': url, 'new_tab': False}, browser_session=browser_session)
 
     @tools.action(description='Look closely at the form on the current page: returns a picture of the form with every '
-                              'empty required field outlined in red, and a list of each field with its current value.')
+                              'empty field outlined in red, and a list of each visible field with its current value '
+                              'and whether the site marks it required.')
     async def check_form(browser_session: BrowserSession) -> ActionResult:
         info = await form_check(run, browser_session, None, 'check_form')
         if info is None:
