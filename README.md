@@ -1,5 +1,25 @@
 # Crimson — Scripts
 
+## What is Crimson
+
+Crimson finds cryptocurrency investment scam websites (HYIPs: sites that promise high daily returns on crypto deposits) soon after they get a TLS certificate, and collects the wallet addresses they use to take deposits. It is based on the WWW '25 paper *"The Poorest Man in Babylon: A Longitudinal Study of Cryptocurrency Investment Scams"* (Muzammil et al.), code at [pragseclab/Crimson](https://github.com/pragseclab/Crimson).
+
+## How it works
+
+Crimson has two parts: a **detection pipeline** that finds the scam sites, and a **crawler** that goes inside them to find where the money goes.
+
+**Detection pipeline.** Every website that switches on HTTPS gets a certificate, and every certificate is published in public Certificate Transparency logs. Crimson watches those logs, so it sees new sites within minutes of their creation. That is tens of millions of domains a day, so the pipeline narrows them down in stages. Each stage is cheaper than the next and removes most of what is left:
+
+1. **Name:** keep only domains whose names sound like crypto or investing.
+2. **Page content:** after a short wait to let the site go live, visit it and keep only pages that talk about investing, coins and returns together.
+3. **Judgement:** a language model reads the remaining pages and decides whether each one is an investment scam.
+
+A central queue hands the domains out to several worker machines, so many sites are checked in parallel.
+
+**Crawler.** A scam site's home page rarely shows the wallet address that victims pay into. That address appears only once someone has an account and goes to deposit. For each confirmed site, the crawler acts like a new victim: it signs up with a disposable e-mail address, confirms the account, logs in, opens the deposit page for each payment method on offer, and records the wallet address shown. What it sees inside the site also confirms whether the site really is an investment scam.
+
+**Result.** A steady list of live scam sites and the wallets behind them. The wallets can be traced on the blockchain to measure losses, and the sites and wallets are reported so they can be blocked.
+
 ## `src/`
 
 ### `cron.py`
