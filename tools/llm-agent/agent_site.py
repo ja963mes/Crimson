@@ -18,7 +18,17 @@ is how a run started in the background is steered.
 
 Guards (v3, Nov 14): no web-search action; search-engine domains blocked, and a search page reached
 anyway stops the site; record_wallet keeps addresses from other sites' pages apart (wallets_off_site,
-not counted); a "finish now" instruction 90 s before the time limit; 8192 output tokens per call.
+not counted); 8192 output tokens per call.
+Nov 15 rule removal (James: the agent decides how to reach the goal): no submit refusal, no log-in-first
+refusal of check_inbox, no "you MUST log in" order, no code-box order, no stuck order. What is left
+are facts: the repeat count, the inbox caps, and the time left 90 s before the limit. Safety guards and
+caps (search block, off-site wallets, cost, time, steps, mail budget) are unchanged.
+Backup of the version before: agent_site.py.bak-2026-11-15-before-rule-removal.
+Nov 15 additions for prompt v4 (now the default --prompt): after every step the model gets a "what
+changed" report of browser-measured facts (address before/after, text that appeared or disappeared,
+messages caught as they appeared even if gone, alert() text, fields emptied, links that became visible,
+pop-ups opened/closed, or "nothing visible changed"), also saved to changes.jsonl; and a zoom tool
+(3x picture of an element or text plus the text inside it, saved to zoom/NN.png).
 
 Run folder (runs-llm-<date>/<domain>/):
     steps.jsonl        one line per step: URL, the model's evaluation / memory / next goal, actions, $ so far
@@ -32,6 +42,7 @@ Run folder (runs-llm-<date>/<domain>/):
 import argparse
 import asyncio
 import base64
+import collections
 import datetime as dt
 import hashlib
 import html as html_lib
@@ -142,8 +153,8 @@ class SiteResult(BaseModel):
     notes: str = ''
 
 
-# Stuck rule (James, Nov 14): the same action done REPEAT_LIMIT times on a page that has not changed is
-# not working, and the agent is told firmly to try something else. Browser Use's own loop detector only
+# Repeat count (James, Nov 14 stuck rule; Nov 15 reduced to a statement of fact, no order): the same
+# action done REPEAT_LIMIT times on the same page address is reported to the agent. Browser Use's own loop detector only
 # nudges ("if this is intentional and making progress, carry on"), and on Nov 10 minnercoinex.org got
 # that nudge 7 times and kept going. "Same action" uses Browser Use's own action hash (a click = the same
 # element index, an input = same field and text, find_elements / search_page = same query); a page
@@ -157,13 +168,8 @@ LOGIN_URL_RE = re.compile(r'log-?in|sign-?in|signin|/auth\b|/account/?$', re.I)
 # The crawler's code-box finder wrapped for page.evaluate: [name, placeholder, maxlength] of each box.
 CODE_BOX_FN = ('() => { const found = (() => {' + cb.CODE_INPUTS_JS + '})(); '
                'return JSON.stringify(found.slice(0, 4).map(e => [e.name || "", e.placeholder || "", e.maxLength])); }')
-# Said when the inbox wait ends. A login attempt is required before SIGNED_UP: wertchain.live (Nov 15) took a
-# "Check your email" popup as proof it could not log in and never opened the login page, while
-# minnercoinex.org (Nov 10) let a NOT-ACTIVE account reach its deposit page.
-LOGIN_NOW = ('You MUST now try to log in before you finish: open the site\'s Login / Sign in page and log in with '
-             'the identity\'s e-mail (or username) and password. Many sites let an unverified account in, and some '
-             'let it deposit. Only if the login itself is refused or shows a "verify your e-mail" page, call done '
-             'with level SIGNED_UP and say that no verification e-mail arrived and what the login page answered.')
+# Nov 15 (rule removal): the LOGIN_NOW order ("You MUST now try to log in") that followed an empty inbox is
+# gone; the inbox caps now only state the facts. Whether to try a login is the agent's decision.
 REPEAT_EXEMPT = {'wait', 'done', 'go_back', 'check_inbox'}   # waiting for mail is meant to repeat
 
 
@@ -174,8 +180,10 @@ def page_fingerprint(state):
 
 
 def note_repeats(run, state, actions):
-    """Count each action against the page it was done on; return a firm instruction when one reaches
-    REPEAT_LIMIT (and every REPEAT_LIMIT after that) without the page changing."""
+    """Count each action against the page it was done on; return a plain statement of the count when one
+    reaches REPEAT_LIMIT (and every REPEAT_LIMIT after that) on the same page address.
+    Nov 15 (rule removal): this used to be an order ("You are stuck ... Do NOT do it again. Try something
+    different ..."); it now states the fact only and what to do about it is the agent's decision."""
     fp = page_fingerprint(state)
     notes = []
     for d in actions:
@@ -190,19 +198,16 @@ def note_repeats(run, state, actions):
         run.repeats[h] = (count, fp, text)
         if count % REPEAT_LIMIT == 0:
             run.loop_interventions.append({'step': run.last_step, 'url': state.url, 'action': text, 'times': count})
-            notes.append(f'You are stuck: you have done the same action ({text}) {count} times and you are still on '
-                         'the same page. It is not working. Do NOT do it again. Try something different: '
-                         'another button, menu, tab or link for the same goal, close anything covering the page, '
-                         'scroll to find a different control, or go back a step. If there is no other route, call '
-                         'done with how far you got and what stopped you.')
-            print(f"[guard] stuck: {text} done {count} times on an unchanged page; telling the agent to change approach",
+            notes.append(f'For your information: the same action ({text}) has now been done {count} times while '
+                         f'the page address stayed {short(fp, 100)}.')
+            print(f"[repeat] {text} done {count} times on the same page address; told the agent the count",
                   flush=True)
     return notes
 
 
 # ---------------------------------------------------------------------------------------------
-# Form check (James, Nov 14): before a form is submitted, every field must be filled, checked on a
-# picture of the form. bitwave-capital.com submitted 9 times with two custom dropdowns (a read-only box
+# Form check (James, Nov 14; since Nov 15 a look-closer tool and a record of each submit, no longer a
+# gate on submitting). bitwave-capital.com submitted 9 times with two custom dropdowns (a read-only box
 # that opens a list) still empty. FORM_CHECK_JS finds the form (the one holding the clicked button, or the
 # largest visible form), lists each visible field with its value, outlines empty ones in red, and gives
 # the form's position for a clipped screenshot. Optional referral-type fields are never counted as empty.
@@ -275,7 +280,7 @@ FORM_CHECK_JS = r"""(xp) => {
       filled = !!(e.value && o && !o.disabled && !/^(select|choose|please|--|-)/i.test(value));
     } else if (tag === 'input' && (e.readOnly || e.getAttribute('aria-haspopup') === 'listbox' || e.getAttribute('role') === 'combobox')
                && (e.getAttribute('aria-haspopup') === 'listbox' || e.getAttribute('role') === 'combobox' || /select|combo|picker/i.test(e.className))) {
-      kind = 'custom dropdown: click the box, then click an option in the list that opens; typing does not work';
+      kind = 'custom dropdown';
       value = clean(e.value); filled = !!value;
     } else if (tag !== 'input' && tag !== 'textarea') {
       // a role=combobox element with no label at all means nothing to the agent (ch-zfx.com, Nov 14:
@@ -353,11 +358,14 @@ async def form_check(run, browser_session, xpath=None, why='check'):
         (fdir / f'{stem}.png').write_bytes(png)
     lines = []
     for i, f in enumerate(info['fields'], 1):
-        state = 'EMPTY' if is_empty_field(f) else ('empty, optional: leave it' if not f['filled'] else f'filled: {f["value"]}')
+        # Nov 15 (rule removal): plain description only. "the form can be submitted" read as a go-ahead
+        # (smg-trade.com took it as success and never read the site's phone-number error).
+        state = 'EMPTY' if is_empty_field(f) else ('empty (optional)' if not f['filled'] else f'filled: {f["value"]}')
         lines.append(f"{i}. {f['label']} ({f['kind']}{', required' if f['required'] else ''}): {state}")
-    text = ('Form check (the attached picture shows the form; every EMPTY field is outlined in red):\n' + '\n'.join(lines)
-            + ('\nEMPTY fields: ' + '; '.join(f['label'] for f in empty) + '. Fill each of them, then check again.'
-               if empty else '\nNo empty fields: the form can be submitted.'))
+    text = ('Form check (the attached picture shows the form; every EMPTY required field is outlined in red):\n'
+            + '\n'.join(lines)
+            + ('\nEmpty required fields: ' + '; '.join(f['label'] for f in empty) + '.'
+               if empty else '\nNo empty required fields.'))
     (fdir / f'{stem}.txt').write_text(info['url'] + '\n' + text, encoding='utf-8')
     run.form_log.append({'n': run.form_checks, 'why': why, 'url': info['url'], 'fields': len(info['fields']),
                          'empty': [f['label'] for f in empty], 'picture': f'forms/{stem}.png' if png else ''})
@@ -368,7 +376,7 @@ async def form_check(run, browser_session, xpath=None, why='check'):
 
 def is_submit_control(node):
     """A button that submits a form: type=submit, or a button-like element whose text says sign up /
-    log in / deposit / continue ... Links that go to another page are not gated."""
+    log in / deposit / continue ... Links that go to another page are not recorded."""
     attrs = {k.lower(): (v or '') for k, v in (node.attributes or {}).items()}
     tag = (node.tag_name or '').lower()
     if attrs.get('type', '').lower() == 'submit' and tag in ('button', 'input'):
@@ -382,6 +390,253 @@ def is_submit_control(node):
         return False
     button_like = tag in ('button', 'input') or attrs.get('role') == 'button' or tag in ('a', 'div', 'span')
     return button_like and bool(SUBMIT_TEXT_RE.search(text))
+
+
+# ---------------------------------------------------------------------------------------------
+# "What changed" report (Nov 15, James approved; prompt v4 tells the agent it gets this). Facts only, no
+# advice. Evidence: the agent never read the site's reply after its own actions. smg-trade.com: "Mobile
+# number must contain 8 to 20 digits" appeared after the sign-up submit; arbitraotc.site: "Error | Invalid
+# captcha provided" and the whole form emptied; zenitinvest.online: its "Deposit" heading only opened a
+# submenu with the real Deposit link; 7mtrades.com: a code popup opened. A text diff of the saved step
+# pages shows the first two; the rest need what is VISIBLE (innerText), which is what this measures.
+#
+# CHANGE_WATCH_JS is put on the page at each step start: it records short messages as they appear
+# (alerts, toasts, field errors, SweetAlert, alert()/confirm() text) so one that vanishes in 2 s is still
+# reported. CHANGE_SNAP_JS takes the visible state (text lines, fields filled or not, links, open dialogs)
+# and hands over the recorded messages. describe_changes() compares the snapshots from before and after a step.
+CHANGE_WATCH_JS = r"""() => {
+  if (window.__cwInstalled) return 'already';
+  window.__cwInstalled = true;
+  window.__cwMsgs = [];
+  const SEL = '[role=alert],[role=alertdialog],[role=status],[aria-live=assertive],[aria-live=polite],.alert,.toast,'
+    + '.swal2-popup,.swal-modal,.sweet-alert,.notification,.notify,.snackbar,.invalid-feedback,.error,.errors,'
+    + '.help-block,.text-danger,.iziToast,.noty_body,.toastr,.Toastify__toast,.error-message,.form-error,.field-error';
+  const WORD = /error|invalid|incorrect|wrong|required|must|fail|success|sent|verif|confirm|code|already|not allowed|not available|minimum|maximum|please|warning|denied|expired|exist|blocked|captcha/i;
+  const vis = e => !e.checkVisibility || e.checkVisibility({checkOpacity: false, checkVisibilityCSS: true});
+  const push = (kind, text) => {
+    text = (text || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    if (!text) return;
+    const last = window.__cwMsgs[window.__cwMsgs.length - 1];
+    if (last && last.text === text) return;
+    window.__cwMsgs.push({kind, text});
+    if (window.__cwMsgs.length > 60) window.__cwMsgs.shift();
+  };
+  const matches = el => { try { return el.matches(SEL); } catch (e) { return false; } };
+  const look = el => {
+    if (!(el instanceof Element) || !vis(el)) return;
+    let hit = matches(el) ? el : null;
+    if (!hit) { try { hit = [...el.querySelectorAll(SEL)].find(vis) || null; } catch (e) {} }
+    if (hit) { push('message', hit.innerText); return; }
+    const txt = el.innerText || '';
+    if (txt.length <= 200 && WORD.test(txt)) push('message', txt);
+  };
+  new MutationObserver(ms => {
+    for (const m of ms) {
+      if (m.type === 'childList') m.addedNodes.forEach(n => look(n.nodeType === 3 ? n.parentElement : n));
+      else if (m.type === 'characterData') look(m.target.parentElement);
+      else if (m.type === 'attributes' && matches(m.target)) look(m.target);
+    }
+  }).observe(document.documentElement, {childList: true, subtree: true, characterData: true,
+                                         attributes: true, attributeFilter: ['class', 'style', 'hidden']});
+  for (const name of ['alert', 'confirm', 'prompt']) {
+    const orig = window[name];
+    window[name] = function (m) { push('browser ' + name + ' box', String(m)); return orig.apply(this, arguments); };
+  }
+  return 'installed';
+}"""
+CHANGE_SNAP_JS = r"""() => {
+  const vis = e => !e.checkVisibility || e.checkVisibility({checkOpacity: true, checkVisibilityCSS: true});
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+  const text = document.body ? (document.body.innerText || '') : '';
+  const lines = text.split('\n').map(clean).filter(s => s.length > 1).map(s => s.slice(0, 200)).slice(0, 3000);
+  const fields = [];
+  document.querySelectorAll('input, select, textarea').forEach((el, i) => {
+    const type = (el.type || el.tagName).toLowerCase();
+    if (['hidden', 'submit', 'button', 'image', 'reset', 'file'].includes(type) || !vis(el)) return;
+    const filled = (type === 'checkbox' || type === 'radio') ? el.checked : !!clean(el.value);
+    const label = clean((el.labels && el.labels[0] && el.labels[0].innerText) || el.getAttribute('aria-label')
+                        || el.placeholder || el.name || el.id || type).slice(0, 60);
+    fields.push({key: (el.name || el.id || '#' + i) + '|' + type + (type === 'radio' ? '|' + el.value : ''), label, type, filled});
+  });
+  const links = [];
+  document.querySelectorAll('a[href]').forEach(a => {
+    if (!vis(a)) return;
+    const t = clean(a.innerText).slice(0, 60);
+    if (t) links.push(t + ' -> ' + (a.href || a.getAttribute('href') || '').slice(0, 150));
+  });
+  const dialogs = [];
+  document.querySelectorAll('[role=dialog], [role=alertdialog], [aria-modal=true], .modal.show, .modal.in, .swal2-popup, dialog[open]')
+    .forEach(d => { if (vis(d)) dialogs.push(clean(d.innerText).slice(0, 160)); });
+  const msgs = (window.__cwMsgs || []).splice(0);
+  return JSON.stringify({url: location.href, title: document.title, lines, fields, links: links.slice(0, 500),
+                         dialogs: [...new Set(dialogs)], msgs});
+}"""
+# zoom: find the element (by XPath from the agent's index, or the smallest visible element containing the
+# text), scroll it into view, and return its page rectangle plus margin and the visible text inside it.
+ZOOM_FIND_JS = r"""(xpath, text, margin) => {
+  const vis = e => !e.checkVisibility || e.checkVisibility({checkOpacity: true, checkVisibilityCSS: true});
+  let el = null;
+  if (xpath) {
+    try { el = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue; } catch (e) {}
+    if (!el) return JSON.stringify({why: 'The element for that index is no longer on the page.'});
+  } else {
+    const want = text.toLowerCase();
+    let best = null, bestArea = Infinity;
+    for (const e of document.body.querySelectorAll('*')) {
+      if (!vis(e)) continue;
+      const t = (e.innerText || '').toLowerCase();
+      if (!t.includes(want)) continue;
+      const r = e.getBoundingClientRect();
+      const area = r.width * r.height;
+      if (area > 0 && area < bestArea) { best = e; bestArea = area; }
+    }
+    if (!best) return JSON.stringify({why: 'No visible element contains that text.'});
+    el = best;
+  }
+  el.scrollIntoView({block: 'center', inline: 'center'});
+  const r = el.getBoundingClientRect();
+  const L = Math.max(0, r.left - margin), T = Math.max(0, r.top - margin);
+  const R = Math.min(document.documentElement.scrollWidth, r.right + margin), B = r.bottom + margin;
+  const parts = [];
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const s = n.nodeValue.trim();
+    if (!s || !n.parentElement || !vis(n.parentElement)) continue;
+    const rg = document.createRange(); rg.selectNodeContents(n);
+    const q = rg.getBoundingClientRect();
+    if (q.width && q.height && q.right > L && q.left < R && q.bottom > T && q.top < B) parts.push(s);
+  }
+  const width = Math.min(R - L, 1400), height = Math.min(B - T, 1000);
+  return JSON.stringify({margin, text: parts.join(' ').slice(0, 600),
+                         rect: {x: L + scrollX, y: T + scrollY, width, height}});
+}"""
+CHANGE_MSG_RE = re.compile(r'error|invalid|incorrect|wrong|required|must|fail|success|sent|verif|confirm|code|'
+                           r'already|not allowed|not available|minimum|maximum|please|warning|denied|expired|'
+                           r'exist|blocked|captcha', re.I)
+
+
+async def page_snapshot(browser_session):
+    """Visible state of the current page (CHANGE_SNAP_JS), with the message watcher put in place first."""
+    try:
+        page = await browser_session.must_get_current_page()
+        await page.evaluate(CHANGE_WATCH_JS)
+        return json.loads(await page.evaluate(CHANGE_SNAP_JS))
+    except Exception as e:
+        print(f"[changes] snapshot failed: {short(e, 120)}", flush=True)
+        return None
+
+
+def _counter_diff(before, after):
+    """Items of `after` beyond their count in `before`, in page order."""
+    left = collections.Counter(before)
+    out = []
+    for x in after:
+        if left[x] > 0:
+            left[x] -= 1
+        else:
+            out.append(x)
+    return out
+
+
+def describe_changes(b, a, early_msgs=()):
+    """Plain-fact report of what changed between snapshot b (before the step) and a (after it).
+    Returns (full text for the next step, one-line summary kept in the agent's history)."""
+    if not a:
+        return 'The page could not be read after this step.', 'Browser report: page not readable'
+    if not b:
+        return None, None
+    out, summary = [], []
+    same_page = b['url'].split('#')[0] == a['url'].split('#')[0]
+    if b['url'] != a['url']:
+        out.append(f"Page address changed: {short(b['url'], 110)} -> {short(a['url'], 110)}")
+        summary.append(f"address -> {short(a['url'], 80)}")
+    else:
+        out.append(f"Page address did not change ({short(a['url'], 110)}).")
+    if b.get('title') != a.get('title'):
+        out.append(f"Page title changed: \"{short(b.get('title'), 60)}\" -> \"{short(a.get('title'), 60)}\"")
+    shown = set(a['lines'])
+    msgs = []
+    for m in list(early_msgs) + list(b.get('msgs') or []) + list(a.get('msgs') or []):
+        t = m['text']
+        if t and t not in [x[1] for x in msgs]:
+            msgs.append((m['kind'], t))
+    if msgs:
+        out.append('Messages the site showed during the step:')
+        for kind, t in msgs[:8]:
+            still = 'still shown' if any(t[:60] in line or line in t for line in shown if len(line) > 3) else 'no longer shown'
+            out.append(f"  - [{kind}] \"{short(t, 200)}\" ({still})")
+        summary.append('site said: ' + '; '.join(f'"{short(t, 70)}"' for _, t in msgs[:3]))
+    appeared = _counter_diff(b['lines'], a['lines'])
+    gone = _counter_diff(a['lines'], b['lines'])
+    if not same_page and len(appeared) > 25:
+        out.append(f"A different page is shown ({len(a['lines'])} lines of text). It begins: "
+                   + ' | '.join(short(x, 60) for x in a['lines'][:8]))
+    else:
+        if appeared:
+            ranked = sorted(appeared, key=lambda x: 0 if CHANGE_MSG_RE.search(x) else 1)
+            out.append(f"Text that appeared ({len(appeared)} line(s)): " + ' | '.join(f'"{short(x, 90)}"' for x in ranked[:12])
+                       + (' ...' if len(appeared) > 12 else ''))
+            hits = [x for x in appeared if CHANGE_MSG_RE.search(x)]
+            if hits and not msgs:
+                summary.append('new text: ' + '; '.join(f'"{short(x, 70)}"' for x in hits[:2]))
+        if gone:
+            out.append(f"Text that disappeared ({len(gone)} line(s)): " + ' | '.join(f'"{short(x, 70)}"' for x in gone[:6])
+                       + (' ...' if len(gone) > 6 else ''))
+        new_links = _counter_diff(b['links'], a['links'])
+        if new_links and len(new_links) <= 30:
+            out.append('Links that became visible: ' + ' | '.join(short(x, 110) for x in new_links[:10]))
+            summary.append('links appeared: ' + ' | '.join(short(x, 70) for x in new_links[:3]))
+        elif appeared and not msgs and not any(CHANGE_MSG_RE.search(x) for x in appeared):
+            summary.append(f'{len(appeared)} line(s) of text appeared')
+        if gone and not appeared:
+            summary.append(f'{len(gone)} line(s) of text disappeared')
+        bf = {f['key']: f for f in b['fields']}
+        emptied = [f['label'] for f in a['fields'] if f['type'] != 'radio' and f['key'] in bf
+                   and bf[f['key']]['filled'] and not f['filled']]
+        if emptied:
+            out.append(f"Fields that were filled before and are empty now ({len(emptied)}): " + ', '.join(emptied[:10]))
+            summary.append(f"{len(emptied)} field(s) emptied")
+        new_fields = [f['label'] for f in a['fields'] if f['key'] not in bf]
+        if new_fields and len(new_fields) <= 15:
+            out.append('Fields that appeared: ' + ', '.join(new_fields))
+    opened = [d for d in a['dialogs'] if d not in b['dialogs']]
+    closed = [d for d in b['dialogs'] if d not in a['dialogs']]
+    if opened:
+        out.append('A dialog / pop-up opened: ' + ' | '.join(f'"{short(d, 120)}"' for d in opened[:3]))
+        summary.append('pop-up opened')
+    if closed:
+        out.append('A dialog / pop-up closed: ' + ' | '.join(f'"{short(d, 80)}"' for d in closed[:3]))
+        summary.append('pop-up closed')
+    if len(out) == 1 and same_page and b['url'] == a['url']:
+        out = [f"Nothing visible changed: same page address ({short(a['url'], 110)}), same text, same field values, no messages."]
+        summary.append('nothing visible changed')
+    text = '\n'.join(out)
+    return text[:2500], 'Browser report: ' + ('; '.join(summary) if summary else 'page changed')
+
+
+async def give_change_report(run, agent, n):
+    """Compare the page now with run.before and hand the facts to the model at its next step, as a
+    one-time read_state entry (full report) plus a one-line summary kept in its history."""
+    results = agent.state.last_result or []
+    if any(r.is_done for r in results):
+        return                      # the run is over; nothing to report to
+    await asyncio.sleep(0.5)        # let a message drawn right after the last action appear
+    after = await page_snapshot(agent.browser_session)
+    report, summary = describe_changes(run.before, after)
+    facts, run.facts = run.facts, []
+    if report is None and not facts:
+        return
+    text = ('What changed during your last step (measured in the browser, not your own judgement):\n'
+            + (report or '') + ''.join('\n' + f for f in facts))
+    if facts:
+        summary = (summary or 'Browser report') + '; ' + '; '.join(short(f, 120) for f in facts)
+    run.change_log.append({'step': n, 'report': text, 'summary': summary})
+    with open(run.run_dir / 'changes.jsonl', 'a', encoding='utf-8') as fh:
+        fh.write(json.dumps({'step': n, 't': round(run.elapsed(), 1), 'report': text}, ensure_ascii=False) + '\n')
+    print(f"[changes] {short(summary, 200)}", flush=True)
+    # A NEW list: the history item of this step keeps its own list, so history.is_done() is unaffected.
+    agent.state.last_result = list(results) + [ActionResult(
+        extracted_content=text, include_extracted_content_only_once=True, long_term_memory=summary)]
 
 
 def utc_now():
@@ -414,17 +669,19 @@ class SiteRun:
         self.mail_listings = 0     # inbox listing API calls made for this site
         self.mail_links = []       # every link from opened e-mails, full length, numbered from 1
         self.login_tried = False   # a login form was submitted (opens check_inbox)
-        self.inbox_refusals = 0
         self.code_page = False     # a page asked for a code sent by e-mail (opens check_inbox)
         self.code_notes = set()    # pages already flagged to the agent
         self.wallet_calls = 0
         self.site = registrable_domain(url)
         self.time_warning_given = False
+        self.before = None         # visible page state at the start of the current step (page_snapshot)
+        self.facts = []            # plain facts for the next "what changed" report (repeat count, time left)
+        self.change_log = []       # every report given to the agent, also written to changes.jsonl
+        self.zooms = 0
         self.repeats = {}          # action hash -> [times done on an unchanged page, page fingerprint, text]
         self.loop_interventions = []
         self.form_checks = 0
         self.form_log = []         # every form check: why, URL, empty fields, picture
-        self.form_blocks = {}      # page URL -> submit clicks refused there
         self.stop_reason = ''
         self.notes = queue.Queue()
         self.notes_given = []
@@ -526,21 +783,14 @@ def build_tools(run: SiteRun) -> Tools:
         return [m for m in resp.json().get('msgs', []) if m.get('time', 0) >= since_ms]
 
     @tools.action(description='List the e-mails received by the identity\'s inbox. Waits up to wait_seconds (max 90) '
-                              'for mail to arrive. Shows subjects and any code in a subject. Use it only after a login '
-                              'attempt failed, or with for_code=true when the page asks for a code sent by e-mail.')
+                              'for mail to arrive. Shows subjects and any code in a subject. Listing is limited per '
+                              'site and per day; the answer says how much waiting is left.')
     async def check_inbox(wait_seconds: int = 30, for_code: bool = False) -> ActionResult:
+        # for_code is kept only so a v3-prompted agent's call still validates; it changes nothing now.
         if not run.inbox:
             return ActionResult(error='Call new_identity first; the inbox belongs to that identity.')
-        # Log in first, e-mail only if the login fails (James, Nov 15; the crawler also tries the login
-        # whatever the page says). Refused at most twice, in case a login attempt was not recognised.
-        if not run.login_tried and not for_code and not run.code_page and run.inbox_refusals < 2:
-            run.inbox_refusals += 1
-            print(f"[inbox] refused before any login attempt ({run.inbox_refusals})", flush=True)
-            return ActionResult(error='Not yet: log in first. Go to the site\'s Login / Sign in page and log in with the '
-                                      'identity\'s e-mail (or username) and password; most of these sites let the account '
-                                      'in without e-mail verification. Check the inbox only if that login is refused or '
-                                      'shows a "verify your e-mail" page. If this page is asking for a code sent by '
-                                      'e-mail, call check_inbox with for_code=true.')
+        # Nov 15 (rule removal): no "log in first" refusal any more; when to read mail is the agent's choice.
+        # 7mtrades.com: that rule sent the agent to the login page and closed the e-mailed-code popup.
         # Total wait per site is capped (MAIL_WAIT_BUDGET): wertchain.live (Nov 14) polled an empty inbox
         # 7 times for ~5.5 minutes of its 10. The crawler itself polls 60 s (MAILINATOR_WAIT_SECONDS).
         # Listing calls per site are capped too (MAIL_LIST_LIMIT, polled every MAIL_POLL_SECONDS): Nov 15,
@@ -549,9 +799,10 @@ def build_tools(run: SiteRun) -> Tools:
         if run.mail_listings >= MAIL_LIST_LIMIT or listings_today() >= day_cap:
             why = (f'for this site ({run.mail_listings})' if run.mail_listings >= MAIL_LIST_LIMIT
                    else f'for today ({listings_today()} of {day_cap})')
-            print(f"[inbox] check refused: inbox checks used up {why}", flush=True)
+            print(f"[inbox] listing cap reached: {why}", flush=True)
             return ActionResult(extracted_content=(
-                f'Inbox checks are used up {why}. Do not call check_inbox again. ' + LOGIN_NOW))
+                f'Inbox checks are used up {why} ({MAIL_LIST_LIMIT} per site, {day_cap} per day); '
+                'check_inbox will not list the inbox again.'))
         wait = max(0, min(int(wait_seconds), 90, MAIL_WAIT_BUDGET - run.mail_waited))
         started_wait = time.time()
         deadline = started_wait + wait
@@ -569,10 +820,11 @@ def build_tools(run: SiteRun) -> Tools:
         run.mail_waited += time.time() - started_wait
         if not msgs:
             if run.mail_waited >= MAIL_WAIT_BUDGET - 1 or run.mail_listings >= MAIL_LIST_LIMIT:
-                print(f"[inbox] empty after {run.mail_waited:.0f} s / {run.mail_listings} checks; told the agent to log in", flush=True)
+                print(f"[inbox] empty after {run.mail_waited:.0f} s / {run.mail_listings} checks; waiting used up", flush=True)
                 return ActionResult(extracted_content=(
-                    f'The inbox is still empty after {run.mail_waited:.0f} seconds of waiting in total. The e-mail is not '
-                    'coming: STOP waiting and do not call check_inbox again. ' + LOGIN_NOW))
+                    f'The inbox is still empty after {run.mail_waited:.0f} seconds of waiting in total. That is all the '
+                    f'waiting allowed for this site ({MAIL_WAIT_BUDGET} s); further checks list the inbox once, '
+                    'without waiting.'))
             return ActionResult(extracted_content=f'The inbox is still empty ({run.mail_waited:.0f} s of '
                                                   f'{MAIL_WAIT_BUDGET} s waiting used for this site).')
         lines = []
@@ -642,10 +894,8 @@ def build_tools(run: SiteRun) -> Tools:
         print(f"[mail] opening e-mail link {number}: {short(url, 120)}", flush=True)
         return await tools.registry.execute_action('navigate', {'url': url, 'new_tab': False}, browser_session=browser_session)
 
-    @tools.action(description='Check the form on the current page before submitting it. Returns a picture of the form '
-                              'with every empty field outlined in red, and a list of each field with its value. Call it '
-                              'before clicking any submit button (sign up, log in, deposit), look at the picture, and '
-                              'fill every EMPTY field first.')
+    @tools.action(description='Look closely at the form on the current page: returns a picture of the form with every '
+                              'empty required field outlined in red, and a list of each field with its current value.')
     async def check_form(browser_session: BrowserSession) -> ActionResult:
         info = await form_check(run, browser_session, None, 'check_form')
         if info is None:
@@ -655,9 +905,60 @@ def build_tools(run: SiteRun) -> Tools:
         images = [{'name': f'form-check-{run.form_checks:02d}.png', 'data': info['png_b64']}] if info.get('png_b64') else None
         return ActionResult(extracted_content=info['text'], images=images, include_extracted_content_only_once=True)
 
-    # Submit gate: a click on a form's submit button is refused while the form has empty fields, and the
-    # agent gets the picture and the list instead. After 2 refusals on the same page the click goes
-    # through (the check could be wrong about a field), and that is logged.
+    # zoom (Nov 15, James approved): arbitraotc.site's captcha was 6 rotated digits in a decorative font;
+    # the agent typed 47823 for 478233 and 58208 for 582008. The picture is taken at up to 3x scale. It
+    # ends the step (terminates_sequence) so the picture is seen before anything is typed from it.
+    @tools.action(description='Look closer at part of the page: a sharp picture, enlarged up to 3 times, of one '
+                              'element (give its index) and the area around it, or of the smallest visible element '
+                              'containing some text (give text). margin = pixels of surroundings to include (0-300). '
+                              'Also returns the text inside that area.',
+                  terminates_sequence=True)
+    async def zoom(browser_session: BrowserSession, index: int = -1, text: str = '', margin: int = 80) -> ActionResult:
+        xpath = None
+        if index >= 0:
+            try:
+                node = await browser_session.get_element_by_index(index)
+            except Exception:
+                node = None
+            if node is None:
+                return ActionResult(error=f'No element with index {index} on the current page.')
+            xpath = node.xpath
+        elif not text.strip():
+            return ActionResult(error='Give an element index or some text to find.')
+        try:
+            page = await browser_session.must_get_current_page()
+            found = json.loads(await page.evaluate(ZOOM_FIND_JS, xpath or '', text.strip(), max(0, min(int(margin), 300))))
+        except Exception as e:
+            return ActionResult(error=f'Could not find the area: {short(e, 160)}')
+        if not found.get('rect'):
+            return ActionResult(error=found.get('why') or 'Nothing visible found to zoom on.')
+        r = found['rect']
+        scale = max(1.0, min(3.0, 1600 / max(r['width'], 1), 1600 / max(r['height'], 1)))
+        try:
+            cdp = await browser_session.get_or_create_cdp_session()
+            res = await cdp.cdp_client.send.Page.captureScreenshot(
+                params={'format': 'png', 'captureBeyondViewport': True,
+                        'clip': {'x': r['x'], 'y': r['y'], 'width': r['width'], 'height': r['height'], 'scale': scale}},
+                session_id=cdp.session_id)
+            b64 = res['data']
+        except Exception as e:
+            return ActionResult(error=f'Could not take the picture: {short(e, 160)}')
+        run.zooms += 1
+        zdir = run.run_dir / 'zoom'
+        zdir.mkdir(exist_ok=True)
+        (zdir / f'{run.zooms:02d}.png').write_bytes(base64.b64decode(b64))
+        what = f'element {index}' if index >= 0 else f'the element containing "{short(text, 40)}"'
+        info = (f"Zoomed picture of {what} with {found['margin']} px around it ({int(r['width'])}x{int(r['height'])} px "
+                f"of the page, enlarged {scale:.1f}x). Text inside that area: \"{short(found.get('text'), 400)}\"")
+        print(f"[zoom] {what}: {int(r['width'])}x{int(r['height'])} px at {scale:.1f}x -> zoom/{run.zooms:02d}.png", flush=True)
+        return ActionResult(extracted_content=info, include_extracted_content_only_once=True,
+                            long_term_memory=f'Zoomed on {what}.',
+                            images=[{'name': f'zoom-{run.zooms:02d}.png', 'data': b64}])
+
+    # Submit record (Nov 15, rule removal): a click on a form's submit button is NOT refused any more. The
+    # submit gate's "NOT SUBMITTED" reply read like the site's own answer (arbitraotc.site: the site cleared
+    # the form after a wrong captcha, the gate then refused, the agent concluded the site was broken). The
+    # form is still pictured and listed at each submit, for the run record only; the agent is told nothing.
     click_action = tools.registry.registry.actions['click']
     original_click = click_action.function
 
@@ -672,20 +973,10 @@ def build_tools(run: SiteRun) -> Tools:
             if node is not None and is_submit_control(node):
                 info = await form_check(run, bs, node.xpath, 'submit')
                 if info and info.get('in_form') and info['empty']:
-                    page = info['url'].split('#')[0]
-                    run.form_blocks[page] = run.form_blocks.get(page, 0) + 1
-                    if run.form_blocks[page] <= 2:
-                        run.form_log[-1]['submit_refused'] = True
-                        print(f"[form] submit refused ({run.form_blocks[page]} on this page): empty "
-                              f"{', '.join(f['label'] for f in info['empty'])}", flush=True)
-                        images = [{'name': f'form-check-{run.form_checks:02d}.png', 'data': info['png_b64']}] if info.get('png_b64') else None
-                        return ActionResult(error='NOT SUBMITTED: the form still has empty fields. ' + info['text']
-                                                  + ' Look at the picture, fill the red-outlined fields, then submit again.',
-                                            images=images)
-                    run.form_log[-1]['submit_let_through'] = True
-                    print('[form] submit allowed despite empty fields (refused twice already on this page)', flush=True)
-                # A login attempt: the button says log in / sign in, or the page is a login page. It opens
-                # check_inbox (log in first, e-mail only if the login fails, as the crawler does).
+                    print(f"[form] submitted with empty required fields (not blocked): "
+                          f"{', '.join(f['label'] for f in info['empty'])}", flush=True)
+                # A login attempt: the button says log in / sign in, or the page is a login page. Recorded in
+                # result.json (login_tried) only; nothing depends on it any more.
                 try:
                     btn = ' '.join([node.get_all_children_text(max_depth=4) or '',
                                     (node.attributes or {}).get('value', ''), (node.attributes or {}).get('aria-label', '')])
@@ -871,14 +1162,18 @@ async def run_site(url, args):
         # (fxtradingprofiting.com, Nov 10: UNFINISHED at 600 s with no structured result).
         if not run.time_warning_given and run.elapsed() >= args.time_limit - 90:
             run.time_warning_given = True
-            run.notes.put('TIME IS ALMOST UP. Do not start anything new. If a deposit address is on the screen, '
-                          'call record_wallet for it, then call done now with the structured result of how far '
-                          'you got.')
+            # Nov 15 (rule removal): a statement of the time left, no orders. The run still stops at the limit.
+            left = max(0, int(args.time_limit - run.elapsed()))
+            run.notes.put(f'For your information: about {left} seconds are left of the {args.time_limit}-second limit '
+                          'for this site. The run stops at the limit, and only a result given with done is kept.')
         while not run.notes.empty():
             note = run.notes.get()
             run.notes_given.append({'step': agent.state.n_steps, 'note': note})
             agent._message_manager.add_new_task(note)   # appended to the task as a follow-up request
             print(f"[control] instruction given to the agent: {note}", flush=True)
+        # "What changed": the page as it is just before the model looks at it and acts (the model's own
+        # screenshot is taken right after this hook). Also puts the message watcher on the page.
+        run.before = await page_snapshot(agent.browser_session) if agent.browser_session else None
 
     def on_new_step(state, output, step):
         n = step
@@ -893,8 +1188,8 @@ async def run_site(url, args):
             'next_goal': output.next_goal, 'thinking': output.thinking, 'actions': actions,
         }
         for note in note_repeats(run, state, actions):
-            line['stuck_instruction'] = note
-            run.notes.put(note)        # given to the agent at the start of the next step
+            line['repeat_fact'] = note
+            run.facts.append(note)     # goes into this step's "what changed" report
         run.steps_file.write(json.dumps(line, ensure_ascii=False) + '\n')
         run.steps_file.flush()
         if state.screenshot:
@@ -938,18 +1233,17 @@ async def run_site(url, args):
             boxes = json.loads(await page.evaluate(CODE_BOX_FN) or '[]')
         except Exception:
             boxes = []
+        # Nov 15 (rule removal): the code box is only logged now; the agent is no longer ordered to fill it
+        # (that order existed to undo the log-in-first rule, which is gone too).
         if boxes:
             run.code_page = True
             key = (current or '').split('#')[0]
             if key not in run.code_notes:
                 run.code_notes.add(key)
-                run.notes.put('This page has a box for a CODE sent to your e-mail (' + ', '.join(
-                    f"{b[0] or 'code'} {b[1]}".strip() for b in boxes) + '). Do NOT close it, do not log in and do '
-                    'not leave this page: call check_inbox with for_code=true, take the code from the e-mail '
-                    '(often in the subject), type it into this box and submit it.')
-                print(f"[code] e-mailed code box on {short(current, 80)}: {boxes}; told the agent to fill it", flush=True)
+                print(f"[code] e-mailed code box on {short(current, 80)}: {boxes} (logged only)", flush=True)
         if run.cost_so_far >= args.max_cost_site:
             run.request_stop(f'per-site cost cap ${args.max_cost_site:.2f} reached')
+        await give_change_report(run, agent, n)
 
     async def should_stop():
         if run.elapsed() >= args.time_limit:
@@ -1078,6 +1372,7 @@ def build_result(run, history, usage, prompt_version, error):
         'steps': steps, 'seconds': round(run.elapsed()), 'stop_reason': run.stop_reason, 'error': error,
         'mail_reads': run.mail_reads, 'mail_listings': run.mail_listings, 'login_tried': run.login_tried, 'operator_instructions': run.notes_given,
         'stuck_interventions': run.loop_interventions, 'form_checks': run.form_log,
+        'change_reports': len(run.change_log), 'zooms': run.zooms,
         'tokens': tokens, 'cost_usd': cost_lib, 'cost_usd_own_calc': cost_own,
     }
 
@@ -1100,7 +1395,7 @@ def print_summary(r):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('url')
-    p.add_argument('--prompt', default=str(HERE / 'prompts' / 'v3.md'))
+    p.add_argument('--prompt', default=str(HERE / 'prompts' / 'v4.md'))
     p.add_argument('--control-file', default=None,
                    help='file to append commands to (p / r / n <text> / s); default <out dir>/control.txt')
     p.add_argument('--headed', action='store_true', help='show the browser window (local runs)')
