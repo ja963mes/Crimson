@@ -851,7 +851,9 @@ def get_website_title(html_content):
     except curl_requests.exceptions.RequestException:
         return "No Title."
 
-derive_schemes = ('https://', 'http://')
+# HTTPS only. Plain http:// is never fetched (an HTTPS response that redirects
+# to http:// is still followed by curl).
+derive_schemes = ('https://',)
 
 # Pages are fetched with curl_cffi (curl-impersonate), not requests. Its TLS
 # handshake and HTTP/2 settings match a real Chrome's, and it sends Chrome's own
@@ -869,12 +871,11 @@ derive_schemes = ('https://', 'http://')
 FETCH_IMPERSONATE = "chrome"
 
 def is_domain_available(url_name, curr_date):
-    """Fetch the page. HTTPS first, HTTP only as a fallback.
+    """Fetch the page over HTTPS only (see derive_schemes).
 
-    This used to be hardcoded to 'http://' with no fallback, which is wrong for
-    essentially the whole modern web: an HTTPS-only host either refuses the plain
-    HTTP connection or answers with a redirect, and any site whose edge declines
-    to serve cleartext was being filed as 'unavailable.' and never classified.
+    This used to be hardcoded to 'http://', then HTTPS with an HTTP fallback.
+    It now never makes a plain-HTTP request; a host that doesn't answer on
+    HTTPS returns False.
 
     verify=False because the target set is newly-registered scam infrastructure,
     where self-signed and expired certificates are common. We are reading hostile
@@ -898,7 +899,7 @@ def is_domain_available(url_name, curr_date):
                                          impersonate=FETCH_IMPERSONATE)
             break
         except Exception:
-            continue          # TLS failure, refused, timeout -> try the next scheme
+            continue          # TLS failure, refused, timeout -> no HTTP fallback
     if response is None:
         return False
 

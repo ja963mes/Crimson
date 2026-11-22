@@ -62,10 +62,9 @@ class SeleniumScreenshot:
         self.options = chrome_options
 
     def take_screenshot(self, url, curr_date, path, SYSNO):
-        # Both attempts used to load the identical http:// URL, so a site that
-        # only serves HTTPS failed twice for the same reason. Try each scheme
-        # once instead -- HTTPS first, matching is_domain_available().
-        for scheme in ('https://', 'http://'):
+        # HTTPS only, matching is_domain_available() in recv.py. No http://
+        # fallback.
+        for scheme in ('https://',):
             if self.screenshot_retrier(url, curr_date, path, SYSNO, scheme):
                 return True
         time.sleep(0.5)
