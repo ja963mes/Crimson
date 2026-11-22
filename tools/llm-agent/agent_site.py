@@ -162,7 +162,7 @@ class SiteResult(BaseModel):
 REPEAT_LIMIT = 5
 MAIL_WAIT_BUDGET = 120     # seconds check_inbox may wait in total per site (crawler: 60 s + 20 s)
 MAIL_POLL_SECONDS = 10     # between inbox listings while waiting
-MAIL_LIST_LIMIT = 12       # inbox listing API calls per site (the crawler's 60 s at 5 s polling)
+MAIL_LIST_LIMIT = 3        # inbox listing API calls per site (Nov 22, James: was 12; the crawler usually needs one)
 LOGIN_TEXT_RE = re.compile(r'\blog ?in\b|\bsign ?in\b|\blogin\b|\bsignin\b|войти|登录|登入|entrar|connexion|anmelden|acceder', re.I)
 LOGIN_URL_RE = re.compile(r'log-?in|sign-?in|signin|/auth\b|/account/?$', re.I)
 # The crawler's code-box finder wrapped for page.evaluate: [name, placeholder, maxlength] of each box.
@@ -794,7 +794,7 @@ def build_tools(run: SiteRun) -> Tools:
         # Total wait per site is capped (MAIL_WAIT_BUDGET): wertchain.live (Nov 14) polled an empty inbox
         # 7 times for ~5.5 minutes of its 10. The crawler itself polls 60 s (MAILINATOR_WAIT_SECONDS).
         # Listing calls per site are capped too (MAIL_LIST_LIMIT, polled every MAIL_POLL_SECONDS): Nov 15,
-        # oakcrestinvestment.com made ~22 listing calls with 5 s polling. The crawler: 5 s for 60 s = ~12.
+        # oakcrestinvestment.com made ~22 listing calls with 5 s polling. Nov 22: cap lowered from 12 to 3.
         day_cap = run.args.mail_listings_per_day
         if run.mail_listings >= MAIL_LIST_LIMIT or listings_today() >= day_cap:
             why = (f'for this site ({run.mail_listings})' if run.mail_listings >= MAIL_LIST_LIMIT
