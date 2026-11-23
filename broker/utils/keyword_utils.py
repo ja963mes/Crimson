@@ -83,7 +83,29 @@ domain_whitelist = { # Update as needed!
     "amazonaws.com",      # ~5.6% of sends (Oct 4-5)
     "windows-int.net",    # ~4.3%, Azure internal test environments
     "cosmos.azure.com",   # ~2.9%, Cosmos DB endpoints
+    # Measured Nov 22 2026 (VM4 sent.txt for 261121, 2,912,487 domains, against
+    # 948 hand-labelled HYIPs): these shared platforms were ~9% of what was sent
+    # to incubation and held 0 of the 948 HYIPs. pages.dev is NOT here: it held 28.
+    "workers.dev",        # 1.76% of sends
+    "ondigitalocean.com", # 1.58%
+    "chatgpt.site",       # 1.33%
+    "crm.dev",            # 1.22%
+    "nip.io",             # 1.05%, wildcard DNS for raw IPs
+    "telebit.io",         # 0.90%, tunnels
+    "sslip.io",           # 0.87%, wildcard DNS for raw IPs
+    "sfdc.net",           # 0.34%, Salesforce internal
 }
+
+# ---------------------------------------------------------------------------
+# cPanel AutoSSL service names. One cPanel cert covers the site plus these
+# fixed subdomains, so every site arrived up to 8 extra times. Same Nov 22
+# measurement: 5.05% of sends, 0 of 948 HYIPs (and 0 of 566 labelled non-HYIPs,
+# i.e. they never even reach the LLM). Matched only as the FIRST subdomain
+# label, so webmail.com itself is untouched. "mail." is NOT here: it serves the
+# site itself and held 60 of the 948 HYIPs.
+# ---------------------------------------------------------------------------
+cpanel_service_labels = {"webmail", "cpanel", "webdisk", "autodiscover",
+                         "autoconfig", "cpcalendars", "cpcontacts", "whm"}
 
 # ---------------------------------------------------------------------------
 # BUG 2 FIX -- matching.
@@ -144,6 +166,8 @@ def match_domain_name_with_keywords(domain_name):
     if not _KEYWORD_RE.search(domain_name):
         return False
     extracted = tldextract.extract(domain_name)
+    if extracted.subdomain and extracted.subdomain.split('.', 1)[0] in cpanel_service_labels:
+        return False
     domain_without_tld = extracted.domain
     if extracted.subdomain:
         domain_without_tld = extracted.subdomain + '.' + domain_without_tld

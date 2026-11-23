@@ -999,8 +999,8 @@ def check(url_name, curr_date):
     end = time.time()
     log(f"{url_name},{end-start}", curr_date, 'time_availability.txt', 'a')
 
-    # Every reachable page with enough text is screenshotted and OCR'd, as in the paper's artifact.
-    # The LLM judges the OCR text, i.e. what a visitor sees: content drawn by
+    # A reachable page with enough text that passes the content filter on its HTML
+    # text (both checks below) is screenshotted and OCR'd. The LLM judges the OCR text, i.e. what a visitor sees: content drawn by
     # JavaScript or baked into images counts, and HTML text a visitor never sees
     # does not. The HTML text is still read, but only for the content filter.
     #
@@ -1020,6 +1020,24 @@ def check(url_name, curr_date):
     if len(dom_text.encode('utf-8')) < MIN_TEXT_BYTES:
         log(f"{url_name},{len(dom_text.encode('utf-8'))}", curr_date, 'short_html_text.txt', 'a')
         return "HTML text too short."
+
+    # The content filter on the HTML text alone, BEFORE the screenshot. Only pages
+    # that pass go on to the screenshot, OCR, the full filter (OCR + HTML) and the
+    # LLM, exactly as before.
+    # Nov 22 measurement (VM3 re-fetch): 0 of 338 random readable pages passed on
+    # HTML alone, against 644 of 689 live hand-labelled HYIPs (93.5%). Readable
+    # rejected pages were 63.5% of worker time (10.5 s each, 1.1 s of it the
+    # fetch), so this roughly doubles the domains a worker gets through a day.
+    # Cost: HYIPs whose pitch exists only in images (31 of the 45 misses had no
+    # Table 11 word in their HTML). Logged like content_excluded.txt, so a lost
+    # HYIP can be found and its wording added.
+    if not content_filter(dom_text, page_title, url_name):
+        if table11_filter(dom_text):
+            log(f"{url_name},{'+'.join(content_exclusions(dom_text, page_title, url_name)) or 'no_hyip_phrase'}",
+                curr_date, 'content_excluded_html.txt', 'a')
+        log(f"Rejected [html]: {url_name} - Reason: Cleared_By_HTML_Content_Filter",
+            curr_date, 'llm_rejected.txt', 'a')
+        return "Rejected by HTML content filter."
 
     ensure_directory_exists(f"data/{SYSNO}/screenshots/{curr_date}")
     sspath = f"data/{SYSNO}/screenshots/{curr_date}/{url_name}/"
@@ -1049,10 +1067,10 @@ def check(url_name, curr_date):
         log(f"{url_name},{time.time()-start}", curr_date, 'time_OCR.txt', 'a')
         return "OCR text too short."
 
-    # content_filter runs first on every page: it is free, and at ~98.7% rejection
-    # it keeps the Ollama call (the expensive step on CPU-only hardware) off most
-    # pages. As in the artifact's OCR(), it reads the OCR text and the HTML text
-    # combined; the LLM gets the OCR text only.
+    # content_filter runs again here, on the OCR text and the HTML text combined
+    # (as in the artifact's OCR()), before the Ollama call (the expensive step on
+    # CPU-only hardware). The page already passed on its HTML text above; the
+    # LLM gets the OCR text only.
     filter_text = f"{clean_text} {dom_text}"
     if content_filter(filter_text, page_title, url_name):
         evaluation = evaluate_hybrid(clean_text, url_name, curr_date)
