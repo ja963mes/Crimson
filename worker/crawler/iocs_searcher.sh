@@ -27,7 +27,22 @@ touch "$processed_files_log"
 # Specify the IOC types to search for. Current iocsearcher calls Tron addresses
 # (TRX and USDT-TRC20) "tron"; with "tronix" it printed "No regexp for target"
 # and skipped them.
-ioc_types=(bitcoin bitcoincash cardano dashcoin dogecoin ethereum litecoin monero ripple tezos tron zcash webmoney onionAddress email phoneNumber facebookHandle githubHandle instagramHandle linkedinHandle pinterestHandle telegramHandle twitterHandle whatsappHandle youtubeHandle youtubeChannel)
+#
+# Only the address formats of the coins we report (Nov 22 2026): BTC, BCH, ADA,
+# DASH, DOGE, LTC, XRP, TRX + USDT-TRC20 ("tron"), and ETH + BNB (BSC) + MATIC +
+# USDT/USDC on EVM chains, which all share the 0x format ("ethereum";
+# build_wallets.py tells them apart by the page label). Monero, tezos, zcash,
+# webmoney, onion addresses, e-mail, phone numbers and social handles are no
+# longer searched: build_wallets.py reads wallet types only, and the e-mail regex
+# alone ran over 90 s on an 11 MB page on VM1, stalling the whole pass nightly
+# (Nov 20-22).
+ioc_types=(bitcoin bitcoincash cardano dashcoin dogecoin ethereum litecoin ripple tron)
+
+# Per-file time limit. A file that hits it is recorded as processed (and in
+# iocs_timeouts.log) so it cannot stall every later pass; before this one page
+# was retried every night until systemd's 1 h stop-post limit killed the pass.
+IOC_FILE_TIMEOUT=${IOC_FILE_TIMEOUT:-120}
+timeouts_log="$search_dir/iocs_timeouts.log"
 
  target_options=""
 for ioc_type in "${ioc_types[@]}"; do
@@ -47,7 +62,12 @@ find "$search_dir" -type f -name '*.html' | while read html_file; do
     else
         echo "Searching IOCs in $html_file" | tee -a "$results_file"
         # Execute iocsearcher on each HTML file and append output to the results file
-        iocsearcher -f "$html_file" -F $target_options 2>&1 | tee -a "$results_file"
+        timeout -k 10 "$IOC_FILE_TIMEOUT" iocsearcher -f "$html_file" -F $target_options 2>&1 | tee -a "$results_file"
+        status=${PIPESTATUS[0]}
+        if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+            echo "TIMED OUT after ${IOC_FILE_TIMEOUT}s: $html_file" | tee -a "$results_file"
+            echo "$(date -u +%FT%TZ) $html_file" >> "$timeouts_log"
+        fi
         echo "---------------------------------------" | tee -a "$results_file"
         # Log that this file has been processed
         echo "$html_file" >> "$processed_files_log"
